@@ -6,9 +6,7 @@ prisma/*.db-journal
 debug_kf/.cache/
 .env
 debug*
-prisma
 simplx
-bot
 .pytest_cache
 babysitter/__pycache__
 v7_sessions
