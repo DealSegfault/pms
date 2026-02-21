@@ -1,0 +1,228 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./pms.db"
+}
+
+model User {
+  id            String   @id @default(uuid())
+  username      String   @unique
+  passwordHash  String   @map("password_hash")
+  role          String   @default("USER") // ADMIN, USER
+  status        String   @default("PENDING") // PENDING, APPROVED, BANNED
+  apiKey             String?  @unique @map("api_key") // For bot access
+  currentChallenge   String?  @map("current_challenge") // Transient WebAuthn challenge
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  subAccounts          SubAccount[]
+  webauthnCredentials  WebAuthnCredential[]
+
+  @@map("users")
+}
+
+model SubAccount {
+  id              String   @id @default(uuid())
+  userId          String?  @map("user_id")
+  name            String
+  type            String   @default("USER") // USER, BOT
+  initialBalance  Float    @map("initial_balance")
+  currentBalance  Float    @map("current_balance")
+  status          String   @default("ACTIVE") // ACTIVE, FROZEN, LIQUIDATED
+  liquidationMode String   @default("ADL_30") @map("liquidation_mode") // ADL_30, INSTANT_CLOSE, TAKEOVER
+  maintenanceRate Float    @default(0.005) @map("maintenance_rate") // 0.5% maintenance margin
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  user         User?           @relation(fields: [userId], references: [id])
+  riskRule     RiskRule?
+  botConfig    BotConfig?
+  positions    VirtualPosition[]
+  trades       TradeExecution[]
+  balanceLogs  BalanceLog[]
+  pendingOrders PendingOrder[]
+
+  @@index([userId, status])
+  @@index([status])
+  @@map("sub_accounts")
+}
+
+model RiskRule {
+  id                 String  @id @default(uuid())
+  subAccountId       String? @unique @map("sub_account_id")
+  isGlobal           Boolean @default(false) @map("is_global")
+  maxLeverage        Float   @default(100) @map("max_leverage")
+  maxNotionalPerTrade Float  @default(200) @map("max_notional_per_trade")
+  maxTotalExposure   Float   @default(500) @map("max_total_exposure")
+  liquidationThreshold Float @default(0.90) @map("liquidation_threshold")
+  
+  subAccount SubAccount? @relation(fields: [subAccountId], references: [id])
+
+  @@index([isGlobal])
+  @@map("risk_rules")
+}
+
+model VirtualPosition {
+  id             String   @id @default(uuid())
+  subAccountId   String   @map("sub_account_id")
+  symbol         String
+  side           String   // LONG, SHORT
+  entryPrice     Float    @map("entry_price")
+  quantity       Float
+  notional       Float
+  leverage       Float
+  margin         Float
+  liquidationPrice Float  @map("liquidation_price")
+  status         String   @default("OPEN") // OPEN, CLOSED, LIQUIDATED, TAKEN_OVER
+  realizedPnl    Float?   @map("realized_pnl")
+  babysitterExcluded Boolean @default(false) @map("babysitter_excluded") // User can exclude from babysitter
+  takenOver      Boolean  @default(false) @map("taken_over")
+  takenOverBy    String?  @map("taken_over_by")
+  takenOverAt    DateTime? @map("taken_over_at")
+  openedAt       DateTime @default(now()) @map("opened_at")
+  closedAt       DateTime? @map("closed_at")
+
+  subAccount SubAccount       @relation(fields: [subAccountId], references: [id])
+  trades     TradeExecution[]
+
+  @@index([subAccountId, status])
+  @@index([symbol, status])
+  @@index([subAccountId, symbol, side, status])
+  @@map("virtual_positions")
+}
+
+model TradeExecution {
+  id              String   @id @default(uuid())
+  subAccountId    String   @map("sub_account_id")
+  positionId      String?  @map("position_id")
+  exchangeOrderId String?  @map("exchange_order_id")
+  clientOrderId   String?  @map("client_order_id")
+  symbol          String
+  side            String   // BUY, SELL
+  type            String   // MARKET, LIMIT
+  price           Float
+  quantity        Float
+  notional        Float
+  fee             Float    @default(0)
+  realizedPnl     Float?   @map("realized_pnl")
+  action          String   // OPEN, CLOSE, LIQUIDATE, ADD
+  originType      String   @default("MANUAL") @map("origin_type") // MANUAL, BOT, API
+  status          String   @default("FILLED") // PENDING, FILLED, FAILED, CANCELLED
+  signature       String
+  timestamp       DateTime @default(now())
+
+  subAccount SubAccount       @relation(fields: [subAccountId], references: [id])
+  position   VirtualPosition? @relation(fields: [positionId], references: [id])
+
+  @@index([subAccountId, timestamp])
+  @@index([subAccountId, status, timestamp])
+  @@index([subAccountId, symbol, timestamp])
+  @@index([exchangeOrderId])
+  @@map("trade_executions")
+}
+
+model BalanceLog {
+  id            String   @id @default(uuid())
+  subAccountId  String   @map("sub_account_id")
+  balanceBefore Float    @map("balance_before")
+  balanceAfter  Float    @map("balance_after")
+  changeAmount  Float    @map("change_amount")
+  reason        String
+  tradeId       String?  @map("trade_id")
+  timestamp     DateTime @default(now())
+
+  subAccount SubAccount @relation(fields: [subAccountId], references: [id])
+
+  @@index([subAccountId, timestamp])
+  @@map("balance_logs")
+}
+
+model PendingOrder {
+  id            String    @id @default(uuid())
+  subAccountId  String    @map("sub_account_id")
+  symbol        String
+  side          String    // LONG, SHORT
+  type          String    @default("LIMIT") // LIMIT, STOP_MARKET, TAKE_PROFIT_MARKET
+  price         Float     // limit/trigger price
+  quantity      Float
+  leverage      Float
+  exchangeOrderId String? @map("exchange_order_id")
+  status        String    @default("PENDING") // PENDING, FILLED, CANCELLED, EXPIRED
+  createdAt     DateTime  @default(now()) @map("created_at")
+  filledAt      DateTime? @map("filled_at")
+  cancelledAt   DateTime? @map("cancelled_at")
+
+  subAccount SubAccount @relation(fields: [subAccountId], references: [id])
+
+  @@index([exchangeOrderId])
+  @@index([status, type])
+  @@index([subAccountId, status])
+  @@map("pending_orders")
+}
+
+model BotConfig {
+  id              String   @id @default(uuid())
+  subAccountId    String   @unique @map("sub_account_id")
+  enabled         Boolean  @default(false)
+  babysitterEnabled Boolean @default(false) @map("babysitter_enabled") // Simple on/off v7 babysitter
+  tpMode          String   @default("auto")     @map("tp_mode")  // auto, fast, vol, long_short
+
+  // Strategy
+  maxNotional     Float    @default(50)    @map("max_notional")
+  maxLayers       Int      @default(8)     @map("max_layers")
+  maxExposure     Float    @default(500)   @map("max_exposure")
+
+  // Volatility helpers
+  volFilterEnabled Boolean @default(true)  @map("vol_filter_enabled")
+  minSpreadBps    Float    @default(7.0)   @map("min_spread_bps")
+  maxSpreadBps    Float    @default(40.0)  @map("max_spread_bps")
+
+  // Position filters
+  minHoldSec      Float    @default(5.0)   @map("min_hold_sec")
+  minProfitBps    Float    @default(10.0)  @map("min_profit_bps")
+  tpDecayEnabled  Boolean  @default(true)  @map("tp_decay_enabled")
+  tpDecayHalfLife Float    @default(30.0)  @map("tp_decay_half_life")
+
+  // Advanced orders
+  trailingStopEnabled Boolean @default(false) @map("trailing_stop_enabled")
+  trailingStopBps     Float   @default(15.0)  @map("trailing_stop_bps")
+  inverseTPEnabled    Boolean @default(true)   @map("inverse_tp_enabled")
+  inverseTPMinLayers  Int     @default(3)      @map("inverse_tp_min_layers")
+  scaledExitEnabled   Boolean @default(false)  @map("scaled_exit_enabled")
+
+  // Risk
+  maxLossBps      Float    @default(500.0)  @map("max_loss_bps")
+  lossCooldownSec Float    @default(8.0)    @map("loss_cooldown_sec")
+
+  // Pair selection
+  symbols         String   @default("")     // CSV of symbols, empty = auto-scan top volatile
+  blacklist       String   @default("")     // CSV of blacklisted symbols
+
+  createdAt       DateTime @default(now())  @map("created_at")
+  updatedAt       DateTime @updatedAt       @map("updated_at")
+
+  subAccount SubAccount @relation(fields: [subAccountId], references: [id])
+
+  @@index([babysitterEnabled])
+  @@map("bot_configs")
+}
+
+model WebAuthnCredential {
+  id           String   @id @default(uuid())
+  userId       String   @map("user_id")
+  credentialId String   @unique @map("credential_id") // base64url credential ID
+  publicKey    String   @map("public_key")            // base64url public key
+  counter      Int      @default(0)                   // sign counter
+  deviceType   String   @default("unknown") @map("device_type")
+  backedUp     Boolean  @default(false) @map("backed_up")
+  transports   String   @default("")                  // comma-separated transport hints
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("webauthn_credentials")
+}
