@@ -1,0 +1,160 @@
+# ═══════════════════════════════════════════════════════════
+#  V7 Short Grid Trader — Master Config
+#  All battle-tested parameters in one place.
+#  CLI args: --live, --duration, --symbols, --config override.
+# ═══════════════════════════════════════════════════════════
+
+# ── Pair Selection ────────────────────────────────────────
+scanner:
+  top_n: 50
+  min_change_pct: 3.0
+  rotation_interval_sec: 0  # Rescan hot pairs every 10min (0 = disabled)
+  # symbols: ["DUSKUSDT", "BANUSDT"]   # Uncomment to skip scanner
+  blacklist:
+    # Wrapped stocks / commodities / indices — limited liquidity outside
+    # traditional market hours, different price dynamics from pure crypto.
+    - COINUSDT        # Coinbase stock
+    - MSTRUSDT        # MicroStrategy stock
+    - TSLAUSDT        # Tesla stock
+    - AMZNUSDT        # Amazon stock
+    - SPXUSDT         # S&P 500 index
+    - XAUUSDT         # Gold
+    - XAGUSDT         # Silver
+
+# ── Session ───────────────────────────────────────────────
+session:
+  duration_sec: 0               # 0 = forever (no arbitrary cutoff)
+  display_interval: 10.0
+  log_dir: ./v7_sessions
+  keep_positions: true
+  user_scope: ""                # Optional user/account namespace (used by bridge + storage keys)
+  subaccount: ""                # Optional credential profile alias
+  account_scoped_storage: true  # Live mode: auto-suffix DB/log paths with user scope
+
+# ── Portfolio Risk ────────────────────────────────────────
+portfolio:
+  max_total_notional: 2000.0  # $2000 max across all pairs
+
+# ── Grid ──────────────────────────────────────────────────
+grid:
+  min_notional: 50.0          # Min $ per layer
+  max_notional: 80.0          # Max $ per layer (spread-scaled up to this)
+  max_layers: 32
+  max_symbol_notional: 0.0    # Per-symbol hard cap (0=disabled)
+  spacing_growth: 2.0         # WM-inspired: was 1.6, wider layers on deep entries
+  size_growth: 1.5            # WM-inspired: deeper layers = bigger orders (capped by max_notional)
+  base_spacing_bps: 0.0       # 0 = auto from median spread
+  trend_spacing_scale: 0.0    # Disabled: spacing_growth=2.0 already handles widening
+
+# ── Volatility Calibration ────────────────────────────────
+volatility:
+  drift_enabled: true
+  candle_service_url: http://localhost:3003
+  refresh_sec: 120.0
+  live_weight: 0.45
+  drift_min: 0.8
+  drift_max: 3.0
+  tail_mult: 2.2
+  tail_cooldown_sec: 20.0
+  tf_weights:
+    1m: 0.5
+    5m: 0.3
+    15m: 0.2
+  tf_lookbacks:
+    1m: "6h"
+    5m: "2d"
+    15m: "7d"
+
+# ── Entry Signals ─────────────────────────────────────────
+signals:
+  min_spread_bps: 7.0         # Raised from 5.0: sub-5bp pairs are fee traps (64% gross eaten by fees)
+  max_spread_bps: 40.0
+  pump_threshold: 2.0
+  exhaust_threshold: 1.0
+  max_trend_bps: 12.0          # Raised from 5.0 to reduce pump/trend contradiction (UU#5)
+  max_trend_30s_bps: 30.0       # 30s trend guard: skip entry if pair dropped >30bp in 30s (waterfall)
+  max_buy_ratio: 0.72           # Trade-side delta: skip short if >72% of 2s trades are buys
+  waterfall_vol_threshold: 3.0  # Skip entry if 30s drawdown > 3× vol (vol-relative waterfall gate)
+  waterfall_decay_sec: 30.0     # Waterfall score decays with this half-life (seconds)
+  warmup_sec: 30.0
+  resume_context_rewarm_sec: 30.0  # After restart restore: rebuild spread/vol context before new entries
+
+# ── Exit ──────────────────────────────────────────────────
+exit:
+  tp_spread_mult: 1.2         # TP = 1.2× median spread
+  min_tp_profit_bps: 10.0
+  tp_decay_half_life_min: 30.0  # TP tightens from 100% to floor over 30min
+  tp_decay_floor: 0.5           # TP never decays below 50% of target
+  fast_tp_ti: -0.25
+  min_fast_tp_bps: -10.0
+  stop_loss_bps: 0.0          # 0 = disabled
+
+# ── Inverse Grid TP ──────────────────────────────────────
+# Multi-layer positions exit at mirrored entry spacing instead of fixed TP
+inverse_tp:
+  enabled: true
+  min_layers: 3               # Activate when position has >= 3 layers
+  max_zones: 5                # Cap TP zones (prevents absurd deep targets)
+  time_cap_sec: 1800          # 30min hard time cap
+
+# ── Risk ──────────────────────────────────────────────────
+risk:
+  max_loss_bps: 500.0         # Per-symbol circuit breaker
+  loss_cooldown_sec: 8.0
+
+# ── Dynamic Behavior ─────────────────────────────────────
+dynamic:
+  enabled: true
+  behavior_lookback: 120
+
+# ── Edge Gate (LCB) ──────────────────────────────────────
+edge:
+  min_edge_bps: 2.0
+  exec_buffer_bps: 0.3       # Tuned S36: maker GTX = ~0 slippage
+  default_slippage_bps: 0.5   # Tuned S36: fallback exit estimate
+  uncertainty_z: 0.75
+  min_samples: 5              # Tuned S36: was 8, reduced for faster warmup
+  signal_slope_bps: 1.0
+
+# ── Recovery Debt ─────────────────────────────────────────
+recovery:
+  enabled: true
+  paydown_ratio: 0.25
+  max_paydown_bps: 25.0
+  debt_cap_usd: 75.0
+  db_path: ./v7_sessions/history.db
+  lookback_hours: 24.0
+  avg_enabled: true
+  avg_min_unrealized_bps: 35.0
+  avg_min_hurdle_improve_bps: 0.75
+  avg_cooldown_sec: 20.0
+  avg_max_adds_per_hour: 8
+  state_sync_sec: 30.0      # Persist recovery state (adoption/velocity/add pacing) across restarts
+
+# ── Runtime Resilience ─────────────────────────────────────
+resilience:
+  runtime_state_enabled: true
+  runtime_state_sync_sec: 20.0
+  strategy_event_logging: true
+  strategy_event_retention_days: 14.0
+  strategy_event_include_payload: false
+  babysitter_enabled: true      # Reconcile loop master switch (can toggle via bridge /control)
+
+# ── Orphan Management ────────────────────────────────────
+orphans:
+  adopt: true
+  recovery_only: false        # S38: enabled active trading for orphans
+
+# ── Stealth Order Spreading ──────────────────────────────
+stealth:
+  max_l1_fraction: 0.5        # Max fraction of L1 depth per tick level
+  max_ticks: 5                # Max ticks to spread across
+  always_split: true          # Always split into random pieces (anti-front-running)
+  min_slices: 2               # Min random pieces per order
+  max_slices: 5               # Max random pieces per order
+
+# ── Adaptive ─────────────────────────────────────────────
+adaptive:
+  enabled: true
+  lookback_sessions: 5
+  state_path: ./v7_sessions/v7_adaptive_state.json
