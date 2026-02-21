@@ -1,0 +1,802 @@
+/* ═══════════════════════════════════════════════════════════════
+   🎀✨ SUPER CUTE GIRLY THEME ✨🎀
+   A dreamy, kawaii-inspired dark pink/purple aesthetic
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── Color palette ────────────────────────────────────────────── */
+[data-theme="girly"] {
+    --bg-primary: #120a18;
+    --bg-secondary: #1a0f24;
+    --bg-card: rgba(45, 20, 55, 0.7);
+    --bg-card-hover: rgba(60, 28, 72, 0.8);
+    --bg-input: #160c1e;
+    --bg-glass: rgba(40, 18, 50, 0.85);
+    --surface-2: rgba(60, 25, 70, 0.5);
+
+    --text: #f8e8f4;
+    --text-primary: #f8e8f4;
+    --text-secondary: #d4a0c8;
+    --text-muted: #8a5478;
+
+    --accent: #f472b6;
+    --accent-hover: #f9a8d4;
+    --accent-glow: rgba(244, 114, 182, 0.4);
+
+    --green: #34d399;
+    --green-bg: rgba(52, 211, 153, 0.1);
+    --green-glow: rgba(52, 211, 153, 0.25);
+
+    --red: #fb7185;
+    --red-bg: rgba(251, 113, 133, 0.1);
+    --red-glow: rgba(251, 113, 133, 0.25);
+
+    --yellow: #fbbf24;
+    --yellow-bg: rgba(251, 191, 36, 0.1);
+
+    --border: rgba(244, 114, 182, 0.12);
+    --border-active: rgba(244, 114, 182, 0.45);
+
+    --radius: 16px;
+    --radius-sm: 10px;
+    --radius-lg: 20px;
+
+    --shadow: 0 4px 30px rgba(80, 0, 60, 0.4);
+    --shadow-lg: 0 8px 50px rgba(80, 0, 60, 0.6);
+
+    --gradient-accent: linear-gradient(135deg, #f472b6, #c084fc, #818cf8);
+    --gradient-card: linear-gradient(145deg, rgba(60, 20, 70, 0.6), rgba(30, 10, 45, 0.8));
+    --gradient-nav: linear-gradient(180deg, rgba(26, 15, 36, 0.95), rgba(18, 10, 24, 0.98));
+    --theme-color: #120a18;
+}
+
+/* ── Global body bg with subtle gradient ──────────────────────── */
+[data-theme="girly"] body {
+    background:
+        radial-gradient(ellipse at 20% 0%, rgba(192, 132, 252, 0.06) 0%, transparent 50%),
+        radial-gradient(ellipse at 80% 100%, rgba(244, 114, 182, 0.05) 0%, transparent 50%),
+        #120a18;
+}
+
+/* ── Star field / sparkle pseudo-overlay on body ──────────────── */
+[data-theme="girly"] body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background-image:
+        radial-gradient(1px 1px at 10% 15%, rgba(244, 114, 182, 0.4) 50%, transparent 50%),
+        radial-gradient(1px 1px at 25% 35%, rgba(192, 132, 252, 0.35) 50%, transparent 50%),
+        radial-gradient(1.5px 1.5px at 45% 8%, rgba(249, 168, 212, 0.3) 50%, transparent 50%),
+        radial-gradient(1px 1px at 60% 55%, rgba(129, 140, 248, 0.3) 50%, transparent 50%),
+        radial-gradient(1.5px 1.5px at 75% 20%, rgba(244, 114, 182, 0.35) 50%, transparent 50%),
+        radial-gradient(1px 1px at 85% 70%, rgba(192, 132, 252, 0.3) 50%, transparent 50%),
+        radial-gradient(1px 1px at 15% 80%, rgba(249, 168, 212, 0.25) 50%, transparent 50%),
+        radial-gradient(1.5px 1.5px at 50% 90%, rgba(244, 114, 182, 0.35) 50%, transparent 50%),
+        radial-gradient(1px 1px at 35% 65%, rgba(129, 140, 248, 0.25) 50%, transparent 50%),
+        radial-gradient(1px 1px at 90% 40%, rgba(249, 168, 212, 0.3) 50%, transparent 50%);
+    animation: girlySparkle 8s ease-in-out infinite alternate;
+}
+
+@keyframes girlySparkle {
+    0% {
+        opacity: 0.4;
+    }
+
+    50% {
+        opacity: 0.8;
+    }
+
+    100% {
+        opacity: 0.5;
+    }
+}
+
+/* ── Cards: glass morphism + pink glow border ─────────────────── */
+[data-theme="girly"] .card,
+[data-theme="girly"] .glass-card {
+    background: var(--gradient-card);
+    border: 1px solid rgba(244, 114, 182, 0.15);
+    border-radius: var(--radius);
+    box-shadow:
+        0 0 0 1px rgba(244, 114, 182, 0.05),
+        0 4px 24px rgba(80, 0, 60, 0.3),
+        inset 0 1px 0 rgba(249, 168, 212, 0.06);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+}
+
+[data-theme="girly"] .card:hover,
+[data-theme="girly"] .glass-card:hover {
+    border-color: rgba(244, 114, 182, 0.35);
+    box-shadow:
+        0 0 0 1px rgba(244, 114, 182, 0.1),
+        0 0 20px rgba(244, 114, 182, 0.08),
+        0 8px 32px rgba(80, 0, 60, 0.4),
+        inset 0 1px 0 rgba(249, 168, 212, 0.08);
+}
+
+/* ── Bottom nav: dreamy gradient with pink glow ───────────────── */
+[data-theme="girly"] #bottom-nav {
+    background: var(--gradient-nav);
+    border-top: 1px solid rgba(244, 114, 182, 0.15);
+    box-shadow: 0 -4px 30px rgba(80, 0, 60, 0.3);
+}
+
+[data-theme="girly"] .nav-item.active {
+    color: #f9a8d4;
+    text-shadow: 0 0 12px rgba(244, 114, 182, 0.5);
+}
+
+[data-theme="girly"] .nav-item.active svg {
+    filter: drop-shadow(0 0 8px rgba(244, 114, 182, 0.5)) drop-shadow(0 0 16px rgba(192, 132, 252, 0.3));
+}
+
+/* ── Section headers: gradient text ───────────────────────────── */
+[data-theme="girly"] .section-title {
+    background: linear-gradient(135deg, #f9a8d4, #c084fc, #818cf8);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    font-weight: 800;
+}
+
+/* ── Buttons: Pink shimmer + softer shapes ────────────────────── */
+[data-theme="girly"] .btn-primary {
+    background: linear-gradient(135deg, #ec4899, #d946ef, #a855f7);
+    box-shadow: 0 2px 16px rgba(236, 72, 153, 0.3);
+    border-radius: var(--radius-sm);
+    border: none;
+    position: relative;
+    overflow: hidden;
+}
+
+[data-theme="girly"] .btn-primary::after {
+    content: '';
+    position: absolute;
+    top: -50%;
+    left: -50%;
+    width: 200%;
+    height: 200%;
+    background: linear-gradient(45deg,
+            transparent 40%,
+            rgba(255, 255, 255, 0.08) 45%,
+            rgba(255, 255, 255, 0.12) 50%,
+            rgba(255, 255, 255, 0.08) 55%,
+            transparent 60%);
+    animation: girlyShimmer 3s ease-in-out infinite;
+}
+
+@keyframes girlyShimmer {
+    0% {
+        transform: translateX(-100%) rotate(25deg);
+    }
+
+    100% {
+        transform: translateX(100%) rotate(25deg);
+    }
+}
+
+[data-theme="girly"] .btn-primary:hover {
+    box-shadow: 0 4px 24px rgba(236, 72, 153, 0.45);
+    transform: translateY(-1px);
+}
+
+[data-theme="girly"] .btn-outline {
+    border-color: rgba(244, 114, 182, 0.25);
+    color: #f9a8d4;
+    border-radius: var(--radius-sm);
+}
+
+[data-theme="girly"] .btn-outline:hover {
+    border-color: #f472b6;
+    color: #f472b6;
+    background: rgba(244, 114, 182, 0.08);
+    box-shadow: 0 0 16px rgba(244, 114, 182, 0.12);
+}
+
+/* ── Trade side buttons ───────────────────────────────────────── */
+[data-theme="girly"] .btn-long,
+[data-theme="girly"] .side-toggle button.active-long,
+[data-theme="girly"] .side-toggle-mini button.active-long,
+[data-theme="girly"] .btn-submit-long {
+    background: linear-gradient(135deg, #10b981, #34d399);
+    box-shadow: 0 2px 16px rgba(52, 211, 153, 0.3);
+    border-radius: var(--radius-sm);
+}
+
+[data-theme="girly"] .btn-short,
+[data-theme="girly"] .side-toggle button.active-short,
+[data-theme="girly"] .side-toggle-mini button.active-short,
+[data-theme="girly"] .btn-submit-short {
+    background: linear-gradient(135deg, #e11d48, #fb7185);
+    box-shadow: 0 2px 16px rgba(251, 113, 133, 0.3);
+    border-radius: var(--radius-sm);
+}
+
+/* ── Bot toggle ───────────────────────────────────────────────── */
+[data-theme="girly"] .bot-toggle input:checked+.bot-toggle-slider {
+    background: linear-gradient(135deg, #ec4899, #c084fc);
+    border-color: #f472b6;
+    box-shadow: 0 0 16px rgba(236, 72, 153, 0.35);
+}
+
+/* ── Leverage slider ──────────────────────────────────────────── */
+[data-theme="girly"] .leverage-slider {
+    background: linear-gradient(to right, #34d399, #fbbf24, #fb7185);
+}
+
+/* ── Tab bar: soft glow active tabs ───────────────────────────── */
+[data-theme="girly"] .tab-bar button.active {
+    background: rgba(244, 114, 182, 0.12);
+    color: #f9a8d4;
+    border-radius: var(--radius-sm);
+    box-shadow: 0 0 12px rgba(244, 114, 182, 0.08);
+}
+
+/* ── Trading tabs ─────────────────────────────────────────────── */
+[data-theme="girly"] .trading-tab.active {
+    color: #f9a8d4 !important;
+    border-color: #f472b6 !important;
+    text-shadow: 0 0 8px rgba(244, 114, 182, 0.3);
+}
+
+/* ── Badges: cute rounded pills ───────────────────────────────── */
+[data-theme="girly"] .badge {
+    border-radius: 20px;
+    font-weight: 600;
+}
+
+[data-theme="girly"] .badge-active {
+    background: linear-gradient(135deg, rgba(52, 211, 153, 0.15), rgba(52, 211, 153, 0.08));
+    color: #34d399;
+    border: 1px solid rgba(52, 211, 153, 0.2);
+}
+
+/* ── Modals: dreamier backdrop + rounded ──────────────────────── */
+[data-theme="girly"] .modal-overlay {
+    background: rgba(18, 10, 24, 0.8);
+    backdrop-filter: blur(8px);
+}
+
+[data-theme="girly"] .modal-content {
+    background: linear-gradient(145deg, #241529, #1a0f1e);
+    border: 1px solid rgba(244, 114, 182, 0.15);
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    box-shadow: 0 -8px 40px rgba(244, 114, 182, 0.1);
+}
+
+/* ── Inputs: pink focus ring ──────────────────────────────────── */
+[data-theme="girly"] input:focus,
+[data-theme="girly"] select:focus {
+    border-color: rgba(244, 114, 182, 0.5) !important;
+    box-shadow: 0 0 0 3px rgba(244, 114, 182, 0.1),
+        0 0 16px rgba(244, 114, 182, 0.08) !important;
+    outline: none;
+}
+
+/* ── Search input ─────────────────────────────────────────────── */
+[data-theme="girly"] .search-input {
+    border-color: rgba(244, 114, 182, 0.15);
+    border-radius: var(--radius-sm);
+}
+
+[data-theme="girly"] .search-input:focus {
+    border-color: rgba(244, 114, 182, 0.4);
+}
+
+/* ── Toast: pink accent ───────────────────────────────────────── */
+[data-theme="girly"] .toast {
+    background: rgba(26, 15, 36, 0.92);
+    border-color: rgba(244, 114, 182, 0.1);
+    box-shadow: 0 4px 24px rgba(80, 0, 60, 0.5);
+}
+
+/* ── Symbol list items ────────────────────────────────────────── */
+[data-theme="girly"] .symbol-item:hover {
+    background: rgba(244, 114, 182, 0.06);
+}
+
+/* ── Order book: dreamy highlight ─────────────────────────────── */
+[data-theme="girly"] .ob-mid {
+    color: #f9a8d4;
+    text-shadow: 0 0 8px rgba(244, 114, 182, 0.3);
+}
+
+/* ── Stat items ───────────────────────────────────────────────── */
+[data-theme="girly"] .stat-label {
+    color: #8a5478;
+}
+
+/* ── Panel headers in trading ─────────────────────────────────── */
+[data-theme="girly"] .panel-header {
+    border-bottom-color: rgba(244, 114, 182, 0.12);
+}
+
+/* ── Position side badges ─────────────────────────────────────── */
+[data-theme="girly"] .badge-long {
+    background: rgba(52, 211, 153, 0.12);
+    color: #34d399;
+    border: 1px solid rgba(52, 211, 153, 0.2);
+    border-radius: 20px;
+}
+
+[data-theme="girly"] .badge-short {
+    background: rgba(251, 113, 133, 0.12);
+    color: #fb7185;
+    border: 1px solid rgba(251, 113, 133, 0.2);
+    border-radius: 20px;
+}
+
+/* ── Chart container: subtle border glow ──────────────────────── */
+[data-theme="girly"] .chart-panel {
+    border-color: rgba(244, 114, 182, 0.1);
+}
+
+[data-theme="girly"] .chart-toolbar {
+    border-color: rgba(244, 114, 182, 0.1);
+}
+
+/* ── Timeframe buttons ────────────────────────────────────────── */
+[data-theme="girly"] .tf-btn.active {
+    color: #f9a8d4;
+    background: rgba(244, 114, 182, 0.12);
+    border-color: rgba(244, 114, 182, 0.25);
+}
+
+/* ── Size slider: pink fill ───────────────────────────────────── */
+[data-theme="girly"] .size-slider-fill {
+    background: linear-gradient(90deg, #ec4899, #c084fc);
+}
+
+[data-theme="girly"] .slider-diamond.active {
+    background: #f472b6;
+    border-color: #f472b6;
+    box-shadow: 0 0 6px rgba(244, 114, 182, 0.4);
+}
+
+/* ── Scrollbar: kawaii thin pink ───────────────────────────────── */
+[data-theme="girly"] ::-webkit-scrollbar {
+    width: 5px;
+}
+
+[data-theme="girly"] ::-webkit-scrollbar-track {
+    background: rgba(18, 10, 24, 0.3);
+}
+
+[data-theme="girly"] ::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, #ec4899, #c084fc);
+    border-radius: 10px;
+}
+
+[data-theme="girly"] ::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(180deg, #f472b6, #d580f0);
+}
+
+/* ── Cute illustrations: even more pronounced glow in girly ──── */
+[data-theme="girly"] .cute-svg {
+    filter: drop-shadow(0 0 24px rgba(244, 114, 182, 0.35)) drop-shadow(0 0 48px rgba(192, 132, 252, 0.15));
+}
+
+[data-theme="girly"] .cute-title {
+    background: linear-gradient(135deg, #f472b6, #f9a8d4, #c084fc);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    text-shadow: none;
+}
+
+/* ── Compact positions panel ──────────────────────────────────── */
+[data-theme="girly"] .compact-pos-panel {
+    border-color: rgba(244, 114, 182, 0.1);
+}
+
+/* ── Open orders panel ────────────────────────────────────────── */
+[data-theme="girly"] .open-orders-panel {
+    border-color: rgba(244, 114, 182, 0.1);
+}
+
+/* ── Cancel all button: cute danger ───────────────────────────── */
+[data-theme="girly"] .btn-cancel-all {
+    border-color: rgba(251, 113, 133, 0.3);
+    color: #fb7185;
+    border-radius: 20px;
+}
+
+[data-theme="girly"] .btn-cancel-all:hover {
+    background: rgba(251, 113, 133, 0.1);
+    box-shadow: 0 0 12px rgba(251, 113, 133, 0.15);
+}
+
+/* ── Account page: equity chart area ──────────────────────────── */
+[data-theme="girly"] #equity-chart {
+    border-radius: var(--radius);
+    border: 1px solid rgba(244, 114, 182, 0.1);
+}
+
+/* ── Symbol bar: dreamy ───────────────────────────────────────── */
+[data-theme="girly"] .symbol-bar {
+    border-bottom-color: rgba(244, 114, 182, 0.1);
+    background: rgba(26, 15, 36, 0.5);
+}
+
+[data-theme="girly"] .symbol-bar-name {
+    color: #f9a8d4;
+}
+
+[data-theme="girly"] .symbol-bar-price {
+    color: #f8e8f4;
+    text-shadow: 0 0 8px rgba(244, 114, 182, 0.2);
+}
+
+/* ── Auth card (login) ────────────────────────────────────────── */
+[data-theme="girly"] #auth-card {
+    background: linear-gradient(145deg, rgba(45, 20, 55, 0.9), rgba(30, 12, 40, 0.95));
+    border: 1px solid rgba(244, 114, 182, 0.15);
+    box-shadow:
+        0 0 40px rgba(244, 114, 182, 0.08),
+        0 8px 40px rgba(80, 0, 60, 0.4);
+}
+
+/* ── Header: subtle pink underline ────────────────────────────── */
+[data-theme="girly"] #app-header {
+    border-bottom-color: rgba(244, 114, 182, 0.1);
+    background: rgba(18, 10, 24, 0.8);
+    backdrop-filter: blur(16px);
+}
+
+/* ── Index trading ────────────────────────────────────────────── */
+[data-theme="girly"] .idx-list {
+    border-color: rgba(244, 114, 182, 0.1);
+}
+
+[data-theme="girly"] .idx-item.active {
+    background: rgba(244, 114, 182, 0.08);
+    border-color: rgba(244, 114, 182, 0.25);
+}
+
+/* ── Submit trade buttons: extra glow ─────────────────────────── */
+[data-theme="girly"] .btn-submit {
+    border-radius: var(--radius-sm);
+    font-weight: 700;
+    letter-spacing: 0.3px;
+}
+
+[data-theme="girly"] .btn-submit-long:hover {
+    box-shadow: 0 0 24px rgba(52, 211, 153, 0.35),
+        0 4px 16px rgba(52, 211, 153, 0.2);
+    transform: translateY(-1px);
+}
+
+[data-theme="girly"] .btn-submit-short:hover {
+    box-shadow: 0 0 24px rgba(251, 113, 133, 0.35),
+        0 4px 16px rgba(251, 113, 133, 0.2);
+    transform: translateY(-1px);
+}
+
+/* ── Range input styling ──────────────────────────────────────── */
+[data-theme="girly"] input[type="range"]::-webkit-slider-thumb {
+    background: linear-gradient(135deg, #f472b6, #c084fc);
+    border: 2px solid #f9a8d4;
+    box-shadow: 0 0 8px rgba(244, 114, 182, 0.4);
+}
+
+/* ── Equity / UPNL panel ──────────────────────────────────────── */
+[data-theme="girly"] .equity-upnl-panel {
+    background: rgba(60, 25, 70, 0.4);
+    border-color: rgba(244, 114, 182, 0.1);
+}
+
+/* ── Selection highlight ──────────────────────────────────────── */
+[data-theme="girly"] ::selection {
+    background: rgba(244, 114, 182, 0.3);
+    color: #f8e8f4;
+}
+
+/* ── Keyframe: gentle pulse for nav active indicator ──────────── */
+@keyframes girlyPulse {
+
+    0%,
+    100% {
+        opacity: 0.8;
+    }
+
+    50% {
+        opacity: 1;
+    }
+}
+
+[data-theme="girly"] .nav-item.active::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 20px;
+    height: 3px;
+    background: linear-gradient(90deg, #f472b6, #c084fc);
+    border-radius: 3px;
+    animation: girlyPulse 2s ease-in-out infinite;
+}
+
+[data-theme="girly"] .nav-item {
+    position: relative;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   🎀✨ GIRLY ANIMATIONS ✨🎀
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── 🌸 Sakura Petals ────────────────────────────────────────── */
+.girly-sakura-petal {
+    position: absolute;
+    left: var(--start-x);
+    top: -20px;
+    width: var(--size);
+    height: var(--size);
+    background: radial-gradient(circle, #f9a8d4, #f472b6);
+    border-radius: 50% 0 50% 50%;
+    opacity: var(--opacity);
+    animation: girlySakuraFall var(--duration) linear var(--delay) infinite;
+    transform: rotate(45deg);
+}
+
+@keyframes girlySakuraFall {
+    0% {
+        transform: translateY(0) translateX(0) rotate(0deg);
+        opacity: 0;
+    }
+
+    5% {
+        opacity: var(--opacity, 0.08);
+    }
+
+    85% {
+        opacity: var(--opacity, 0.08);
+    }
+
+    100% {
+        transform: translateY(110vh) translateX(80px) rotate(720deg);
+        opacity: 0;
+    }
+}
+
+/* ── ⭐ Twinkle Stars ────────────────────────────────────────── */
+@keyframes girlyTwinkle {
+    0% {
+        opacity: 0.1;
+        transform: scale(0.6);
+    }
+
+    50% {
+        opacity: 0.8;
+        transform: scale(1.2);
+    }
+
+    100% {
+        opacity: 0.15;
+        transform: scale(0.7);
+    }
+}
+
+/* ── 🐱 Cat Walking Legs ─────────────────────────────────────── */
+.girly-cat-walking .girly-cat-leg1 {
+    animation: girlyCatLeg 0.3s ease-in-out infinite alternate;
+}
+
+.girly-cat-walking .girly-cat-leg2 {
+    animation: girlyCatLeg 0.3s ease-in-out 0.075s infinite alternate;
+}
+
+.girly-cat-walking .girly-cat-leg3 {
+    animation: girlyCatLeg 0.3s ease-in-out 0.15s infinite alternate;
+}
+
+.girly-cat-walking .girly-cat-leg4 {
+    animation: girlyCatLeg 0.3s ease-in-out 0.225s infinite alternate;
+}
+
+@keyframes girlyCatLeg {
+    0% {
+        transform: rotate(-8deg);
+    }
+
+    100% {
+        transform: rotate(8deg);
+    }
+}
+
+.girly-cat-sitting {
+    animation: girlyCatBreathe 2s ease-in-out infinite;
+}
+
+@keyframes girlyCatBreathe {
+
+    0%,
+    100% {
+        transform: scaleY(1);
+    }
+
+    50% {
+        transform: scaleY(1.03);
+    }
+}
+
+/* ── ✨ Sparkle Burst Particles ───────────────────────────────── */
+.girly-sparkle-particle {
+    animation: girlySparkleParticle 1.2s cubic-bezier(0.25, 0.46, 0.45, 0.94) forwards;
+}
+
+@keyframes girlySparkleParticle {
+    0% {
+        transform: translate(0, 0) scale(1);
+        opacity: 1;
+    }
+
+    60% {
+        opacity: 0.8;
+    }
+
+    100% {
+        transform: translate(var(--dx), calc(var(--dy) + 100px)) scale(0);
+        opacity: 0;
+    }
+}
+
+/* ── 💸 Money Rain ────────────────────────────────────────────── */
+@keyframes girlyMoneyFall {
+    0% {
+        transform: translateY(0) rotate(0deg) scale(0.5);
+        opacity: 0;
+    }
+
+    10% {
+        opacity: 1;
+        transform: translateY(5vh) rotate(20deg) scale(1);
+    }
+
+    80% {
+        opacity: 0.8;
+    }
+
+    100% {
+        transform: translateY(110vh) rotate(360deg) scale(0.6);
+        opacity: 0;
+    }
+}
+
+/* ── 💔 Heartbreak ────────────────────────────────────────────── */
+@keyframes girlyHeartbreak {
+    0% {
+        transform: translate(-50%, -50%) scale(0.2);
+        opacity: 0;
+    }
+
+    20% {
+        transform: translate(-50%, -50%) scale(1.3);
+        opacity: 1;
+    }
+
+    40% {
+        transform: translate(-50%, -50%) scale(1);
+    }
+
+    70% {
+        transform: translate(-50%, -50%) scale(1.1);
+        opacity: 0.8;
+    }
+
+    100% {
+        transform: translate(-50%, -50%) scale(1.5);
+        opacity: 0;
+    }
+}
+
+/* ── 🎀 Toast Wiggle Entrance ─────────────────────────────────── */
+[data-theme="girly"] .toast {
+    animation: girlyToastWiggle 0.5s ease-out;
+}
+
+@keyframes girlyToastWiggle {
+    0% {
+        transform: translateX(120%);
+        opacity: 0;
+    }
+
+    40% {
+        transform: translateX(-4px) rotate(-2deg);
+        opacity: 1;
+    }
+
+    60% {
+        transform: translateX(3px) rotate(1.5deg);
+    }
+
+    75% {
+        transform: translateX(-2px) rotate(-0.5deg);
+    }
+
+    100% {
+        transform: translateX(0) rotate(0);
+    }
+}
+
+/* ── 💖 Heartbeat Hover on Cards ──────────────────────────────── */
+[data-theme="girly"] .card:hover,
+[data-theme="girly"] .glass-card:hover {
+    animation: girlyHeartbeatHover 0.8s ease-in-out;
+}
+
+@keyframes girlyHeartbeatHover {
+    0% {
+        transform: scale(1);
+    }
+
+    15% {
+        transform: scale(1.012);
+    }
+
+    30% {
+        transform: scale(1);
+    }
+
+    45% {
+        transform: scale(1.008);
+    }
+
+    60% {
+        transform: scale(1);
+    }
+}
+
+/* ── 🎵 Nav Item Bounce on Click ──────────────────────────────── */
+[data-theme="girly"] .nav-item:active {
+    animation: girlyNavBounce 0.4s ease-out;
+}
+
+@keyframes girlyNavBounce {
+    0% {
+        transform: scale(1);
+    }
+
+    30% {
+        transform: scale(0.88);
+    }
+
+    50% {
+        transform: scale(1.1);
+    }
+
+    70% {
+        transform: scale(0.96);
+    }
+
+    100% {
+        transform: scale(1);
+    }
+}
+
+/* ── 🌙 Cat Paw Wave Loading Enhancement ─────────────────────── */
+[data-theme="girly"] .cute-bounce {
+    animation: girlyCuteBounce 0.8s ease-in-out infinite alternate;
+}
+
+@keyframes girlyCuteBounce {
+    0% {
+        transform: translateY(0) rotate(0deg);
+    }
+
+    50% {
+        transform: translateY(-4px) rotate(-3deg);
+    }
+
+    100% {
+        transform: translateY(0) rotate(3deg);
+    }
+}
+
+/* ── 🎀 Cursor Trail Dot ─────────────────────────────────────── */
+.girly-cursor-trail {
+    will-change: transform, left, top;
+    transform: translate(-50%, -50%);
+}

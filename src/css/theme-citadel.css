@@ -1,0 +1,1051 @@
+/* ═══════════════════════════════════════════════════════════════
+   ⚡ CITADEL PRO QUANT THEME — Director-Grade
+   Institutional dark terminal · Bloomberg war room · Hedge fund HUD
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── Color palette ────────────────────────────────────────────── */
+[data-theme="citadel"] {
+    --bg-primary: #05080e;
+    --bg-secondary: #0a0e18;
+    --bg-card: rgba(12, 18, 30, 0.88);
+    --bg-card-hover: rgba(16, 24, 40, 0.92);
+    --bg-input: #070a12;
+    --bg-glass: rgba(10, 16, 26, 0.94);
+    --surface-2: rgba(16, 24, 38, 0.65);
+
+    --text: #e2e8f0;
+    --text-primary: #e2e8f0;
+    --text-secondary: #8892a4;
+    --text-muted: #3d4a5f;
+
+    --accent: #00d4ff;
+    --accent-hover: #33ddff;
+    --accent-glow: rgba(0, 212, 255, 0.22);
+    --accent-gold: #d4a017;
+    --accent-gold-glow: rgba(212, 160, 23, 0.2);
+
+    --green: #00e676;
+    --green-bg: rgba(0, 230, 118, 0.07);
+    --green-glow: rgba(0, 230, 118, 0.18);
+
+    --red: #ff1744;
+    --red-bg: rgba(255, 23, 68, 0.07);
+    --red-glow: rgba(255, 23, 68, 0.18);
+
+    --yellow: #f59e0b;
+    --yellow-bg: rgba(245, 158, 11, 0.07);
+
+    --border: rgba(0, 212, 255, 0.06);
+    --border-active: rgba(0, 212, 255, 0.3);
+
+    --radius: 4px;
+    --radius-sm: 2px;
+    --radius-lg: 6px;
+
+    --shadow: 0 1px 12px rgba(0, 0, 0, 0.7);
+    --shadow-lg: 0 4px 28px rgba(0, 0, 0, 0.85);
+
+    --gradient-accent: linear-gradient(90deg, #00d4ff, #0084ff);
+    --gradient-card: linear-gradient(180deg, rgba(12, 18, 30, 0.92), rgba(7, 10, 18, 0.96));
+    --gradient-nav: linear-gradient(180deg, rgba(8, 12, 20, 0.98), rgba(5, 8, 14, 0.99));
+    --theme-color: #05080e;
+
+    --font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+}
+
+/* ── Body: HUD grid + vignette ────────────────────────────────── */
+[data-theme="citadel"] body {
+    background:
+        linear-gradient(rgba(0, 212, 255, 0.008) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 212, 255, 0.008) 1px, transparent 1px),
+        radial-gradient(ellipse at 50% 0%, rgba(0, 100, 200, 0.03) 0%, transparent 55%),
+        radial-gradient(ellipse at 50% 100%, rgba(0, 0, 0, 0.3) 0%, transparent 70%),
+        #05080e;
+    background-size: 32px 32px, 32px 32px, 100% 100%, 100% 100%, 100% 100%;
+}
+
+/* ── HUD corner brackets ──────────────────────────────────────── */
+[data-theme="citadel"] body::before,
+[data-theme="citadel"] body::after {
+    content: '';
+    position: fixed;
+    pointer-events: none;
+    z-index: 9998;
+}
+
+[data-theme="citadel"] body::before {
+    top: 8px;
+    left: 8px;
+    width: 28px;
+    height: 28px;
+    border-top: 2px solid rgba(0, 212, 255, 0.2);
+    border-left: 2px solid rgba(0, 212, 255, 0.2);
+}
+
+[data-theme="citadel"] body::after {
+    bottom: calc(var(--nav-height) + var(--safe-bottom) + 8px);
+    right: 8px;
+    width: 28px;
+    height: 28px;
+    border-bottom: 2px solid rgba(0, 212, 255, 0.2);
+    border-right: 2px solid rgba(0, 212, 255, 0.2);
+}
+
+/* ── Scan line overlay (very subtle) ──────────────────────────── */
+[data-theme="citadel"] #app::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background: repeating-linear-gradient(0deg,
+            transparent,
+            transparent 3px,
+            rgba(0, 212, 255, 0.005) 3px,
+            rgba(0, 212, 255, 0.005) 6px);
+    animation: citadelScan 30s linear infinite;
+}
+
+@keyframes citadelScan {
+    0% {
+        background-position: 0 0;
+    }
+
+    100% {
+        background-position: 0 300px;
+    }
+}
+
+/* ── Vignette edge darkening ──────────────────────────────────── */
+[data-theme="citadel"] #app::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background: radial-gradient(ellipse at center, transparent 50%, rgba(0, 0, 0, 0.35) 100%);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   DATA TYPOGRAPHY
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .stat-value,
+[data-theme="citadel"] .pnl-value,
+[data-theme="citadel"] .price-value,
+[data-theme="citadel"] .size-value,
+[data-theme="citadel"] .ob-row span,
+[data-theme="citadel"] .pos-col-val,
+[data-theme="citadel"] .cpr-pnl {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.2px;
+}
+
+[data-theme="citadel"] .stat-label,
+[data-theme="citadel"] .pos-col-label,
+[data-theme="citadel"] .panel-header,
+[data-theme="citadel"] .bot-settings-group-title {
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    font-size: 0.68em;
+    font-weight: 700;
+    font-family: var(--font);
+}
+
+/* PnL glow: green values glow green, red glow red */
+[data-theme="citadel"] .pnl-positive,
+[data-theme="citadel"] .profit {
+    text-shadow: 0 0 8px rgba(0, 230, 118, 0.35);
+}
+
+[data-theme="citadel"] .pnl-negative,
+[data-theme="citadel"] .loss {
+    text-shadow: 0 0 8px rgba(255, 23, 68, 0.3);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   CARDS — Frosted glass + gold top trim
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .card,
+[data-theme="citadel"] .glass-card {
+    background: var(--gradient-card);
+    border: 1px solid rgba(0, 212, 255, 0.06);
+    border-radius: var(--radius);
+    box-shadow:
+        0 0 0 1px rgba(0, 0, 0, 0.3),
+        0 1px 8px rgba(0, 0, 0, 0.5),
+        inset 0 1px 0 rgba(0, 212, 255, 0.03);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    position: relative;
+}
+
+[data-theme="citadel"] .card:hover,
+[data-theme="citadel"] .glass-card:hover {
+    border-color: rgba(0, 212, 255, 0.14);
+    box-shadow:
+        0 0 0 1px rgba(0, 212, 255, 0.04),
+        0 0 8px rgba(0, 212, 255, 0.03),
+        0 4px 16px rgba(0, 0, 0, 0.6),
+        inset 0 1px 0 rgba(0, 212, 255, 0.05);
+}
+
+/* Gold top trim on important cards */
+[data-theme="citadel"] .glass-card.gold-trim,
+[data-theme="citadel"] .card.active {
+    border-top: 2px solid var(--accent-gold);
+    box-shadow:
+        0 -2px 12px rgba(212, 160, 23, 0.1),
+        0 1px 8px rgba(0, 0, 0, 0.5);
+}
+
+/* Left accent bar on selected items */
+[data-theme="citadel"] .idx-item.active,
+[data-theme="citadel"] .symbol-item.selected {
+    border-left: 3px solid var(--accent);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   BOTTOM NAV — War room control bar
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] #bottom-nav {
+    background: var(--gradient-nav);
+    border-top: 1px solid rgba(0, 212, 255, 0.08);
+    box-shadow:
+        0 -1px 0 rgba(0, 0, 0, 0.5),
+        0 -4px 20px rgba(0, 0, 0, 0.4);
+}
+
+[data-theme="citadel"] .nav-item {
+    position: relative;
+    transition: color 0.15s ease-out;
+}
+
+[data-theme="citadel"] .nav-item.active {
+    color: #00d4ff;
+}
+
+[data-theme="citadel"] .nav-item.active svg {
+    filter: drop-shadow(0 0 4px rgba(0, 212, 255, 0.5));
+}
+
+[data-theme="citadel"] .nav-item.active::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 28px;
+    height: 2px;
+    background: #00d4ff;
+    box-shadow: 0 0 6px rgba(0, 212, 255, 0.6), 0 0 20px rgba(0, 212, 255, 0.15);
+    animation: citadelNavGlow 3s ease-in-out infinite;
+}
+
+@keyframes citadelNavGlow {
+
+    0%,
+    100% {
+        opacity: 0.7;
+        box-shadow: 0 0 6px rgba(0, 212, 255, 0.4);
+    }
+
+    50% {
+        opacity: 1;
+        box-shadow: 0 0 10px rgba(0, 212, 255, 0.7), 0 0 24px rgba(0, 212, 255, 0.2);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SECTION HEADERS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .section-title {
+    background: linear-gradient(90deg, #00d4ff, #0084ff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    font-weight: 800;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    font-size: 0.82em;
+}
+
+[data-theme="citadel"] .card-title {
+    font-weight: 700;
+    letter-spacing: 0.3px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   BUTTONS — Institutional precision
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .btn-primary {
+    background: linear-gradient(180deg, #0080ee, #0060bb);
+    box-shadow: 0 1px 6px rgba(0, 128, 238, 0.2);
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(0, 128, 238, 0.25);
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    font-size: 0.82em;
+    transition: all 0.12s ease-out;
+}
+
+[data-theme="citadel"] .btn-primary:hover {
+    background: linear-gradient(180deg, #0090ff, #0070dd);
+    box-shadow: 0 2px 12px rgba(0, 128, 238, 0.3);
+    transform: none;
+}
+
+[data-theme="citadel"] .btn-primary:active {
+    transform: scale(0.98);
+    box-shadow: 0 0 4px rgba(0, 128, 238, 0.2);
+}
+
+[data-theme="citadel"] .btn-outline {
+    border-color: rgba(0, 212, 255, 0.15);
+    color: #00d4ff;
+    border-radius: var(--radius-sm);
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    transition: all 0.12s ease-out;
+}
+
+[data-theme="citadel"] .btn-outline:hover {
+    border-color: rgba(0, 212, 255, 0.35);
+    background: rgba(0, 212, 255, 0.04);
+    box-shadow: 0 0 8px rgba(0, 212, 255, 0.06);
+    color: #33ddff;
+}
+
+/* ── Trade side buttons ───────────────────────────────────────── */
+[data-theme="citadel"] .btn-long,
+[data-theme="citadel"] .side-toggle button.active-long,
+[data-theme="citadel"] .side-toggle-mini button.active-long,
+[data-theme="citadel"] .btn-submit-long {
+    background: linear-gradient(180deg, #00c853, #009e3f);
+    box-shadow: 0 1px 6px rgba(0, 200, 83, 0.15);
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(0, 230, 118, 0.15);
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    font-size: 0.82em;
+}
+
+[data-theme="citadel"] .btn-short,
+[data-theme="citadel"] .side-toggle button.active-short,
+[data-theme="citadel"] .side-toggle-mini button.active-short,
+[data-theme="citadel"] .btn-submit-short {
+    background: linear-gradient(180deg, #e6002e, #c00028);
+    box-shadow: 0 1px 6px rgba(255, 23, 68, 0.15);
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(255, 23, 68, 0.15);
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    font-size: 0.82em;
+}
+
+[data-theme="citadel"] .btn-submit {
+    border-radius: var(--radius-sm);
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    font-size: 0.82em;
+    transition: all 0.12s ease-out;
+}
+
+[data-theme="citadel"] .btn-submit-long:hover {
+    box-shadow: 0 0 14px rgba(0, 230, 118, 0.25);
+}
+
+[data-theme="citadel"] .btn-submit-short:hover {
+    box-shadow: 0 0 14px rgba(255, 23, 68, 0.25);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   BOT CONTROLS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .bot-toggle input:checked+.bot-toggle-slider {
+    background: linear-gradient(135deg, #0084ff, #00d4ff);
+    border-color: rgba(0, 212, 255, 0.4);
+    box-shadow: 0 0 10px rgba(0, 212, 255, 0.25);
+}
+
+[data-theme="citadel"] .leverage-slider {
+    background: linear-gradient(to right, #00e676, #f59e0b, #ff1744);
+}
+
+[data-theme="citadel"] .bot-settings-group {
+    border-color: rgba(0, 212, 255, 0.06);
+    border-radius: var(--radius);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TABS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .tab-bar button.active {
+    background: rgba(0, 212, 255, 0.06);
+    color: #00d4ff;
+    border-radius: var(--radius-sm);
+    box-shadow: inset 0 -2px 0 #00d4ff;
+    font-weight: 700;
+}
+
+[data-theme="citadel"] .trading-tab.active {
+    color: #00d4ff !important;
+    border-color: #00d4ff !important;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   BADGES — Sharp data labels
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .badge {
+    border-radius: var(--radius-sm);
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    font-family: var(--font-mono);
+    font-size: 0.72em;
+    font-variant-numeric: tabular-nums;
+}
+
+[data-theme="citadel"] .badge-active {
+    background: rgba(0, 230, 118, 0.08);
+    color: #00e676;
+    border: 1px solid rgba(0, 230, 118, 0.15);
+}
+
+[data-theme="citadel"] .badge-long {
+    background: rgba(0, 230, 118, 0.06);
+    color: #00e676;
+    border: 1px solid rgba(0, 230, 118, 0.12);
+    border-radius: var(--radius-sm);
+}
+
+[data-theme="citadel"] .badge-short {
+    background: rgba(255, 23, 68, 0.06);
+    color: #ff1744;
+    border: 1px solid rgba(255, 23, 68, 0.12);
+    border-radius: var(--radius-sm);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   MODALS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .modal-overlay {
+    background: rgba(3, 5, 8, 0.88);
+    backdrop-filter: blur(3px);
+}
+
+[data-theme="citadel"] .modal-content {
+    background: linear-gradient(180deg, #0c1220, #070a12);
+    border: 1px solid rgba(0, 212, 255, 0.1);
+    border-top: 2px solid var(--accent-gold);
+    border-radius: var(--radius);
+    box-shadow:
+        0 0 24px rgba(0, 212, 255, 0.04),
+        0 8px 40px rgba(0, 0, 0, 0.75);
+}
+
+/* Citadel confirm modal overrides */
+[data-theme="citadel"] .cute-confirm-modal {
+    background: linear-gradient(180deg, #0c1220, #070a12) !important;
+    border: 1px solid rgba(0, 212, 255, 0.1) !important;
+    border-top: 2px solid var(--accent-gold) !important;
+    border-radius: var(--radius) !important;
+}
+
+[data-theme="citadel"] .cute-confirm-title {
+    font-weight: 800 !important;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    font-size: 0.9em !important;
+    color: #e2e8f0 !important;
+    background: none !important;
+    -webkit-text-fill-color: unset !important;
+}
+
+[data-theme="citadel"] .cute-confirm-message {
+    color: var(--text-secondary) !important;
+    font-size: 0.85em;
+}
+
+[data-theme="citadel"] .cute-confirm-ok {
+    background: linear-gradient(180deg, #0080ee, #0060bb) !important;
+    border-radius: var(--radius-sm) !important;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+}
+
+[data-theme="citadel"] .cute-confirm-ok.cute-confirm-danger {
+    background: linear-gradient(180deg, #e6002e, #c00028) !important;
+}
+
+[data-theme="citadel"] .cute-confirm-cancel {
+    border-radius: var(--radius-sm) !important;
+    border-color: rgba(0, 212, 255, 0.15) !important;
+    color: var(--text-secondary) !important;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   INPUTS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] input,
+[data-theme="citadel"] select {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    letter-spacing: 0.3px;
+    font-variant-numeric: tabular-nums;
+}
+
+[data-theme="citadel"] input:focus,
+[data-theme="citadel"] select:focus {
+    border-color: rgba(0, 212, 255, 0.35) !important;
+    box-shadow: 0 0 0 1px rgba(0, 212, 255, 0.06),
+        0 0 8px rgba(0, 212, 255, 0.04) !important;
+    outline: none;
+}
+
+[data-theme="citadel"] .search-input {
+    border-color: rgba(0, 212, 255, 0.08);
+    border-radius: var(--radius-sm);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TOAST — Terminal alert bar
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .toast {
+    background: rgba(7, 10, 18, 0.96);
+    border: 1px solid rgba(0, 212, 255, 0.08);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-sm);
+    box-shadow: 0 2px 16px rgba(0, 0, 0, 0.7);
+    font-family: var(--font-mono);
+    font-size: 0.82em;
+    letter-spacing: 0.2px;
+    animation: citadelToastEnter 0.2s ease-out;
+}
+
+[data-theme="citadel"] .toast-success {
+    border-left-color: #00e676;
+}
+
+[data-theme="citadel"] .toast-error {
+    border-left-color: #ff1744;
+}
+
+[data-theme="citadel"] .toast-warning {
+    border-left-color: #f59e0b;
+}
+
+@keyframes citadelToastEnter {
+    0% {
+        transform: translateX(40px);
+        opacity: 0;
+    }
+
+    100% {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ORDER BOOK & MID PRICE
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .ob-mid {
+    color: #f59e0b;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    text-shadow: 0 0 6px rgba(245, 158, 11, 0.25);
+}
+
+[data-theme="citadel"] .symbol-item:hover {
+    background: rgba(0, 212, 255, 0.03);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   PANEL HEADERS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .panel-header {
+    border-bottom: 1px solid rgba(0, 212, 255, 0.06);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   CHART
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .chart-panel {
+    border-color: rgba(0, 212, 255, 0.04);
+}
+
+[data-theme="citadel"] .chart-toolbar {
+    border-color: rgba(0, 212, 255, 0.04);
+    background: rgba(7, 10, 18, 0.6);
+}
+
+[data-theme="citadel"] .tf-btn {
+    font-family: var(--font-mono);
+    font-size: 0.75em;
+    letter-spacing: 0.3px;
+    font-weight: 600;
+}
+
+[data-theme="citadel"] .tf-btn.active {
+    color: #00d4ff;
+    background: rgba(0, 212, 255, 0.06);
+    border-color: rgba(0, 212, 255, 0.15);
+    font-weight: 700;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SIZE SLIDER
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .size-slider-fill {
+    background: linear-gradient(90deg, #0060bb, #00d4ff);
+}
+
+[data-theme="citadel"] .slider-diamond.active {
+    background: #00d4ff;
+    border-color: rgba(0, 212, 255, 0.5);
+    box-shadow: 0 0 4px rgba(0, 212, 255, 0.4);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SCROLLBAR — Ultra-thin 3px trace
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] ::-webkit-scrollbar {
+    width: 3px;
+}
+
+[data-theme="citadel"] ::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+[data-theme="citadel"] ::-webkit-scrollbar-thumb {
+    background: rgba(0, 212, 255, 0.15);
+    border-radius: 1px;
+}
+
+[data-theme="citadel"] ::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 212, 255, 0.3);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   EMPTY STATES — Terminal style (override cute/kawaii)
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .cute-svg {
+    filter: drop-shadow(0 0 12px rgba(0, 212, 255, 0.15));
+    opacity: 0.7;
+}
+
+[data-theme="citadel"] .cute-title {
+    background: linear-gradient(90deg, #00d4ff, #0084ff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    text-shadow: none;
+    font-weight: 800;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    font-size: 0.85em;
+}
+
+[data-theme="citadel"] .cute-subtitle {
+    font-family: var(--font-mono);
+    font-size: 0.78em;
+    letter-spacing: 0.3px;
+    color: var(--text-muted);
+}
+
+[data-theme="citadel"] .cute-illustration {
+    animation: citadelFloat 4s ease-in-out infinite;
+}
+
+@keyframes citadelFloat {
+
+    0%,
+    100% {
+        transform: translateY(0);
+    }
+
+    50% {
+        transform: translateY(-4px);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   POSITIONS / ORDERS PANELS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .compact-pos-panel {
+    border-color: rgba(0, 212, 255, 0.04);
+}
+
+[data-theme="citadel"] .open-orders-panel {
+    border-color: rgba(0, 212, 255, 0.04);
+}
+
+[data-theme="citadel"] .btn-cancel-all {
+    border-color: rgba(255, 23, 68, 0.15);
+    color: #ff1744;
+    border-radius: var(--radius-sm);
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+    font-size: 0.75em;
+    font-family: var(--font-mono);
+    transition: all 0.12s ease-out;
+}
+
+[data-theme="citadel"] .btn-cancel-all:hover {
+    background: rgba(255, 23, 68, 0.06);
+    box-shadow: 0 0 8px rgba(255, 23, 68, 0.08);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   EQUITY CHART & ACCOUNT
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] #equity-chart {
+    border-radius: var(--radius);
+    border: 1px solid rgba(0, 212, 255, 0.04);
+}
+
+[data-theme="citadel"] .equity-upnl-panel {
+    background: rgba(10, 16, 26, 0.5);
+    border-color: rgba(0, 212, 255, 0.04);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SYMBOL BAR
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .symbol-bar {
+    border-bottom-color: rgba(0, 212, 255, 0.04);
+    background: rgba(7, 10, 18, 0.7);
+}
+
+[data-theme="citadel"] .symbol-bar-name {
+    color: #00d4ff;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    letter-spacing: 0.6px;
+}
+
+[data-theme="citadel"] .symbol-bar-price {
+    color: #e2e8f0;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   AUTH CARD — Vault door aesthetic
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] #auth-card {
+    background: linear-gradient(180deg, rgba(12, 18, 32, 0.96), rgba(7, 10, 18, 0.98));
+    border: 1px solid rgba(0, 212, 255, 0.08);
+    border-top: 2px solid var(--accent-gold);
+    box-shadow:
+        0 0 20px rgba(212, 160, 23, 0.04),
+        0 8px 40px rgba(0, 0, 0, 0.65);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   APP HEADER
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] #app-header {
+    border-bottom-color: rgba(0, 212, 255, 0.04);
+    background: rgba(5, 8, 14, 0.92);
+    backdrop-filter: blur(8px);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   INDEX TRADING
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .idx-list {
+    border-color: rgba(0, 212, 255, 0.04);
+}
+
+[data-theme="citadel"] .idx-item.active {
+    background: rgba(0, 212, 255, 0.04);
+    border-color: rgba(0, 212, 255, 0.15);
+    border-left: 3px solid #00d4ff;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   RANGE INPUT
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] input[type="range"]::-webkit-slider-thumb {
+    background: #00d4ff;
+    border: 1px solid rgba(0, 132, 255, 0.5);
+    box-shadow: 0 0 4px rgba(0, 212, 255, 0.4);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SELECTION
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] ::selection {
+    background: rgba(0, 212, 255, 0.15);
+    color: #e2e8f0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   MICRO-ANIMATIONS — Professional, not playful
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Data tick pulse: brief flash on live values */
+@keyframes citadelDataTick {
+    0% {
+        color: inherit;
+    }
+
+    15% {
+        color: #00d4ff;
+        text-shadow: 0 0 4px rgba(0, 212, 255, 0.3);
+    }
+
+    100% {
+        color: inherit;
+        text-shadow: none;
+    }
+}
+
+.citadel-tick {
+    animation: citadelDataTick 0.4s ease-out;
+}
+
+/* Card entrance: subtle slide-up fade */
+@keyframes citadelCardEnter {
+    0% {
+        opacity: 0;
+        transform: translateY(6px);
+    }
+
+    100% {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+[data-theme="citadel"] .card,
+[data-theme="citadel"] .glass-card {
+    animation: citadelCardEnter 0.2s ease-out;
+}
+
+/* Status blink for connection */
+@keyframes citadelStatusBlink {
+
+    0%,
+    100% {
+        opacity: 0.5;
+    }
+
+    50% {
+        opacity: 1;
+    }
+}
+
+[data-theme="citadel"] .connection-status.online {
+    animation: citadelStatusBlink 2.5s ease-in-out infinite;
+}
+
+/* Suppress ALL bouncy/kawaii animations in citadel */
+[data-theme="citadel"] .cute-bounce,
+[data-theme="citadel"] .cute-bounce-delay1,
+[data-theme="citadel"] .cute-bounce-delay2,
+[data-theme="citadel"] .cute-bounce-delay3 {
+    animation: citadelFloat 4s ease-in-out infinite;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SCANNER
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .scanner-badge {
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: 0.72em;
+    letter-spacing: 0.5px;
+    font-weight: 700;
+}
+
+[data-theme="citadel"] .scanner-badge.active {
+    background: rgba(0, 212, 255, 0.06);
+    border-color: rgba(0, 212, 255, 0.2);
+    color: #00d4ff;
+    box-shadow: 0 0 6px rgba(0, 212, 255, 0.08);
+}
+
+[data-theme="citadel"] .scanner-stat-value {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ENGINE CARDS — Data panel feel
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .engine-card {
+    border-color: rgba(0, 212, 255, 0.04);
+    border-radius: var(--radius);
+    transition: border-color 0.15s ease-out;
+}
+
+[data-theme="citadel"] .engine-card.active {
+    border-color: rgba(0, 230, 118, 0.15);
+    border-left: 3px solid #00e676;
+    background: rgba(0, 230, 118, 0.02);
+}
+
+[data-theme="citadel"] .engine-card.cooldown {
+    border-color: rgba(245, 158, 11, 0.12);
+    border-left: 3px solid #f59e0b;
+    background: rgba(245, 158, 11, 0.02);
+}
+
+[data-theme="citadel"] .engine-state.active {
+    color: #00e676;
+    background: rgba(0, 230, 118, 0.08);
+    font-family: var(--font-mono);
+    font-size: 0.72em;
+    letter-spacing: 0.3px;
+    font-weight: 700;
+}
+
+[data-theme="citadel"] .engine-state.cooldown {
+    color: #f59e0b;
+    background: rgba(245, 158, 11, 0.08);
+    font-family: var(--font-mono);
+    font-size: 0.72em;
+    letter-spacing: 0.3px;
+    font-weight: 700;
+}
+
+[data-theme="citadel"] .engine-row .dim {
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   WEIGHT CHIPS — Monospace data
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .weight-chip {
+    font-family: var(--font-mono);
+    font-size: 0.72em;
+    border-radius: var(--radius-sm);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.3px;
+}
+
+[data-theme="citadel"] .weight-chip.long {
+    color: #00e676;
+    border-color: rgba(0, 230, 118, 0.15);
+    background: rgba(0, 230, 118, 0.04);
+}
+
+[data-theme="citadel"] .weight-chip.short {
+    color: #ff1744;
+    border-color: rgba(255, 23, 68, 0.15);
+    background: rgba(255, 23, 68, 0.04);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   INDEX CARDS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .index-card {
+    border-radius: var(--radius);
+    transition: border-color 0.12s ease-out;
+}
+
+[data-theme="citadel"] .index-card.active {
+    border-left: 3px solid #00d4ff;
+}
+
+[data-theme="citadel"] .index-card-header .card-title {
+    font-family: var(--font-mono);
+    letter-spacing: 0.3px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   EVENT LOG
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .event-item {
+    font-family: var(--font-mono);
+    font-size: 0.78em;
+    border-bottom-color: rgba(0, 212, 255, 0.03);
+}
+
+[data-theme="citadel"] .event-time {
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   THEME SWATCH OVERRIDE (account page picker)
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .theme-swatch {
+    border-radius: var(--radius) !important;
+}
+
+[data-theme="citadel"] .theme-swatch:hover {
+    transform: translateY(-1px);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ACCOUNT PAGE — Stat grid
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] .stat-grid {
+    gap: 8px;
+}
+
+[data-theme="citadel"] .stat-item {
+    background: rgba(10, 16, 26, 0.5);
+    border: 1px solid rgba(0, 212, 255, 0.04);
+    border-radius: var(--radius);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   RECONNECT BANNER — Override pink kitten with cyan
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="citadel"] #reconnect-banner {
+    background: rgba(0, 212, 255, 0.04) !important;
+    border-color: rgba(0, 212, 255, 0.12) !important;
+}
+
+[data-theme="citadel"] #reconnect-banner .cute-bounce {
+    animation: citadelStatusBlink 1.5s ease-in-out infinite;
+}

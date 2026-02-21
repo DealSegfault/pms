@@ -1,0 +1,158 @@
+/* ═══════════════════════════════════════════════════════
+   🎀 Cute Empty States & Spinner Styles
+   ═══════════════════════════════════════════════════════ */
+
+/* ── Container ────────────────────────────────────── */
+.cute-empty {
+    text-align: center;
+    padding: 32px 20px 40px;
+}
+
+.cute-empty-mini {
+    padding: 12px 8px;
+}
+
+/* ── SVG ──────────────────────────────────────────── */
+.cute-svg {
+    width: 140px;
+    height: 140px;
+    margin: 0 auto;
+    display: block;
+    filter: drop-shadow(0 0 18px rgba(192, 132, 252, 0.25));
+}
+
+.cute-svg-sm {
+    width: 100px;
+    height: 100px;
+}
+
+/* ── Text ─────────────────────────────────────────── */
+.cute-title {
+    font-size: 18px;
+    font-weight: 800;
+    background: linear-gradient(135deg, #f9a8d4, #c084fc, #818cf8);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin-bottom: 6px;
+    letter-spacing: 0.3px;
+}
+
+.cute-subtitle {
+    font-size: 13px;
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+/* ── Illustration float ───────────────────────────── */
+.cute-illustration {
+    animation: cuteFloat 3s ease-in-out infinite;
+    margin-bottom: 8px;
+}
+
+@keyframes cuteFloat {
+
+    0%,
+    100% {
+        transform: translateY(0);
+    }
+
+    50% {
+        transform: translateY(-8px);
+    }
+}
+
+/* ── Sparkle twinkle ──────────────────────────────── */
+.sparkle1 {
+    animation: twinkle 2s ease-in-out infinite;
+}
+
+.sparkle2 {
+    animation: twinkle 2.4s ease-in-out 0.4s infinite;
+}
+
+.sparkle3 {
+    animation: twinkle 2.8s ease-in-out 0.8s infinite;
+}
+
+@keyframes twinkle {
+
+    0%,
+    100% {
+        opacity: 0.3;
+        transform: scale(0.8);
+    }
+
+    50% {
+        opacity: 1;
+        transform: scale(1.3);
+    }
+}
+
+/* ── Zzz float ────────────────────────────────────── */
+.zzz1 {
+    animation: zzzFloat 2.5s ease-in-out infinite;
+}
+
+.zzz2 {
+    animation: zzzFloat 2.5s ease-in-out 0.3s infinite;
+}
+
+.zzz3 {
+    animation: zzzFloat 2.5s ease-in-out 0.6s infinite;
+}
+
+@keyframes zzzFloat {
+
+    0%,
+    100% {
+        transform: translateY(0) scale(1);
+        opacity: 0.8;
+    }
+
+    50% {
+        transform: translateY(-4px) scale(1.1);
+        opacity: 0.4;
+    }
+}
+
+/* ── Bounce (paw spinner, tears, etc.) ────────────── */
+.cute-bounce {
+    animation: cuteBounce 1.2s ease-in-out infinite;
+}
+
+.cute-bounce-delay1 {
+    animation: cuteBounce 1.2s ease-in-out 0.15s infinite;
+}
+
+.cute-bounce-delay2 {
+    animation: cuteBounce 1.2s ease-in-out 0.3s infinite;
+}
+
+.cute-bounce-delay3 {
+    animation: cuteBounce 1.2s ease-in-out 0.45s infinite;
+}
+
+@keyframes cuteBounce {
+
+    0%,
+    100% {
+        transform: translateY(0);
+    }
+
+    50% {
+        transform: translateY(-6px);
+    }
+}
+
+/* ── Mini spinner container ───────────────────────── */
+.cute-spinner-mini {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 16px 0;
+}
+
+.cute-spinner-mini svg {
+    filter: drop-shadow(0 0 8px rgba(244, 114, 182, 0.3));
+}

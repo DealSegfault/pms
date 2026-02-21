@@ -1,0 +1,236 @@
+.duck-login-bg {
+    position: fixed;
+    inset: 0;
+    background:
+        radial-gradient(ellipse at 20% 80%, rgba(251, 191, 36, 0.08) 0%, transparent 50%),
+        radial-gradient(ellipse at 80% 20%, rgba(245, 158, 11, 0.06) 0%, transparent 50%),
+        radial-gradient(ellipse at 50% 50%, rgba(30, 20, 50, 0.9) 0%, transparent 100%),
+        linear-gradient(170deg, #0a0a1a 0%, #1a1025 30%, #0f0d1a 60%, #0a0815 100%);
+    overflow: hidden;
+    z-index: -1;
+}
+
+.duck-float {
+    position: absolute;
+    bottom: -60px;
+    animation: duckRise linear infinite;
+}
+
+@keyframes duckRise {
+    0% {
+        transform: translateY(0) rotate(0deg);
+        opacity: 0;
+    }
+
+    10% {
+        opacity: 1;
+    }
+
+    90% {
+        opacity: 1;
+    }
+
+    100% {
+        transform: translateY(-110vh) rotate(20deg);
+        opacity: 0;
+    }
+}
+
+.feather-float {
+    position: absolute;
+    top: -40px;
+    font-size: 22px;
+    opacity: 0.15;
+    animation: featherFall linear infinite;
+}
+
+@keyframes featherFall {
+    0% {
+        transform: translateY(0) rotate(0deg) translateX(0);
+        opacity: 0;
+    }
+
+    10% {
+        opacity: 0.15;
+    }
+
+    50% {
+        transform: translateY(50vh) rotate(180deg) translateX(30px);
+    }
+
+    90% {
+        opacity: 0.15;
+    }
+
+    100% {
+        transform: translateY(110vh) rotate(360deg) translateX(-20px);
+        opacity: 0;
+    }
+}
+
+@keyframes capeFlicker {
+
+    0%,
+    19%,
+    21%,
+    23%,
+    25%,
+    54%,
+    56%,
+    100% {
+        text-shadow:
+            0 0 4px #fbbf24,
+            0 0 11px #fbbf24,
+            0 0 19px #fbbf24,
+            0 0 40px #f59e0b,
+            0 0 80px #f59e0b44;
+        opacity: 1;
+    }
+
+    20%,
+    24%,
+    55% {
+        text-shadow: none;
+        opacity: 0.8;
+    }
+}
+
+@keyframes subtleFlicker {
+
+    0%,
+    9%,
+    11%,
+    100% {
+        opacity: 1;
+    }
+
+    10% {
+        opacity: 0.7;
+    }
+}
+
+.cape-flicker {
+    animation: capeFlicker 3s infinite alternate;
+}
+
+.subtitle-flicker {
+    animation: subtleFlicker 4s infinite;
+}
+
+@keyframes duckBob {
+
+    0%,
+    100% {
+        transform: translateY(0) rotate(-2deg);
+    }
+
+    50% {
+        transform: translateY(-8px) rotate(2deg);
+    }
+}
+
+.duck-mascot-bob {
+    animation: duckBob 3s ease-in-out infinite;
+}
+
+@keyframes sealGlow {
+
+    0%,
+    100% {
+        filter: drop-shadow(0 0 6px #fbbf2444);
+    }
+
+    50% {
+        filter: drop-shadow(0 0 16px #fbbf24aa);
+    }
+}
+
+.seal-glow {
+    animation: sealGlow 2s ease-in-out infinite;
+}
+
+@keyframes borderShimmer {
+    0% {
+        border-color: rgba(251, 191, 36, 0.15);
+    }
+
+    50% {
+        border-color: rgba(251, 191, 36, 0.4);
+    }
+
+    100% {
+        border-color: rgba(251, 191, 36, 0.15);
+    }
+}
+
+.duck-auth-card {
+    background: rgba(15, 13, 26, 0.85) !important;
+    backdrop-filter: blur(20px) !important;
+    border: 1px solid rgba(251, 191, 36, 0.2) !important;
+    animation: borderShimmer 4s ease-in-out infinite;
+    box-shadow:
+        0 0 40px rgba(251, 191, 36, 0.05),
+        inset 0 1px 0 rgba(251, 191, 36, 0.1) !important;
+}
+
+.duck-login-wrapper {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 20px;
+    position: relative;
+    z-index: 1;
+}
+
+.reconnect-banner {
+    background: rgba(251, 191, 36, 0.06);
+    border: 1px solid rgba(251, 191, 36, 0.2);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.biometric-login-btn {
+    transition: all 0.25s ease;
+    border-radius: var(--radius) !important;
+    cursor: pointer;
+}
+
+.biometric-login-btn:hover:not(:disabled) {
+    background: rgba(99, 102, 241, 0.2) !important;
+    border-color: rgba(99, 102, 241, 0.5) !important;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 16px rgba(99, 102, 241, 0.15);
+}
+
+.biometric-login-btn:active:not(:disabled) {
+    transform: translateY(0);
+}
+
+.biometric-login-btn:disabled {
+    opacity: 0.5;
+    cursor: wait;
+}
+
+@keyframes bioPulse {
+
+    0%,
+    100% {
+        box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.3);
+    }
+
+    50% {
+        box-shadow: 0 0 0 6px rgba(99, 102, 241, 0);
+    }
+}
+
+.biometric-login-btn:focus {
+    animation: bioPulse 1.5s ease-in-out infinite;
+}

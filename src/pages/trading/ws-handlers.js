@@ -1,0 +1,879 @@
+// ── Trading Page – WebSocket Handlers ────────────────────────
+import { formatPrice } from '../../core/index.js';
+import { streams } from '../../lib/binance-streams.js';
+import * as S from './state.js';
+import { scheduleOrderBookRender, scheduleTradeTapeRender } from './orderbook.js';
+import { _refreshEquityUpnl, _applyNegativeBalanceLock } from './order-form.js';
+import { scheduleChartRiskRefresh, updateCompactLiqForPosition, connectCompactMarkStreams, loadChartAnnotations } from './positions-panel.js';
+import { saveToStorage } from './candle-storage.js';
+import { scheduleTradingRefresh } from './refresh-scheduler.js';
+import { playFillSound } from './fill-sounds.js';
+import { _orderLineRegistry } from './positions-panel.js';
+
+let pnlUiRafId = null;
+let lastPnlUiTs = 0;
+let lastFallbackPositionSyncTs = 0;
+
+// ── Stream Teardown ─────────────────────────────
+
+export function teardownStreams() {
+    if (S._klineUnsub) { S._klineUnsub(); S.set('_klineUnsub', null); }
+    if (S._depthUnsub) { S._depthUnsub(); S.set('_depthUnsub', null); }
+    if (S._tradeUnsub) { S._tradeUnsub(); S.set('_tradeUnsub', null); }
+
+    // Flush any pending candle storage write
+    if (S._candleStorageTimer) {
+        clearTimeout(S._candleStorageTimer);
+        S.set('_candleStorageTimer', null);
+        const cacheKey = `${S.selectedSymbol}_${S.currentTimeframe}`;
+        const cc = S.candleCache[cacheKey];
+        if (cc) saveToStorage(S.selectedSymbol, S.currentTimeframe, cc.data, cc.lastTime);
+    }
+}
+
+function _schedulePnlUiRefresh() {
+    if (pnlUiRafId != null) return;
+    pnlUiRafId = requestAnimationFrame(() => {
+        pnlUiRafId = null;
+        _refreshEquityUpnl();
+    });
+}
+
+// ── Stream Init ─────────────────────────────────
+
+export function initWebSockets() {
+    teardownStreams();
+    if (!S._tradingMounted) return;
+
+    const symbol = S.rawSymbol;
+
+    // ── Kline / 1s stream ─────────────────────────────────────────────
+    // Binance Futures does NOT provide @kline_1s on the combined stream.
+    // For 1s we build OHLCV candles ourselves from the @aggTrade stream.
+    if (S.currentTimeframe === '1s') {
+        // 1s candle builder state
+        let _bar1s = null; // { time, open, high, low, close, volume }
+
+        const unsub1s = streams.subscribe(`${symbol}@aggTrade`, (data) => {
+            if (!S.chartReady || !S.candleSeries || S.currentTimeframe !== '1s') return;
+
+            const price = parseFloat(data.p);
+            const qty = parseFloat(data.q);
+            const ts = Math.floor(data.T / 1000); // second-boundary timestamp
+
+            if (!_bar1s || ts > _bar1s.time) {
+                // Emit the completed bar first (if any)
+                if (_bar1s) {
+                    S.candleSeries.update(_bar1s);
+                    if (S.volumeSeries) {
+                        S.volumeSeries.update({
+                            time: _bar1s.time,
+                            value: _bar1s.volume,
+                            color: _bar1s.close >= _bar1s.open ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)',
+                        });
+                    }
+                }
+                // Start a new bar
+                _bar1s = { time: ts, open: price, high: price, low: price, close: price, volume: qty };
+            } else {
+                // Update current bar
+                _bar1s.high = Math.max(_bar1s.high, price);
+                _bar1s.low = Math.min(_bar1s.low, price);
+                _bar1s.close = price;
+                _bar1s.volume += qty;
+                // Push a live update so the current candle follows price in real-time
+                S.candleSeries.update({ time: _bar1s.time, open: _bar1s.open, high: _bar1s.high, low: _bar1s.low, close: _bar1s.close });
+            }
+
+            // Update current price display & side-effects
+            S.set('currentPrice', price);
+            const priceEl = document.getElementById('sym-price');
+            if (priceEl) priceEl.textContent = formatPrice(price);
+
+            for (const [, pos] of S._positionMap) {
+                if (pos.symbol === S.selectedSymbol) pos.markPrice = price;
+            }
+            _schedulePnlUiRefresh();
+            import('./trail-stop.js').then(m => m.onTrailPriceTick(price)).catch(() => { });
+        });
+        S.set('_klineUnsub', unsub1s);
+
+    } else {
+        // Standard kline stream for all other timeframes
+        S.set('_klineUnsub', streams.subscribe(`${symbol}@kline_${S.currentTimeframe}`, (data) => {
+            if (!S.chartReady || !S.candleSeries) return;
+            const k = data.k;
+            if (!k) return;
+
+            const candle = {
+                time: k.t / 1000,
+                open: parseFloat(k.o),
+                high: parseFloat(k.h),
+                low: parseFloat(k.l),
+                close: parseFloat(k.c),
+            };
+            S.candleSeries.update(candle);
+
+            if (S.volumeSeries) {
+                S.volumeSeries.update({
+                    time: candle.time,
+                    value: parseFloat(k.v),
+                    color: candle.close >= candle.open ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)',
+                });
+            }
+
+            // Update cache
+            const cacheKey = `${S.selectedSymbol}_${S.currentTimeframe}`;
+            if (S.candleCache[cacheKey]) {
+                const arr = S.candleCache[cacheKey].data;
+                const existing = arr.findIndex(c => c.time === candle.time);
+                const fullCandle = { ...candle, volume: parseFloat(k.v) };
+                if (existing >= 0) arr[existing] = fullCandle;
+                else arr.push(fullCandle);
+                S.candleCache[cacheKey].lastTime = candle.time * 1000;
+
+                // Debounced write-through to localStorage (every 30s)
+                if (!S._candleStorageTimer) {
+                    S.set('_candleStorageTimer', setTimeout(() => {
+                        S.set('_candleStorageTimer', null);
+                        const cc = S.candleCache[cacheKey];
+                        if (cc) saveToStorage(S.selectedSymbol, S.currentTimeframe, cc.data, cc.lastTime);
+                    }, 30000));
+                }
+            }
+
+            // Update current price display
+            S.set('currentPrice', candle.close);
+            const priceEl = document.getElementById('sym-price');
+            if (priceEl) priceEl.textContent = formatPrice(candle.close);
+
+            for (const [, pos] of S._positionMap) {
+                if (pos.symbol === S.selectedSymbol) pos.markPrice = candle.close;
+            }
+            _schedulePnlUiRefresh();
+            import('./trail-stop.js').then(m => m.onTrailPriceTick(candle.close)).catch(() => { });
+        }));
+    }
+
+    // Depth stream
+    S.set('_depthUnsub', streams.subscribe(`${symbol}@depth10@100ms`, (data) => {
+        if (!S._tradingMounted) return;
+        S.set('orderBookAsks', (data.a || data.asks || []).map(([p, q]) => [parseFloat(p), parseFloat(q)]));
+        S.set('orderBookBids', (data.b || data.bids || []).map(([p, q]) => [parseFloat(p), parseFloat(q)]));
+        scheduleOrderBookRender(data.E || Date.now());
+
+        // Live-update chase line from frontend orderbook feed
+        import('./chase-limit.js').then(m => m.onChaseDepthTick()).catch(() => { });
+    }));
+
+    // Trade stream
+    S.set('_tradeUnsub', streams.subscribe(`${symbol}@trade`, (data) => {
+        if (!S._tradingMounted) return;
+        S.recentTrades.unshift({
+            price: parseFloat(data.p),
+            qty: parseFloat(data.q),
+            time: data.T,
+            isBuyerMaker: data.m,
+        });
+        if (S.recentTrades.length > 50) S.recentTrades.length = 50;
+        scheduleTradeTapeRender(data.T || Date.now());
+    }));
+}
+
+// ── App-Level Event Handlers ────────────────────
+
+export function setupAppEventListeners() {
+    // margin_update
+    const marginHandler = (e) => {
+        if (!S._tradingMounted || !e.detail) return;
+
+        const payload = e.detail || {};
+        const update = payload.update || payload;
+        const subAccountId = payload.subAccountId || update.subAccountId;
+
+        if (subAccountId !== (window.__pmsState || {}).currentAccount) return;
+
+        S.set('cachedMarginInfo', update);
+
+        const avail = update.availableMargin ?? 0;
+        const avEl = document.getElementById('acct-available');
+        const availEl = document.getElementById('form-available');
+        if (avEl) avEl.textContent = `${avail < 0 ? '-' : ''}$${Math.abs(avail).toFixed(2)}`;
+        if (availEl) availEl.textContent = `${avail < 0 ? '-' : ''}$${Math.abs(avail).toFixed(2)}`;
+
+        S.set('_cachedBalance', update.balance || 0);
+        S.set('_cachedMarginUsed', update.marginUsed || 0);
+
+        _applyNegativeBalanceLock(avail);
+        _schedulePnlUiRefresh();
+    };
+    S.set('_marginUpdateHandler', marginHandler);
+    window.addEventListener('margin_update', marginHandler);
+
+    // pnl_update
+    const pnlHandler = (e) => {
+        if (!S._tradingMounted || !e.detail) return;
+
+        const d = e.detail;
+        if (d.subAccountId && d.subAccountId !== (window.__pmsState || {}).currentAccount) return;
+
+        const now = Date.now();
+        S.set('_lastTradingWsPnlTs', now);
+
+        if (d.positionId) {
+            const existing = S._positionMap.get(d.positionId) || {};
+            S._positionMap.set(d.positionId, {
+                symbol: d.symbol || existing.symbol,
+                side: d.side || existing.side,
+                entryPrice: d.entryPrice ?? existing.entryPrice,
+                quantity: d.quantity || existing.quantity || 0,
+                markPrice: d.markPrice ?? existing.markPrice,
+                liquidationPrice: d.liquidationPrice ?? existing.liquidationPrice ?? 0,
+            });
+            updateCompactLiqForPosition(d.positionId, d.liquidationPrice);
+        }
+
+        if (now - lastPnlUiTs < 30) {
+            _schedulePnlUiRefresh();
+            return;
+        }
+
+        lastPnlUiTs = now;
+        _schedulePnlUiRefresh();
+    };
+    S.set('_pnlUpdateHandler', pnlHandler);
+    window.addEventListener('pnl_update', pnlHandler);
+
+    // doc click → close chart settings panel
+    const docClick = (e) => {
+        const panel = document.getElementById('chart-settings-panel');
+        const btn = document.getElementById('chart-settings-btn');
+        if (panel && panel.style.display !== 'none' && !panel.contains(e.target) && e.target !== btn) {
+            panel.style.display = 'none';
+        }
+    };
+    S.set('_docClickHandler', docClick);
+    document.addEventListener('click', docClick);
+
+    // Compact positions event listeners
+    const compactListeners = {};
+    const mkHandler = (eventName, fn) => {
+        const handler = fn;
+        compactListeners[`_${eventName}`] = handler;
+        window.addEventListener(eventName, handler);
+    };
+
+    mkHandler('order_filled', (e) => {
+        if (!S._tradingMounted) return;
+        const d = e?.detail || {};
+        // Only play on opening fills (suppressToast = algo fills like CHASE/TWAP)
+        if (!d.suppressToast && d.side) playFillSound(d.side);
+
+        // Optimistically remove charting line immediately
+        if (d.orderId && _orderLineRegistry.has(d.orderId)) {
+            try { S.candleSeries.removePriceLine(_orderLineRegistry.get(d.orderId)); } catch { }
+            _orderLineRegistry.delete(d.orderId);
+            // Request fresh labels too
+            import('./positions-panel.js').then(m => m.refreshChartLeftAnnotationLabels());
+        }
+
+        scheduleTradingRefresh({
+            positions: true,
+            openOrders: true,
+            annotations: true,
+            forceAnnotations: true,
+            account: true,
+        }, 300);
+    });
+
+    mkHandler('order_cancelled', (e) => {
+        if (!S._tradingMounted) return;
+        const d = e?.detail || {};
+
+        // Optimistically remove charting line immediately
+        if (d.orderId && _orderLineRegistry.has(d.orderId)) {
+            try { S.candleSeries.removePriceLine(_orderLineRegistry.get(d.orderId)); } catch { }
+            _orderLineRegistry.delete(d.orderId);
+            // Request fresh labels too
+            import('./positions-panel.js').then(m => m.refreshChartLeftAnnotationLabels());
+        }
+
+        scheduleTradingRefresh({
+            openOrders: true,
+            annotations: true,
+            forceAnnotations: true,
+            account: true,
+        }, 300);
+    });
+
+    mkHandler('position_closed', (e) => {
+        if (!S._tradingMounted) return;
+        // ── Optimistic instant removal ──
+        const d = e?.detail || {};
+        if (d.positionId) {
+            const row = document.querySelector(`.compact-pos-row[data-cp-id="${d.positionId}"]`);
+            if (row) row.remove();
+            S._positionMap.delete(d.positionId);
+            const countEl = document.getElementById('compact-pos-count');
+            if (countEl) countEl.textContent = S._positionMap.size;
+            if (S._positionMap.size === 0) {
+                const list = document.getElementById('compact-pos-list');
+                if (list) list.innerHTML = '<div style="padding:6px 8px; color:var(--text-muted); text-align:center; font-size:10px;">No positions</div>';
+                connectCompactMarkStreams([]);
+            }
+            _refreshEquityUpnl();
+        }
+        // ── Optimistic chart cleanup: remove price lines immediately ──
+        for (const line of S.chartPriceLines) {
+            try { S.candleSeries.removePriceLine(line); } catch { }
+        }
+        S.set('chartPriceLines', []);
+        S.set('_chartAnnotationCache', null);
+        S.set('_chartAnnotationFingerprint', null);
+        loadChartAnnotations(true);
+        scheduleTradingRefresh({
+            positions: true,
+            account: true,
+        }, 50);
+    });
+
+    mkHandler('liquidation', (e) => {
+        if (!S._tradingMounted) return;
+        // ── Optimistic instant removal ──
+        const d = e?.detail || {};
+        if (d.positionId) {
+            const row = document.querySelector(`.compact-pos-row[data-cp-id="${d.positionId}"]`);
+            if (row) row.remove();
+            S._positionMap.delete(d.positionId);
+            const countEl = document.getElementById('compact-pos-count');
+            if (countEl) countEl.textContent = S._positionMap.size;
+            if (S._positionMap.size === 0) {
+                const list = document.getElementById('compact-pos-list');
+                if (list) list.innerHTML = '<div style="padding:6px 8px; color:var(--text-muted); text-align:center; font-size:10px;">No positions</div>';
+                connectCompactMarkStreams([]);
+            }
+            _refreshEquityUpnl();
+        }
+        // ── Optimistic chart cleanup: remove price lines immediately ──
+        for (const line of S.chartPriceLines) {
+            try { S.candleSeries.removePriceLine(line); } catch { }
+        }
+        S.set('chartPriceLines', []);
+        S.set('_chartAnnotationCache', null);
+        S.set('_chartAnnotationFingerprint', null);
+        loadChartAnnotations(true);
+        scheduleTradingRefresh({
+            positions: true,
+            account: true,
+        }, 50);
+    });
+
+    mkHandler('position_reduced', () => {
+        if (!S._tradingMounted) return;
+        scheduleTradingRefresh({
+            positions: true,
+            annotations: true,
+            forceAnnotations: true,
+            account: true,
+        }, 60);
+    });
+
+    mkHandler('position_updated', (e) => {
+        if (!S._tradingMounted) return;
+        const d = e?.detail || {};
+        if (!d.positionId) return;
+
+        // Update in-memory position map
+        const existing = S._positionMap.get(d.positionId) || {};
+        S._positionMap.set(d.positionId, {
+            symbol: d.symbol || existing.symbol,
+            side: d.side || existing.side,
+            entryPrice: d.entryPrice ?? existing.entryPrice,
+            quantity: d.quantity ?? existing.quantity ?? 0,
+            markPrice: existing.markPrice ?? d.entryPrice,
+            liquidationPrice: d.liquidationPrice ?? existing.liquidationPrice ?? 0,
+        });
+
+        // Update compact panel DOM in-place
+        let row = document.querySelector(`.compact-pos-row[data-cp-id="${d.positionId}"]`);
+
+        // ── Optimistic creation: new position not yet in DOM ──
+        if (!row && d.symbol && d.side && d.entryPrice != null) {
+            const list = document.getElementById('compact-pos-list');
+            if (list) {
+                // Clear "No positions" placeholder
+                const noPos = list.querySelector('div[style*="text-align:center"]');
+                if (noPos && list.children.length === 1) list.innerHTML = '';
+
+                const isLong = d.side === 'LONG';
+                const mark = S._compactMarkPrices[d.symbol] || d.entryPrice;
+                const pnl = 0;
+                const pnlPct = 0;
+                const notional = d.notional || (d.quantity * mark) || 0;
+                const lev = d.leverage || 1;
+                const margin = d.margin || 0;
+                const liqPrice = d.liquidationPrice || 0;
+                const babysitterExcluded = d.babysitterExcluded ?? false;
+                const babysitterOn = !babysitterExcluded;
+
+                const tmp = document.createElement('div');
+                tmp.innerHTML = `
+                  <div class="compact-pos-row" data-cp-symbol="${d.symbol}" data-cp-side="${d.side}"
+                       data-cp-id="${d.positionId}" data-cp-entry="${d.entryPrice}" data-cp-qty="${d.quantity || 0}" data-cp-margin="${margin}" data-cp-notional="${notional}">
+                    <span class="cpr-sym">
+                      <span class="cpr-name">${d.symbol.split('/')[0]}</span>
+                      <span class="cpr-badge ${isLong ? 'cpr-long' : 'cpr-short'}">${isLong ? 'L' : 'S'}</span>
+                      <span class="cpr-lev">${lev}x</span>
+                    </span>
+                    <span class="cpr-size" data-cpsize-id="${d.positionId}">$${notional.toFixed(2)}</span>
+                    <span class="cpr-entry">${formatPrice(d.entryPrice)}</span>
+                    <span class="cpr-mark" data-cpmark-id="${d.positionId}">${formatPrice(mark)}</span>
+                    <span class="cpr-liq" data-cpliq-id="${d.positionId}">${liqPrice > 0 ? formatPrice(liqPrice) : '—'}</span>
+                    <span class="cpr-pnl pnl-up" data-cppnl-id="${d.positionId}" data-cp-prev-pnl="0">
+                      +0.00 <small>(+0.0%)</small>
+                    </span>
+                    <button class="cpr-bbs ${babysitterOn ? 'on' : 'off'}" data-cp-bbs="${d.positionId}" data-cp-bbs-excluded="${babysitterExcluded ? '1' : '0'}" title="Toggle babysitter for this position">${babysitterOn ? 'On' : 'Off'}</button>
+                    <span class="cpr-close" data-cp-close="${d.positionId}" data-cp-close-sym="${d.symbol}" title="Market Close">✕</span>
+                  </div>
+                `;
+
+                const newRow = tmp.firstElementChild;
+                list.appendChild(newRow);
+
+                // Attach close handler
+                import('./positions-panel.js').then(({ marketClosePosition }) => {
+                    newRow.querySelector('[data-cp-close]')?.addEventListener('click', (ev) => {
+                        ev.stopPropagation();
+                        marketClosePosition(d.positionId, d.symbol);
+                    });
+                });
+
+                // Attach symbol click handler
+                newRow.querySelector('.cpr-name')?.addEventListener('click', (ev) => {
+                    ev.stopPropagation();
+                    if (d.symbol !== S.selectedSymbol) {
+                        import('./order-form.js').then(({ switchSymbol }) => {
+                            switchSymbol(d.symbol);
+                            scheduleTradingRefresh({ positions: true, openOrders: true, account: true }, 30);
+                        });
+                    }
+                });
+
+                // Update count badge
+                const countEl = document.getElementById('compact-pos-count');
+                if (countEl) countEl.textContent = S._positionMap.size;
+
+                // Connect mark price stream for the new symbol
+                connectCompactMarkStreams([...S._positionMap.values()]);
+            }
+        } else if (row) {
+            if (d.entryPrice != null) {
+                row.dataset.cpEntry = d.entryPrice;
+                const entryEl = row.querySelector('.cpr-entry');
+                if (entryEl) entryEl.textContent = formatPrice(d.entryPrice);
+            }
+            if (d.quantity != null) {
+                row.dataset.cpQty = d.quantity;
+            }
+            if (d.margin != null) {
+                row.dataset.cpMargin = d.margin;
+            }
+            if (d.notional != null) {
+                row.dataset.cpNotional = d.notional;
+                const sizeEl = row.querySelector(`[data-cpsize-id="${d.positionId}"]`);
+                if (sizeEl) sizeEl.textContent = `$${d.notional.toFixed(2)}`;
+            }
+            if (d.liquidationPrice != null) {
+                updateCompactLiqForPosition(d.positionId, d.liquidationPrice);
+            }
+        }
+
+        _schedulePnlUiRefresh();
+        scheduleChartRiskRefresh();
+    });
+
+    mkHandler('twap_progress', (e) => {
+        if (!S._tradingMounted) return;
+        scheduleTradingRefresh({ positions: true, openOrders: true, account: true },);
+        if (e.detail?.symbol === S.selectedSymbol) scheduleChartRiskRefresh();
+    });
+
+    mkHandler('twap_completed', () => {
+        if (!S._tradingMounted) return;
+        scheduleTradingRefresh({ openOrders: true, positions: true, account: true, annotations: true }, 80);
+    });
+
+    mkHandler('twap_cancelled', () => {
+        if (!S._tradingMounted) return;
+        scheduleTradingRefresh({ positions: true, openOrders: true, account: true }, 30);
+    });
+
+    // Trail stop events — live chart visualization
+    mkHandler('trail_stop_progress', (e) => {
+        if (!S._tradingMounted) return;
+        const d = e.detail;
+        if (d?.symbol === S.selectedSymbol) {
+            import('./trail-stop.js').then(m => m.drawLiveTrailStop(d));
+        }
+        // Live-update the open orders row DOM in-place
+        if (d?.trailStopId) {
+            const row = document.querySelector(`[data-trail-id="${d.trailStopId}"]`);
+            if (row) {
+                const isLong = d.side === 'LONG';
+                const extremeEl = row.querySelector('.trail-extreme');
+                if (extremeEl && d.extremePrice) {
+                    extremeEl.textContent = `${isLong ? 'HWM' : 'LWM'}: $${formatPrice(d.extremePrice)}`;
+                }
+                const triggerEl = row.querySelector('.trail-trigger');
+                if (triggerEl && d.triggerPrice) {
+                    triggerEl.innerHTML = `⚡$${formatPrice(d.triggerPrice)}`;
+                }
+                const statusEl = row.querySelector('.trail-status');
+                if (statusEl) {
+                    statusEl.textContent = d.activated ? 'tracking' : 'waiting';
+                }
+            } else {
+                // Row doesn't exist yet — schedule a full refresh
+                scheduleTradingRefresh({ positions: true, openOrders: true, account: true }, 30);
+            }
+        }
+    });
+
+    mkHandler('trail_stop_triggered', (e) => {
+        if (!S._tradingMounted) return;
+        const d = e.detail || {};
+
+        // Toast notification
+        const sym = d.symbol ? d.symbol.split('/')[0] : '';
+        const priceStr = d.triggeredPrice ? `@ $${formatPrice(d.triggeredPrice)}` : '';
+        import('../../core/index.js').then(({ showToast }) => {
+            showToast(`⚡ Trail stop filled: ${sym} ${d.side || ''} ${priceStr}`, 'success');
+        });
+
+        // Optimistic removal of the position row
+        if (d.positionId) {
+            const row = document.querySelector(`.compact-pos-row[data-cp-id="${d.positionId}"]`);
+            if (row) row.remove();
+            S._positionMap.delete(d.positionId);
+            const countEl = document.getElementById('compact-pos-count');
+            if (countEl) countEl.textContent = S._positionMap.size;
+            if (S._positionMap.size === 0) {
+                const list = document.getElementById('compact-pos-list');
+                if (list) list.innerHTML = '<div style="padding:6px 8px; color:var(--text-muted); text-align:center; font-size:10px;">No positions</div>';
+            }
+        }
+
+        // Clear all chart price lines + trail stop lines
+        for (const line of S.chartPriceLines) {
+            try { S.candleSeries.removePriceLine(line); } catch { }
+        }
+        S.set('chartPriceLines', []);
+        S.set('_chartAnnotationCache', null);
+        S.set('_chartAnnotationFingerprint', null);
+        import('./trail-stop.js').then(m => m.clearAllTrailStopLines());
+        import('./positions-panel.js').then(m => m.loadChartAnnotations(true));
+
+        import('./order-form.js').then(m => m._refreshEquityUpnl());
+        scheduleTradingRefresh({ openOrders: true, positions: true, account: true, annotations: true, forceAnnotations: true }, 50);
+    });
+
+    mkHandler('trail_stop_cancelled', () => {
+        if (!S._tradingMounted) return;
+        import('./trail-stop.js').then(m => m.clearAllTrailStopLines());
+        scheduleTradingRefresh({ positions: true, openOrders: true, account: true }, 30);
+    });
+
+    mkHandler('chase_progress', (e) => {
+        if (!S._tradingMounted) return;
+        const data = e.detail;
+        // drawLiveChase handles symbol filtering internally
+        import('./chase-limit.js').then(m => m.drawLiveChase(data));
+        // Live-update chase order row in open orders panel
+        if (data.chaseId) {
+            const row = document.querySelector(`[data-chase-id="${data.chaseId}"]`);
+            if (row) {
+                const priceEl = row.querySelector('.chase-live-price');
+                if (priceEl && data.currentOrderPrice) priceEl.textContent = `$${formatPrice(data.currentOrderPrice)}`;
+                const repEl = row.querySelector('.chase-live-reprices');
+                if (repEl) repEl.textContent = `${data.repriceCount || 0} reprices`;
+            } else {
+                // Row doesn't exist yet — schedule a full refresh
+                scheduleTradingRefresh({ positions: true, openOrders: true, account: true }, 30);
+            }
+        }
+        // Live-update chase price on matching compact position row
+        if (data.symbol && data.currentOrderPrice) {
+            const posRow = document.querySelector(`.compact-pos-row[data-cp-symbol="${data.symbol}"]`);
+            if (posRow) {
+                let chaseTag = posRow.querySelector('.chase-price-tag');
+                if (!chaseTag) {
+                    chaseTag = document.createElement('span');
+                    chaseTag.className = 'chase-price-tag';
+                    chaseTag.style.cssText = 'font-size:9px; color:#06b6d4; font-weight:600; margin-left:3px;';
+                    const symSpan = posRow.querySelector('.cpr-sym');
+                    if (symSpan) symSpan.appendChild(chaseTag);
+                }
+                chaseTag.textContent = `🎯${formatPrice(data.currentOrderPrice)}`;
+            }
+        }
+    });
+
+    mkHandler('chase_filled', (e) => {
+        if (!S._tradingMounted) return;
+        const data = e.detail;
+        if (data?.side) playFillSound(data.side);
+        // Remove this chase's lines from chart (leave other chases intact)
+        if (data.chaseId) import('./chase-limit.js').then(m => m.removeChase(data.chaseId));
+        // Remove chase price tag from position row
+        if (data.symbol) {
+            const tag = document.querySelector(`.compact-pos-row[data-cp-symbol="${data.symbol}"] .chase-price-tag`);
+            if (tag) tag.remove();
+        }
+        const oor = document.querySelector(`[data-chase-id="${data.chaseId}"]`);
+        if (oor) oor.remove();
+        scheduleTradingRefresh({ account: true }, 500);
+    });
+
+    mkHandler('chase_cancelled', (e) => {
+        if (!S._tradingMounted) return;
+        const data = e.detail;
+        // Remove this chase's lines from chart (leave other chases intact)
+        if (data?.chaseId) import('./chase-limit.js').then(m => m.removeChase(data.chaseId));
+        // Toast only for user-initiated cancel or distance breach
+        if (data?.reason) {
+            import('../../core/index.js').then(({ showToast }) => {
+                const reason = data.reason === 'distance_breached' ? 'max distance reached' : 'cancelled';
+                showToast(`Chase ${reason}: ${data.symbol?.split('/')[0] || ''}`, 'warning');
+            }).catch(() => { });
+        }
+        // Remove chase price tag from position row
+        if (data?.symbol) {
+            const tag = document.querySelector(`.compact-pos-row[data-cp-symbol="${data.symbol}"] .chase-price-tag`);
+            if (tag) tag.remove();
+        }
+        const oor = document.querySelector(`[data-chase-id="${data?.chaseId}"]`);
+        if (oor) oor.remove();
+        scheduleTradingRefresh({ account: true }, 500);
+    });
+
+    // SURF events — live chart visualization + status updates
+    mkHandler('pump_chaser_progress', (e) => {
+        if (!S._tradingMounted) return;
+        const data = e.detail;
+        // Update chart lines
+        import('./pump-chaser.js').then(m => m.drawLivePumpChaser(data));
+
+        // Live-update the open orders row for this SURF (no full refresh needed)
+        const row = document.querySelector(`[data-pc-id="${data.pumpChaserId}"]`);
+        if (row) {
+            const stateEl = row.querySelector('.oor-price span:first-child');
+            if (stateEl) stateEl.textContent = data.state || '\u2014';
+            const detailEl = row.querySelector('.oor-price span:last-child');
+            if (detailEl) detailEl.textContent = `${data.fillCount || 0} fills \u00b7 ${(data.amplitude || 0).toFixed(1)}%`;
+            const posPct = data.maxNotional > 0 ? Math.round(((data.positionNotional || 0) / data.maxNotional) * 100) : 0;
+            const barEl = row.querySelector('.oor-qty div div');
+            if (barEl) {
+                barEl.style.width = `${posPct}%`;
+                barEl.style.background = data.state === 'DELEVERAGING' ? '#f43f5e' : '';
+            }
+            const pctLabel = row.querySelector('.oor-qty > span');
+            if (pctLabel) pctLabel.textContent = `${posPct}% of max`;
+            const pnlEl = row.querySelector('.oor-notional');
+            if (pnlEl) {
+                const pnl = data.netPnl || 0;
+                pnlEl.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+                pnlEl.textContent = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`;
+            }
+        } else {
+            // Row not yet rendered — trigger a full open orders refresh
+            scheduleTradingRefresh({ positions: true, openOrders: true, account: true }, 30);
+        }
+    });
+
+    mkHandler('pump_chaser_fill', (e) => {
+        if (!S._tradingMounted) return;
+        const data = e.detail;
+        const fill = data.fill || {};
+        const sym = data.symbol ? data.symbol.split('/')[0] : '';
+        const sideLabel = data.side === 'LONG' ? 'L' : 'S';
+        import('../../core/index.js').then(({ showToast, formatPrice }) => {
+            const price = fill.price || 0;
+            const fillNum = fill.fillNum || '?';
+            const amp = (fill.amplitude || 0).toFixed(1);
+            const notional = (fill.notional || 0).toFixed(0);
+            const action = data.side === 'LONG' ? 'buy' : 'sell';
+            showToast(`\ud83c\udfc4 SURF ${sideLabel} fill #${fillNum}: ${sym} ${action} @ $${formatPrice(price)} \u2014 $${notional} \u00b7 ${amp}% amp`, 'success');
+        }).catch(() => { });
+        scheduleTradingRefresh({ account: true }, 500);
+    });
+
+    mkHandler('pump_chaser_scalp', (e) => {
+        if (!S._tradingMounted) return;
+        const data = e.detail;
+        const rt = data.roundTrip || {};
+        const sym = data.symbol ? data.symbol.split('/')[0] : '';
+        const sideLabel = data.side === 'LONG' ? 'L' : 'S';
+        import('../../core/index.js').then(({ showToast, formatPrice }) => {
+            const profit = rt.profit || 0;
+            const total = data.totalScalpProfit || 0;
+            showToast(`\u26a1 SURF ${sideLabel} scalp: ${sym} +$${profit.toFixed(3)} (total: +$${total.toFixed(2)})`, 'info');
+        }).catch(() => { });
+        scheduleTradingRefresh({ account: true }, 500);
+    });
+
+    mkHandler('pump_chaser_stopped', (e) => {
+        if (!S._tradingMounted) return;
+        const data = e.detail;
+        if (data.pumpChaserId) {
+            import('./pump-chaser.js').then(m => m.removePumpChaser(data.pumpChaserId));
+        }
+        const sym = data.symbol ? data.symbol.split('/')[0] : '';
+        const sideLabel = data.side === 'LONG' ? 'L' : 'S';
+        const reason = data.reason || 'completed';
+        const pnl = data.netPnl || 0;
+        const fills = data.fills || 0;
+        const scalp = data.scalpProfit || 0;
+        import('../../core/index.js').then(({ showToast }) => {
+            showToast(`\ud83c\udfc1 SURF ${sideLabel} stopped (${reason}): ${sym} \u2014 ${fills} fills \u00b7 scalp +$${scalp.toFixed(2)} \u00b7 net ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`, pnl >= 0 ? 'success' : 'warning');
+        }).catch(() => { });
+        scheduleTradingRefresh({ openOrders: true, positions: true, account: true }, 300);
+    });
+
+    mkHandler('pump_chaser_deleverage', (e) => {
+        if (!S._tradingMounted) return;
+        const data = e.detail;
+        const sym = data.symbol ? data.symbol.split('/')[0] : '';
+        const sideLabel = data.side === 'LONG' ? 'L' : 'S';
+        const freed = data.deleverage?.freedNotional || 0;
+        import('../../core/index.js').then(({ showToast, formatPrice }) => {
+            showToast(`\ud83d\udcc9 SURF ${sideLabel} deleverage: ${sym} \u2014 freed $${freed.toFixed(2)} @ $${formatPrice(data.deleverage?.price || 0)}`, 'info');
+        }).catch(() => { });
+        scheduleTradingRefresh({ account: true }, 500);
+    });
+
+    // Scalper events
+    // Note: scalper_progress is NOT handled here — child chases broadcast
+    // chase_progress individually, which drawLiveChase already handles.
+    // scalper_progress is only fired for fill count updates on the parent row.
+    // scalper_progress: updates parent row fill count + per-slot backoff countdown
+    mkHandler('scalper_progress', (e) => {
+        if (!S._tradingMounted) return;
+        const data = e.detail;
+        if (!data?.scalperId) return;
+
+        // 1. Update parent row fill count
+        const row = document.querySelector(`[data-scalper-id="${data.scalperId}"]`);
+        if (row) {
+            const fillEl = row.querySelector('.oor-price span:last-child');
+            if (fillEl) fillEl.textContent = `${data.fillCount || 0} fills`;
+        }
+
+        // 2. Update per-slot badges in drawer (paused / retry countdown)
+        const drawer = document.querySelector(`[data-scalper-drawer="${data.scalperId}"]`);
+        if (!drawer) return;
+
+        const allSlots = [...(data.longSlots || []), ...(data.shortSlots || [])];
+        const slotsWithRetry = allSlots.filter(s => s.retryAt && !s.active);
+
+        // Clear any previous countdown interval for this scalper
+        const prevTimer = drawer._scalperCountdownTimer;
+        if (prevTimer) clearInterval(prevTimer);
+
+        function updateSlotBadges() {
+            const now = Date.now();
+            for (const slot of allSlots) {
+                // Slot DOM node keyed by layer side+idx
+                const key = `${slot.layerIdx}`;
+                const badge = drawer.querySelector(`[data-slot-badge="${key}"]`);
+                if (!badge) continue;
+
+                if (slot.active) {
+                    badge.textContent = '●';
+                    badge.style.color = '#22c55e';
+                    badge.title = 'Active';
+                } else if (slot.paused) {
+                    badge.textContent = '⏸ paused';
+                    badge.style.color = '#f59e0b';
+                    badge.title = 'Price filter active — waiting for price to re-enter range';
+                } else if (slot.retryAt) {
+                    const secsLeft = Math.max(0, Math.ceil((slot.retryAt - now) / 1000));
+                    badge.textContent = secsLeft > 0 ? `⟳ ${secsLeft}s` : '⟳ soon';
+                    badge.style.color = '#f43f5e';
+                    badge.title = `Retry #${slot.retryCount} — retrying in ${secsLeft}s`;
+                } else {
+                    badge.textContent = '●';
+                    badge.style.color = '#6b7280';
+                    badge.title = 'Idle';
+                }
+            }
+        }
+
+        updateSlotBadges();
+
+        // Start live countdown if any slots are backing off
+        if (slotsWithRetry.length > 0) {
+            const timer = setInterval(() => {
+                const allDone = slotsWithRetry.every(s => !s.retryAt || Date.now() >= s.retryAt);
+                updateSlotBadges();
+                if (allDone) clearInterval(timer);
+            }, 1000);
+            drawer._scalperCountdownTimer = timer;
+        }
+    });
+
+    mkHandler('scalper_filled', (e) => {
+        if (!S._tradingMounted) return;
+        const data = e.detail;
+        if (data?.side) playFillSound(data.side);
+        const sym = data?.symbol ? data.symbol.split('/')[0] : '';
+        import('../../core/index.js').then(({ showToast, formatPrice }) => {
+            showToast(`⚔️ Scalper ${data?.side} L${data?.layerIdx} filled @ $${formatPrice(data?.fillPrice || 0)} (${sym})`, 'info');
+        }).catch(() => { });
+        scheduleChartRiskRefresh();
+        scheduleTradingRefresh({ openOrders: true, account: true }, 500);
+    });
+
+    mkHandler('scalper_cancelled', (e) => {
+        if (!S._tradingMounted) return;
+        const data = e.detail;
+        if (data?.scalperId) {
+            import('./scalper.js').then(m => m.clearScalperById(data.scalperId)).catch(() => { });
+        }
+        const sym = data?.symbol ? data.symbol.split('/')[0] : '';
+        import('../../core/index.js').then(({ showToast }) => {
+            showToast(`⚔️ Scalper stopped: ${sym}`, 'info');
+        }).catch(() => { });
+        scheduleTradingRefresh({ openOrders: true, positions: true, account: true }, 30);
+    });
+
+    S.set('_compactPosListeners', compactListeners);
+
+}
+
+// ── Compact-position poll ───────────────────────
+
+export function startCompactPoll() {
+    if (S._compactPollInterval) clearInterval(S._compactPollInterval);
+
+    lastFallbackPositionSyncTs = 0;
+    S.set('_compactPollInterval', setInterval(() => {
+        if (!S._tradingMounted) return;
+
+        _schedulePnlUiRefresh();
+
+        const now = Date.now();
+        const wsStale = (now - S._lastTradingWsPnlTs) > 10000;
+        if (wsStale && (now - lastFallbackPositionSyncTs) > 15000) {
+            lastFallbackPositionSyncTs = now;
+            scheduleTradingRefresh({ positions: true, account: true }, 0);
+        }
+    }, 3000));
+}
+
+export function stopCompactPoll() {
+    if (S._compactPollInterval) { clearInterval(S._compactPollInterval); S.set('_compactPollInterval', null); }
+    if (pnlUiRafId != null) {
+        cancelAnimationFrame(pnlUiRafId);
+        pnlUiRafId = null;
+    }
+}
