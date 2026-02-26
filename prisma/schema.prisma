@@ -3,8 +3,8 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
-  url      = "file:./pms.db"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 model User {
@@ -225,4 +225,34 @@ model WebAuthnCredential {
 
   @@index([userId])
   @@map("webauthn_credentials")
+}
+
+model TcaEvent {
+  id        String   @id @default(uuid())
+  type      String   // CHASE_FILL, CHASE_CANCEL, EXCHANGE_LATENCY, WS_LATENCY, RECONCILIATION, ORDER_MISMATCH, SCALPER_SESSION
+  symbol    String?
+  data      Json     // JSONB — type-specific fields, queryable server-side
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([type, createdAt])
+  @@index([symbol, createdAt])
+  @@index([createdAt])
+  @@map("tca_events")
+}
+
+model EngineEventLog {
+  id            String    @id @default(uuid())
+  stream        String                          // e.g. "order_update", "trade_execution"
+  subAccountId  String?   @map("sub_account_id")
+  symbol        String?
+  payload       String                          // raw JSON from C++ engine
+  cppRequestId  String?   @map("cpp_request_id") // C++ request_id for correlation
+  dedupKey      String    @unique @map("dedup_key") // prevents duplicate writes
+  processedAt   DateTime? @map("processed_at")  // set when derived state is written
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  @@index([subAccountId, createdAt])
+  @@index([stream, createdAt])
+  @@index([cppRequestId])
+  @@map("engine_event_log")
 }

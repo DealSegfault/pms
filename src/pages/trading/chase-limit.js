@@ -6,6 +6,7 @@ import { cuteConfirm } from '../../lib/cute-confirm.js';
 import * as S from './state.js';
 import { showTradeError } from './order-form.js';
 import { scheduleTradingRefresh } from './refresh-scheduler.js';
+import { beginOrderLatency, markOrderSent, markOrderAck, markOrderPaint } from './perf-metrics.js';
 
 // ── Chart line management ───────────────────────
 
@@ -263,6 +264,8 @@ export async function submitChase() {
     if (!confirmed) return;
 
     try {
+        const latencyId = beginOrderLatency('chase');
+        markOrderSent(latencyId);
         const result = await api('/trade/chase-limit', {
             method: 'POST',
             body: {
@@ -270,6 +273,7 @@ export async function submitChase() {
                 symbol: S.selectedSymbol,
                 side,
                 quantity,
+                notionalUsd: sizeUsdt,
                 leverage,
                 stalkOffsetPct: offsetPct,
                 stalkMode,
@@ -281,12 +285,14 @@ export async function submitChase() {
             },
         });
         if (result.success) {
+            markOrderAck(latencyId);
+            requestAnimationFrame(() => markOrderPaint(latencyId));
             showToast(`Chase started: ${result.symbol.split('/')[0]} ${result.side} @ $${formatPrice(result.currentOrderPrice)}`, 'success');
 
             clearPreviewLines();
 
             // drawLiveChase stores state in the Map and renders chart lines
-            if (result.currentOrderPrice) {
+            if (result.currentOrderPrice && result.chaseId) {
                 drawLiveChase(result);
             }
 
@@ -304,7 +310,10 @@ export async function submitChase() {
 export async function cancelChase(chaseId) {
     showToast('Cancelling chase order...', 'info');
     try {
-        const result = await api(`/trade/chase-limit/${chaseId}`, { method: 'DELETE' });
+        const query = state.currentAccount
+            ? `?subAccountId=${encodeURIComponent(state.currentAccount)}`
+            : '';
+        const result = await api(`/trade/chase-limit/${encodeURIComponent(chaseId)}${query}`, { method: 'DELETE' });
         showToast(`Chase cancelled (${result.symbol?.split('/')[0] || ''})`, 'success');
         removeChase(chaseId);
         scheduleTradingRefresh({ positions: true, openOrders: true }, 30);

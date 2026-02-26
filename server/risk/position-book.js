@@ -43,6 +43,16 @@ export class PositionBook {
         return this._entries.has(subAccountId);
     }
 
+    /** Find a position by account, symbol, and side. Returns null if not found. */
+    getPosition(subAccountId, symbol, side) {
+        const entry = this._entries.get(subAccountId);
+        if (!entry) return null;
+        for (const pos of entry.positions.values()) {
+            if (pos.symbol === symbol && pos.side === side) return pos;
+        }
+        return null;
+    }
+
     /** Delete an account entry entirely. */
     delete(subAccountId) {
         this._entries.delete(subAccountId);

@@ -3,20 +3,75 @@
  */
 import { Router } from 'express';
 import riskEngine, { prisma } from '../../risk/index.js';
-import exchange from '../../exchange.js';
+import defaultExchange from '../../exchange.js';
+import { fetchRawReferencePrice } from '../../exchange-public.js';
+import { closePositionViaCpp, closeAllPositionsViaCpp } from './close-utils.js';
 import { getRiskSnapshot } from '../../redis.js';
 import { requireOwnership, requirePositionOwnership } from '../../ownership.js';
+import { broadcast } from '../../ws.js';
+import { getSimplxBridge } from '../../simplx-uds-bridge.js';
+import { toCppSymbol } from './cpp-symbol.js';
+import { makeCppClientOrderId } from './cpp-order-utils.js';
+import {
+    extractNotionalUsd,
+    getSymbolMinNotional,
+    normalizeOrderSizing,
+    parsePositiveNumber,
+} from './order-sizing.js';
+import { persistPendingOrderWithRecovery } from './order-persistence-recovery.js';
+import {
+    beginIdempotentRequest,
+    completeIdempotentRequest,
+    releaseIdempotentRequest,
+} from './submit-idempotency.js';
+import { ensureSubmitPreflight } from './submit-preflight.js';
+
+// V2: C++ engine handles all order execution. No JS fallback.
+
 
 const router = Router();
+let exchange = defaultExchange;
+
+export function setMarketOrdersExchangeConnector(exchangeConnector) {
+    exchange = exchangeConnector || defaultExchange;
+}
+const DEFAULT_CPP_MARKET_PRICE_LOOKUP_TIMEOUT_MS = 120;
+const parsedPriceLookupTimeoutMs = Number.parseInt(process.env.CPP_MARKET_PRICE_LOOKUP_TIMEOUT_MS || `${DEFAULT_CPP_MARKET_PRICE_LOOKUP_TIMEOUT_MS}`, 10);
+const CPP_MARKET_PRICE_LOOKUP_TIMEOUT_MS = Number.isFinite(parsedPriceLookupTimeoutMs) && parsedPriceLookupTimeoutMs > 0
+    ? parsedPriceLookupTimeoutMs
+    : DEFAULT_CPP_MARKET_PRICE_LOOKUP_TIMEOUT_MS;
+const LOG_TRADE_ROUTE_PERF = process.env.LOG_TRADE_ROUTE_PERF === '1';
+
+function allowHttpPriceLookup() {
+    return process.env.CPP_MARKET_ALLOW_HTTP_PRICE_LOOKUP !== '0';
+}
+
+async function fetchBinanceReferencePrice(rawSymbol) {
+    return fetchRawReferencePrice(rawSymbol, { timeoutMs: CPP_MARKET_PRICE_LOOKUP_TIMEOUT_MS });
+}
 
 // POST /api/trade - Place a new trade
 router.post('/', requireOwnership('body'), async (req, res) => {
+    let idem = null;
     try {
         const startedAt = Date.now();
-        const { subAccountId, symbol, side, quantity, leverage, fastExecution, fallbackPrice, babysitterExcluded, reduceOnly } = req.body;
+        const {
+            subAccountId,
+            symbol,
+            side,
+            quantity,
+            leverage,
+            fastExecution,
+            fallbackPrice,
+            babysitterExcluded,
+            reduceOnly,
+        } = req.body;
+        const requestedNotionalUsd = extractNotionalUsd(req.body);
 
-        if (!subAccountId || !symbol || !side || !quantity || !leverage) {
-            return res.status(400).json({ error: 'Missing required fields: subAccountId, symbol, side, quantity, leverage' });
+        if (!subAccountId || !symbol || !side || !leverage || (!quantity && !requestedNotionalUsd)) {
+            return res.status(400).json({
+                error: 'Missing required fields: subAccountId, symbol, side, leverage, and quantity or notionalUsd',
+            });
         }
 
         const validSides = ['LONG', 'SHORT'];
@@ -24,90 +79,183 @@ router.post('/', requireOwnership('body'), async (req, res) => {
             return res.status(400).json({ error: 'side must be LONG or SHORT' });
         }
 
-        const parsedFallbackPrice = Number.parseFloat(fallbackPrice);
-        const normalizedFallbackPrice = Number.isFinite(parsedFallbackPrice) && parsedFallbackPrice > 0
-            ? parsedFallbackPrice
+        let sizing;
+        try {
+            sizing = await normalizeOrderSizing({
+                symbol,
+                side,
+                quantity,
+                fallbackPrice,
+                notionalUsd: requestedNotionalUsd,
+                payload: req.body,
+                quantityPrecisionMode: 'nearest',
+                pricePrecisionMode: 'nearest',
+                allowPriceLookup: true,
+                exchangeConnector: exchange,
+            });
+        } catch (sizingErr) {
+            return res.status(400).json({ error: sizingErr.message });
+        }
+        const normalizedSymbol = sizing.symbol;
+        const normalizedQty = sizing.quantity;
+
+        const parsedFallbackPrice = parsePositiveNumber(fallbackPrice) || parsePositiveNumber(sizing.referencePrice);
+        const normalizedFallbackPrice = parsedFallbackPrice
+            ? Number.parseFloat(exchange.priceToPrecisionCached(normalizedSymbol, parsedFallbackPrice, { mode: 'nearest' }))
             : undefined;
 
-        const result = await riskEngine.executeTrade(
-            subAccountId,
-            symbol,
-            side.toUpperCase(),
-            parseFloat(quantity),
-            parseFloat(leverage),
-            'MARKET',
-            {
-                fastExecution: fastExecution !== false,
-                fallbackPrice: normalizedFallbackPrice,
-                origin: 'MANUAL',
-                ...(typeof babysitterExcluded === 'boolean' ? { babysitterExcluded } : {}),
-                ...(reduceOnly ? { reduceOnly: true } : {}),
-            },
-        );
-
-
-        if (!result.success) {
-            // Structured errors: [{ code, message }]
-            return res.status(400).json({
-                success: false,
-                errors: result.errors,
-                // Legacy compat
-                error: result.errors.map(e => e.message || e).join('; '),
-                reasons: result.errors.map(e => e.message || e),
-            });
+        // ── V2: C++ Engine Write Path (ACK-first) ────────────────────────────
+        idem = await beginIdempotentRequest(req, 'trade:market');
+        if (idem?.replay) {
+            res.set('X-Idempotency-Replayed', '1');
+            return res.status(idem.replay.statusCode || 200).json(idem.replay.body || {});
+        }
+        if (idem?.conflict) {
+            return res.status(409).json({ error: 'Duplicate request in progress (idempotency key)' });
         }
 
-        const serverLatencyMs = Date.now() - startedAt;
-        res.set('X-Server-Latency-Ms', String(serverLatencyMs));
-        res.status(201).json({ ...result, serverLatencyMs });
+        try {
+            const bridge = await ensureSubmitPreflight({
+                getBridge: getSimplxBridge,
+                subAccountId,
+                sync: true,
+            });
+
+            const cppSide = side.toUpperCase() === 'LONG' ? 'BUY' : 'SELL';
+            const rawSymbol = toCppSymbol(normalizedSymbol);
+            const parsedLev = parseFloat(leverage);
+
+            // C++ risk validation expects a reference price even for MARKET orders
+            let commandPrice = normalizedFallbackPrice;
+            if (!commandPrice) {
+                const livePrice = exchange.getLatestPrice(normalizedSymbol);
+                if (Number.isFinite(livePrice) && livePrice > 0) commandPrice = livePrice;
+            }
+            if (!commandPrice) {
+                if (allowHttpPriceLookup()) {
+                    const fetched = await fetchBinanceReferencePrice(rawSymbol);
+                    if (fetched) commandPrice = fetched;
+                }
+            }
+            if (commandPrice) {
+                try { commandPrice = Number.parseFloat(exchange.priceToPrecisionCached(normalizedSymbol, commandPrice, { mode: 'nearest' })); } catch { /* best-effort */ }
+            }
+
+            const minNotional = reduceOnly ? 0 : getSymbolMinNotional(normalizedSymbol, exchange);
+            if (minNotional > 0) {
+                const notionalRefPrice = parsePositiveNumber(commandPrice)
+                    || parsePositiveNumber(sizing.referencePrice)
+                    || parsePositiveNumber(normalizedFallbackPrice);
+                if (notionalRefPrice) {
+                    const estimatedNotional = normalizedQty * notionalRefPrice;
+                    if ((estimatedNotional + 1e-9) < minNotional) {
+                        return res.status(400).json({
+                            error: `Order notional too small for ${normalizedSymbol}: ${estimatedNotional.toFixed(4)} < min ${minNotional}`,
+                            errors: [{
+                                code: 'EXCHANGE_MIN_NOTIONAL',
+                                message: `Order notional too small for ${normalizedSymbol}: ${estimatedNotional.toFixed(4)} < min ${minNotional}. Increase size or use reduce-only.`,
+                            }],
+                        });
+                    }
+                }
+            }
+
+            const clientOrderId = makeCppClientOrderId('mkt', subAccountId);
+            const requestId = await bridge.sendCommand('new', {
+                sub_account_id: subAccountId,
+                client_order_id: clientOrderId,
+                symbol: rawSymbol,
+                side: cppSide,
+                type: 'MARKET',
+                qty: normalizedQty,
+                leverage: parsedLev,
+                ...(commandPrice ? { price: commandPrice } : {}),
+                ...(reduceOnly ? { reduce_only: true } : {}),
+            });
+
+            const serverLatencyMs = Date.now() - startedAt;
+            res.set('X-Server-Latency-Ms', String(serverLatencyMs));
+            res.set('X-Source', 'cpp-engine');
+            const responseBody = {
+                success: true, accepted: true, source: 'cpp-engine',
+                serverLatencyMs, requestId, clientOrderId, status: 'QUEUED',
+                persistencePending: false,
+            };
+            await completeIdempotentRequest(idem, { statusCode: 202, body: responseBody });
+            return res.status(202).json(responseBody);
+        } catch (cppErr) {
+            await releaseIdempotentRequest(idem);
+            console.error(`[Trade] C++ submit failed: ${cppErr.message}`);
+            return res.status(502).json({ success: false, error: `C++ submit failed: ${cppErr.message}` });
+        }
     } catch (err) {
+        await releaseIdempotentRequest(idem);
         res.status(500).json({ error: err.message });
     }
 });
 
 // POST /api/trade/close/:positionId - Close a position
 router.post('/close/:positionId', requirePositionOwnership(), async (req, res) => {
+    let idem = null;
     try {
-        const _t0 = Date.now();
-        const result = await riskEngine.closePosition(req.params.positionId, 'CLOSE');
-        if (!result.success) {
-            return res.status(400).json({ error: 'Close failed', reasons: result.errors });
+        idem = await beginIdempotentRequest(req, 'trade:close');
+        if (idem?.replay) {
+            res.set('X-Idempotency-Replayed', '1');
+            return res.status(idem.replay.statusCode || 200).json(idem.replay.body || {});
         }
-        console.log(`[Perf] POST /trade/close ${Date.now() - _t0}ms`);
-        res.json(result);
+        if (idem?.conflict) {
+            return res.status(409).json({ error: 'Duplicate request in progress (idempotency key)' });
+        }
+        const result = await closePositionViaCpp(req.params.positionId, 'CLOSE');
+        const responseBody = {
+            ...result,
+            source: 'cpp-engine',
+            status: result?.status || 'QUEUED',
+            persistencePending: false,
+        };
+        await completeIdempotentRequest(idem, { statusCode: 202, body: responseBody });
+        res.status(202).json(responseBody);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        await releaseIdempotentRequest(idem);
+        res.status(err.message.includes('not found') ? 404 : 500).json({ error: err.message });
     }
 });
 
 // POST /api/trade/close-all/:subAccountId - Close all open positions
 router.post('/close-all/:subAccountId', requireOwnership(), async (req, res) => {
+    let idem = null;
     try {
-        const positions = await prisma.virtualPosition.findMany({
-            where: { subAccountId: req.params.subAccountId, status: 'OPEN' },
-        });
-        if (positions.length === 0) return res.json({ closed: 0, results: [] });
-
-        const results = [];
-        for (const pos of positions) {
-            try {
-                const result = await riskEngine.closePosition(pos.id, 'CLOSE');
-                results.push({ positionId: pos.id, symbol: pos.symbol, success: result.success, pnl: result.trade?.realizedPnl });
-            } catch (err) {
-                results.push({ positionId: pos.id, symbol: pos.symbol, success: false, error: err.message });
-            }
+        idem = await beginIdempotentRequest(req, 'trade:close-all');
+        if (idem?.replay) {
+            res.set('X-Idempotency-Replayed', '1');
+            return res.status(idem.replay.statusCode || 200).json(idem.replay.body || {});
         }
-        res.json({ closed: results.filter(r => r.success).length, total: positions.length, results });
+        if (idem?.conflict) {
+            return res.status(409).json({ error: 'Duplicate request in progress (idempotency key)' });
+        }
+        const result = await closeAllPositionsViaCpp(req.params.subAccountId, 'CLOSE');
+        const responseBody = {
+            ...result,
+            source: 'cpp-engine',
+            status: 'QUEUED',
+            accepted: true,
+            persistencePending: false,
+        };
+        await completeIdempotentRequest(idem, { statusCode: 200, body: responseBody });
+        res.json(responseBody);
     } catch (err) {
+        await releaseIdempotentRequest(idem);
         res.status(500).json({ error: err.message });
     }
 });
 
 // POST /api/trade/limit-close/:positionId - Place reduce-only limit close
 router.post('/limit-close/:positionId', requirePositionOwnership(), async (req, res) => {
+    let idem = null;
     try {
         const { price } = req.body;
-        if (!price) return res.status(400).json({ error: 'price is required' });
+        const requestedPrice = parsePositiveNumber(price);
+        if (!requestedPrice) return res.status(400).json({ error: 'price is required and must be positive' });
 
         const position = await prisma.virtualPosition.findUnique({ where: { id: req.params.positionId } });
         if (!position) return res.status(404).json({ error: 'Position not found' });
@@ -117,9 +265,31 @@ router.post('/limit-close/:positionId', requirePositionOwnership(), async (req, 
         // Before placing a reduce-only limit order, verify a real exchange position
         // exists with the same side. A desynced position would create a bad order.
         try {
-            const exchangePositions = await exchange.fetchPositions();
-            const exchangePos = exchangePositions.find((p) => p.symbol === position.symbol);
-            const exSide = (exchangePos?.side || '').toLowerCase();
+            const bridge = getSimplxBridge();
+            let exchangePositions = [];
+
+            if (bridge && typeof bridge.getExchangePositionsSnapshot === 'function') {
+                const maxAgeMsRaw = Number.parseInt(process.env.CPP_EXCHANGE_POSITION_CACHE_MAX_AGE_MS || '7000', 10);
+                const maxAgeMs = Number.isFinite(maxAgeMsRaw) && maxAgeMsRaw > 0 ? maxAgeMsRaw : 7000;
+                let snap = bridge.getExchangePositionsSnapshot(maxAgeMs);
+
+                if (!snap.fresh && typeof bridge.syncExchangePositions === 'function') {
+                    await bridge.syncExchangePositions({ reason: 'limit_close', force: true });
+                    snap = bridge.getExchangePositionsSnapshot(maxAgeMs);
+                }
+                exchangePositions = snap.positions || [];
+            }
+
+            if (!exchangePositions.length) {
+                exchangePositions = await exchange.fetchPositions();
+            }
+
+            const positionSymbol = toCppSymbol(position.symbol);
+            const exchangePos = exchangePositions.find((p) => toCppSymbol(p.symbol) === positionSymbol);
+            const exSideRaw = String(exchangePos?.side || '').toUpperCase();
+            const exSide = exSideRaw === 'LONG' || exSideRaw === 'BUY'
+                ? 'long'
+                : (exSideRaw === 'SHORT' || exSideRaw === 'SELL' ? 'short' : '');
             const virtualSide = position.side.toLowerCase(); // 'long' or 'short'
 
             if (!exchangePos) {
@@ -150,35 +320,74 @@ router.post('/limit-close/:positionId', requirePositionOwnership(), async (req, 
         }
         // ────────────────────────────────────────────────────────────────────
 
-        // Close side is opposite of position side
-        const closeSide = position.side === 'LONG' ? 'sell' : 'buy';
+        idem = await beginIdempotentRequest(req, 'trade:limit-close');
+        if (idem?.replay) {
+            res.set('X-Idempotency-Replayed', '1');
+            return res.status(idem.replay.statusCode || 200).json(idem.replay.body || {});
+        }
+        if (idem?.conflict) {
+            return res.status(409).json({ error: 'Duplicate request in progress (idempotency key)' });
+        }
 
-        await exchange.setLeverage(position.symbol, position.leverage);
-        const exchangeResult = await exchange.createLimitOrder(
-            position.symbol,
-            closeSide,
-            position.quantity,
-            parseFloat(price),
-            { reduceOnly: true },
-        );
-
-        // Store as pending order
-        const order = await prisma.pendingOrder.create({
-            data: {
-                subAccountId: position.subAccountId,
-                symbol: position.symbol,
-                side: position.side === 'LONG' ? 'SHORT' : 'LONG',
-                type: 'LIMIT',
-                price: parseFloat(price),
-                quantity: position.quantity,
-                leverage: position.leverage,
-                exchangeOrderId: exchangeResult.orderId,
-                status: 'PENDING',
-            },
+        const bridge = await ensureSubmitPreflight({
+            getBridge: getSimplxBridge,
+            subAccountId: position.subAccountId,
+            sync: true,
         });
 
-        res.status(201).json({ success: true, order });
+        const normalizedPrice = Number.parseFloat(
+            exchange.priceToPrecisionCached(position.symbol, requestedPrice, { mode: 'nearest' }),
+        );
+        if (!Number.isFinite(normalizedPrice) || normalizedPrice <= 0) {
+            return res.status(400).json({ error: `Invalid limit close price: ${price}` });
+        }
+
+        const clientOrderId = makeCppClientOrderId('lmt', position.subAccountId);
+        const requestId = await bridge.sendCommand('new', {
+            sub_account_id: position.subAccountId,
+            client_order_id: clientOrderId,
+            symbol: toCppSymbol(position.symbol),
+            side: position.side === 'LONG' ? 'SELL' : 'BUY',
+            type: 'LIMIT',
+            qty: position.quantity,
+            price: normalizedPrice,
+            leverage: position.leverage || 20,
+            reduce_only: true,
+        });
+
+        // Store as pending order (best effort after C++ ACK)
+        const persisted = await persistPendingOrderWithRecovery({
+            subAccountId: position.subAccountId,
+            symbol: position.symbol,
+            side: position.side === 'LONG' ? 'SHORT' : 'LONG',
+            type: 'LIMIT',
+            price: normalizedPrice,
+            quantity: position.quantity,
+            leverage: position.leverage,
+            exchangeOrderId: clientOrderId,
+            status: 'PENDING',
+        }, 'LimitClose', { route: 'limit-close', requestId, clientOrderId, positionId: position.id });
+
+        res.set('X-Source', 'cpp-engine');
+        if (persisted.persistencePending) {
+            res.set('X-Persistence-Pending', '1');
+        }
+        const responseBody = {
+            success: true,
+            accepted: true,
+            source: 'cpp-engine',
+            requestId,
+            clientOrderId,
+            status: persisted.persistencePending ? 'accepted_but_persist_pending' : 'QUEUED',
+            persistencePending: persisted.persistencePending,
+            persistenceError: persisted.persistencePending ? persisted.persistenceError : undefined,
+            recoveryQueue: persisted.persistencePending ? persisted.recoveryQueue : undefined,
+            order: persisted.order,
+        };
+        await completeIdempotentRequest(idem, { statusCode: 202, body: responseBody });
+        res.status(202).json(responseBody);
     } catch (err) {
+        await releaseIdempotentRequest(idem);
         console.error('[LimitClose] Failed:', err.message);
         res.status(400).json({ error: err.message });
     }
@@ -187,11 +396,49 @@ router.post('/limit-close/:positionId', requirePositionOwnership(), async (req, 
 // POST /api/trade/validate - Validate a trade without executing
 router.post('/validate', requireOwnership('body'), async (req, res) => {
     try {
-        const { subAccountId, symbol, side, quantity, leverage } = req.body;
+        const { subAccountId, symbol, side, quantity, leverage, price, fallbackPrice } = req.body;
+        const requestedNotionalUsd = extractNotionalUsd(req.body);
+        if (!subAccountId || !symbol || !side || !leverage || (!quantity && !requestedNotionalUsd)) {
+            return res.status(400).json({
+                error: 'Missing required fields: subAccountId, symbol, side, leverage, and quantity or notionalUsd',
+            });
+        }
+        let sizing;
+        try {
+            sizing = await normalizeOrderSizing({
+                symbol,
+                side,
+                quantity,
+                price,
+                fallbackPrice,
+                notionalUsd: requestedNotionalUsd,
+                payload: req.body,
+                quantityPrecisionMode: 'nearest',
+                pricePrecisionMode: 'nearest',
+                allowPriceLookup: true,
+                exchangeConnector: exchange,
+            });
+        } catch (sizingErr) {
+            return res.status(400).json({ error: sizingErr.message });
+        }
         const result = await riskEngine.validateTrade(
-            subAccountId, symbol, side?.toUpperCase(), parseFloat(quantity), parseFloat(leverage)
+            subAccountId,
+            sizing.symbol,
+            side?.toUpperCase(),
+            sizing.quantity,
+            parseFloat(leverage),
         );
-        res.json(result);
+        res.json({
+            ...result,
+            sizing: {
+                symbol: sizing.symbol,
+                quantity: sizing.quantity,
+                requestedNotionalUsd: sizing.requestedNotionalUsd,
+                referencePrice: sizing.referencePrice,
+                priceSource: sizing.priceSource,
+                derivedFromNotional: sizing.derivedFromNotional,
+            },
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -201,14 +448,19 @@ router.post('/validate', requireOwnership('body'), async (req, res) => {
 router.get('/positions/:subAccountId', requireOwnership(), async (req, res) => {
     try {
         const subAccountId = req.params.subAccountId;
+
+        // Phase 3: C++ SnapshotCache removed — positions served from Redis snapshot
+        // or riskEngine.getAccountSummary (event-sourced, always fresh)
+
         const snapshot = await getRiskSnapshot(subAccountId);
         const snapshotFresh = snapshot?.timestamp && (Date.now() - snapshot.timestamp) < 15_000;
 
         if (snapshotFresh) {
-            const account = await prisma.subAccount.findUnique({ where: { id: subAccountId } });
+            const [account, rules] = await Promise.all([
+                prisma.subAccount.findUnique({ where: { id: subAccountId } }),
+                riskEngine.getRules(subAccountId),
+            ]);
             if (!account) return res.status(404).json({ error: 'Sub-account not found' });
-
-            const rules = await riskEngine.getRules(subAccountId);
             return res.json({
                 account,
                 positions: snapshot.positions || [],
@@ -252,8 +504,7 @@ router.get('/balance/:subAccountId', requireOwnership(), async (req, res) => {
 router.get('/history/:subAccountId', requireOwnership(), async (req, res) => {
     try {
         const limit = parseInt(req.query.limit) || 50;
-        const offset = parseInt(req.query.offset) || 0;
-        const { symbol, from, to, action } = req.query;
+        const { symbol, from, to, action, cursor } = req.query;
 
         const where = { subAccountId: req.params.subAccountId };
         if (symbol) where.symbol = symbol;
@@ -263,18 +514,27 @@ router.get('/history/:subAccountId', requireOwnership(), async (req, res) => {
             if (from) where.timestamp.gte = new Date(from);
             if (to) where.timestamp.lte = new Date(to);
         }
+        // Cursor-based pagination: fetch records older than the cursor ID
+        if (cursor) {
+            where.id = { lt: cursor };
+        }
 
+        const take = Math.min(limit, 1000);
         const [trades, total] = await Promise.all([
             prisma.tradeExecution.findMany({
                 where,
                 orderBy: { timestamp: 'desc' },
-                skip: offset,
-                take: limit,
+                take,
                 include: { position: { select: { id: true, side: true, entryPrice: true, status: true } } },
             }),
             prisma.tradeExecution.count({ where }),
         ]);
-        res.json({ trades, total, offset, limit });
+
+        const nextCursor = trades.length === take && trades.length > 0
+            ? trades[trades.length - 1].id
+            : null;
+
+        res.json({ trades, total, count: trades.length, hasMore: trades.length === take, nextCursor, limit });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -286,7 +546,10 @@ router.get('/margin/:subAccountId', requireOwnership(), async (req, res) => {
         const _t0 = Date.now();
         const subAccountId = req.params.subAccountId;
 
-        // Fast path: use Redis snapshot if fresh (avoids slow getAccountSummary with REST prices)
+        // Phase 3: C++ SnapshotCache removed — margin served from Redis snapshot
+        // or riskEngine.getMarginInfo (event-sourced, always fresh)
+
+        // Fast path: use Redis snapshot if fresh (avoids slow getMarginInfo with REST prices)
         const snapshot = await getRiskSnapshot(subAccountId);
         const snapshotFresh = snapshot?.timestamp && (Date.now() - snapshot.timestamp) < 15_000;
 
@@ -297,7 +560,7 @@ router.get('/margin/:subAccountId', requireOwnership(), async (req, res) => {
             ]);
             if (!account) return res.status(404).json({ error: 'Sub-account not found' });
 
-            console.log(`[Perf] /trade/margin (snapshot) ${Date.now() - _t0}ms`);
+            if (LOG_TRADE_ROUTE_PERF) console.log(`[Perf] /trade/margin (snapshot) ${Date.now() - _t0}ms`);
             return res.json({
                 account,
                 equity: snapshot.equity ?? 0,
@@ -321,7 +584,7 @@ router.get('/margin/:subAccountId', requireOwnership(), async (req, res) => {
         // Slow path: compute from scratch
         const info = await riskEngine.getMarginInfo(subAccountId);
         if (!info) return res.status(404).json({ error: 'Sub-account not found' });
-        console.log(`[Perf] /trade/margin (full) ${Date.now() - _t0}ms`);
+        if (LOG_TRADE_ROUTE_PERF) console.log(`[Perf] /trade/margin (full) ${Date.now() - _t0}ms`);
         res.json(info);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -454,6 +717,56 @@ router.get('/chart-data/:subAccountId', requireOwnership(), async (req, res) => 
 
         res.json({ positions, trades, openOrders });
     } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/trade/positions/:subAccountId/refresh - Force-sync virtual positions with exchange
+router.post('/positions/:subAccountId/refresh', requireOwnership(), async (req, res) => {
+    try {
+        const subAccountId = req.params.subAccountId;
+        const account = await prisma.subAccount.findUnique({ where: { id: subAccountId } });
+        if (!account) return res.status(404).json({ error: 'Sub-account not found' });
+
+        // Fetch real positions from exchange
+        const exchangePositions = await exchange.fetchPositions();
+        const realPositions = exchangePositions.filter(p => {
+            const amt = Math.abs(parseFloat(p.contracts || p.contractSize || 0));
+            return amt > 0;
+        });
+
+        // Fetch virtual positions from DB
+        const virtualPositions = await prisma.virtualPosition.findMany({
+            where: { subAccountId, status: 'OPEN' },
+        });
+
+        const syncResults = { created: 0, closed: 0, updated: 0, unchanged: 0 };
+
+        // Check for orphaned virtual positions (exist virtually but not on exchange)
+        const exchangeSymbols = new Set(realPositions.map(p => p.symbol));
+        for (const vp of virtualPositions) {
+            if (!exchangeSymbols.has(vp.symbol)) {
+                // Orphaned — close it virtually at latest known price
+                try {
+                    await closePositionViaCpp(vp.id, 'ORPHAN_RECONCILE');
+                    syncResults.closed++;
+                } catch (err) {
+                    console.warn(`[Refresh] Failed to reconcile orphaned position ${vp.symbol}:`, err.message);
+                }
+            }
+        }
+
+        // Mark positions dirty so the risk engine reloads
+        riskEngine.markPositionsDirty();
+
+        // Return fresh data
+        const summary = await riskEngine.getAccountSummary(subAccountId);
+        res.json({
+            syncResults,
+            ...(summary || {}),
+        });
+    } catch (err) {
+        console.error('[Refresh] Position refresh failed:', err.message);
         res.status(500).json({ error: err.message });
     }
 });

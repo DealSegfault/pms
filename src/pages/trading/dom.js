@@ -111,6 +111,7 @@ export function buildTradingHTML() {
               Current only
             </label>
             <button id="cancel-all-orders" class="btn-cancel-all" style="display:none;" title="Cancel all open orders">Cancel All</button>
+            <button id="cancel-all-scalpers" class="btn-cancel-all" style="display:none; background:#7c3aed; border-color:#7c3aed;" title="Stop all active scalpers">⚔ Kill Scalpers</button>
           </div>
           <div class="bp-content">
             <div class="open-orders-panel bp-pane active" id="bp-orders">
@@ -186,8 +187,8 @@ export function buildTradingHTML() {
 
           <div class="ot-dropdown" id="ot-dropdown" style="margin: 8px 10px 4px; position:relative; user-select:none;">
             <button id="ot-trigger" class="ot-trigger">
-              <span class="ot-selected-icon" id="ot-selected-icon">${{ 'MARKET': '⚡', 'LIMIT': '📌', 'SCALE': '📊', 'TWAP': '⏱️', 'TRAIL': '🛡️', 'CHASE': '🎯', 'SURF': '🏄', 'SCALPER': '⚔️' }[S.orderType] || '⚡'}</span>
-              <span class="ot-selected-label" id="ot-selected-label">${{ 'MARKET': 'Market', 'LIMIT': 'Limit', 'SCALE': 'Scale', 'TWAP': 'TWAP', 'TRAIL': 'Trail Stop', 'CHASE': 'Chase', 'SURF': 'Surf', 'SCALPER': 'Scalper' }[S.orderType] || 'Market'}</span>
+              <span class="ot-selected-icon" id="ot-selected-icon">${{ 'MARKET': '⚡', 'LIMIT': '📌', 'SCALE': '📊', 'TWAP': '⏱️', 'TRAIL': '🛡️', 'CHASE': '🎯', 'SCALPER': '⚔️', 'AGENT': '🤖', 'SMART': '🧠' }[S.orderType] || '⚡'}</span>
+              <span class="ot-selected-label" id="ot-selected-label">${{ 'MARKET': 'Market', 'LIMIT': 'Limit', 'SCALE': 'Scale', 'TWAP': 'TWAP', 'TRAIL': 'Trail Stop', 'CHASE': 'Chase', 'SCALPER': 'Scalper', 'AGENT': 'Agent', 'SMART': 'SmartOrder' }[S.orderType] || 'Market'}</span>
               <svg class="ot-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 9l6 6 6-6"/></svg>
             </button>
             <div class="ot-menu" id="ot-menu">
@@ -212,13 +213,18 @@ export function buildTradingHTML() {
                 <span class="ot-opt-icon">🎯</span>
                 <div class="ot-opt-text"><span class="ot-opt-name">Chase</span><span class="ot-opt-desc">Stalk the best quote</span></div>
               </div>
-              <div class="ot-option${S.orderType === 'SURF' ? ' active' : ''}" data-type="SURF">
-                <span class="ot-opt-icon">🏄</span>
-                <div class="ot-opt-text"><span class="ot-opt-name">Surf</span><span class="ot-opt-desc">Momentum rider with scalp/core split</span></div>
-              </div>
+
               <div class="ot-option${S.orderType === 'SCALPER' ? ' active' : ''}" data-type="SCALPER">
                 <span class="ot-opt-icon">⚔️</span>
                 <div class="ot-opt-text"><span class="ot-opt-name">Scalper</span><span class="ot-opt-desc">Dual chase — long &amp; short layers</span></div>
+              </div>
+              <div class="ot-option${S.orderType === 'SMART' ? ' active' : ''}" data-type="SMART">
+                <span class="ot-opt-icon">🧠</span>
+                <div class="ot-opt-text"><span class="ot-opt-name">SmartOrder</span><span class="ot-opt-desc">Adaptive TCA-driven scalper</span></div>
+              </div>
+              <div class="ot-option${S.orderType === 'AGENT' ? ' active' : ''}" data-type="AGENT">
+                <span class="ot-opt-icon">🤖</span>
+                <div class="ot-opt-text"><span class="ot-opt-name">Agent</span><span class="ot-opt-desc">Auto-trading strategies</span></div>
               </div>
               <div class="ot-divider"></div>
               <div class="ot-option${S.orderType === 'TRAIL' ? ' active' : ''}" data-type="TRAIL">
@@ -382,7 +388,7 @@ export function buildTradingHTML() {
                 <label style="font-size:11px; color:var(--cyan,#06b6d4); margin:0;">Long Offset %</label>
                 <span id="scalper-long-off-val" style="font-size:13px; font-weight:600; color:var(--cyan,#06b6d4); font-family:var(--font-mono);">0.300%</span>
               </div>
-              <input type="range" id="scalper-long-offset" min="0" max="5" value="0.3" step="0.01" style="width:100%;" />
+              <input type="range" id="scalper-long-offset" min="0" max="3" value="0.3" step="0.01" style="width:100%;" />
               <div style="font-size:9px; color:var(--text-muted); margin-top:3px; opacity:0.7;">BUY chase placed this far below best bid</div>
             </div>
             <!-- Short offset -->
@@ -391,7 +397,7 @@ export function buildTradingHTML() {
                 <label style="font-size:11px; color:var(--orange,#f97316); margin:0;">Short Offset %</label>
                 <span id="scalper-short-off-val" style="font-size:13px; font-weight:600; color:var(--orange,#f97316); font-family:var(--font-mono);">0.300%</span>
               </div>
-              <input type="range" id="scalper-short-offset" min="0" max="5" value="0.3" step="0.01" style="width:100%;" />
+              <input type="range" id="scalper-short-offset" min="0" max="3" value="0.3" step="0.01" style="width:100%;" />
               <div style="font-size:9px; color:var(--text-muted); margin-top:3px; opacity:0.7;">SELL chase placed this far above best ask</div>
             </div>
             <!-- Child count -->
@@ -444,10 +450,10 @@ export function buildTradingHTML() {
                 </div>
               </div>
             </div>
-            <!-- Anti-overtrading settings (shown in Neutral mode) -->
-            <div id="scalper-neutral-settings" style="display:none;">
+            <!-- Anti-overtrading / advanced scalper settings (always visible) -->
+            <div id="scalper-neutral-settings">
               <div style="border-top:1px solid rgba(255,255,255,0.07); padding-top:8px; margin-bottom:8px;">
-                <div style="font-size:10px; color:#a855f7; font-weight:600; margin-bottom:6px;">🧲 Neutral Mode Settings</div>
+                <div style="font-size:10px; color:#a855f7; font-weight:600; margin-bottom:6px;">⚙️ Advanced Scalper Settings</div>
                 <!-- Min fill spread -->
                 <div style="margin-bottom:8px;">
                   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:3px;">
@@ -521,41 +527,96 @@ export function buildTradingHTML() {
             <div id="scalper-preview" style="font-size:10px; color:var(--text-muted); text-align:center; min-height:20px; margin-bottom:4px;"></div>
           </div>
 
-          <!-- Surf Controls -->
-          <div id="surf-controls" style="display:${S.orderType === 'SURF' ? '' : 'none'}; padding:0 10px;">
+          <!-- Agent Controls -->
+          <div id="agent-controls" style="display:${S.orderType === 'AGENT' ? '' : 'none'}; padding:0 10px;">
             <div style="margin-bottom:8px;">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-                <label style="font-size:11px; color:var(--text-muted); margin:0;">Max Position (USDT)</label>
-                <span id="surf-max-pos-val" style="font-size:13px; font-weight:600; color:var(--text); font-family:var(--font-mono);">$500</span>
-              </div>
-              <div style="display:flex; gap:6px; align-items:center;">
-                <input type="range" id="surf-max-pos-slider" min="10" max="5000" value="500" step="10" style="flex:1;" />
-                <input type="number" id="surf-max-pos" value="500" min="10" step="10" inputmode="decimal" style="width:60px; background:var(--surface-2); border:1px solid var(--border); border-radius:4px; padding:4px 6px; font-weight:600; font-family:var(--font-mono); color:var(--text); font-size:11px; text-align:right;" />
-              </div>
-              <div style="font-size:9px; color:var(--text-muted); margin-top:3px; opacity:0.7;">Max position size. Auto-deleverages at cap.</div>
-            </div>
-            <div style="margin-bottom:8px;">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-                <label style="font-size:11px; color:var(--text-muted); margin:0;">Strategy</label>
-                <span id="surf-scalp-val" style="font-size:13px; font-weight:600; color:var(--text); font-family:var(--font-mono);">60%</span>
-              </div>
-              <input type="range" id="surf-scalp-ratio" min="0" max="100" value="60" step="5" style="width:100%;" />
-              <div style="display:flex; justify-content:space-between; font-size:9px; color:var(--text-muted); margin-top:2px;">
-                <span>Hold</span>
-                <span>Scalp</span>
+              <label style="font-size:11px; color:var(--text-muted); margin:0 0 4px; display:block;">Strategy Type</label>
+              <div style="display:flex; gap:4px;">
+                <button class="agent-type-btn" data-agent-type="trend" style="flex:1; padding:5px 0; border-radius:5px; border:1px solid var(--accent); background:var(--accent); color:#fff; font-size:11px; font-weight:600; cursor:pointer;">📈 Trend</button>
+                <button class="agent-type-btn" data-agent-type="grid" style="flex:1; padding:5px 0; border-radius:5px; border:1px solid var(--border); background:var(--surface-2); color:var(--text); font-size:11px; font-weight:600; cursor:pointer;">📊 Grid</button>
+                <button class="agent-type-btn" data-agent-type="deleverage" style="flex:1; padding:5px 0; border-radius:5px; border:1px solid var(--border); background:var(--surface-2); color:var(--text); font-size:11px; font-weight:600; cursor:pointer;">🔻 Delev</button>
               </div>
             </div>
-            <div style="margin-bottom:8px;">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-                <label style="font-size:11px; color:var(--text-muted); margin:0;">Offset (bps)</label>
-                <span id="surf-offset-val" style="font-size:13px; font-weight:600; color:var(--text); font-family:var(--font-mono);">0.3</span>
+
+            <!-- Trend Agent Config -->
+            <div id="agent-trend-config">
+              <div style="display:flex; gap:6px; margin-bottom:6px;">
+                <div style="flex:1;">
+                  <label style="font-size:10px; color:var(--text-muted);">Fast EMA</label>
+                  <input type="number" id="agent-trend-fast" value="10" min="2" max="100" style="width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:4px; padding:4px 6px; font-size:11px; color:var(--text); font-family:var(--font-mono);" />
+                </div>
+                <div style="flex:1;">
+                  <label style="font-size:10px; color:var(--text-muted);">Slow EMA</label>
+                  <input type="number" id="agent-trend-slow" value="50" min="5" max="500" style="width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:4px; padding:4px 6px; font-size:11px; color:var(--text); font-family:var(--font-mono);" />
+                </div>
               </div>
-              <input type="range" id="surf-offset-bps" min="0.1" max="5" value="0.3" step="0.1" style="width:100%;" />
-              <div style="font-size:9px; color:var(--text-muted); margin-top:3px; opacity:0.7;">Distance from extreme to fill trigger</div>
+              <div style="display:flex; gap:6px; margin-bottom:6px;">
+                <div style="flex:1;">
+                  <label style="font-size:10px; color:var(--text-muted);">Offset %</label>
+                  <input type="number" id="agent-trend-offset" value="0.15" min="0.01" max="5" step="0.01" style="width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:4px; padding:4px 6px; font-size:11px; color:var(--text); font-family:var(--font-mono);" />
+                </div>
+                <div style="flex:1;">
+                  <label style="font-size:10px; color:var(--text-muted);">Layers</label>
+                  <input type="number" id="agent-trend-layers" value="2" min="1" max="10" style="width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:4px; padding:4px 6px; font-size:11px; color:var(--text); font-family:var(--font-mono);" />
+                </div>
+              </div>
+              <div style="font-size:9px; color:var(--text-muted); margin-bottom:4px; opacity:0.7;">Spawns directional scalpers on EMA crossover</div>
             </div>
-            <div id="surf-preview" style="font-size:10px; color:var(--text-muted); text-align:center; min-height:20px; margin-bottom:4px;"></div>
-            <div id="surf-status-panel" style="display:none; background:var(--surface-2); border:1px solid var(--border); border-radius:6px; padding:6px 8px; margin-bottom:6px;"></div>
+
+            <!-- Grid Agent Config -->
+            <div id="agent-grid-config" style="display:none;">
+              <div style="display:flex; gap:6px; margin-bottom:6px;">
+                <div style="flex:1;">
+                  <label style="font-size:10px; color:var(--text-muted);">Offset %</label>
+                  <input type="number" id="agent-grid-offset" value="0.2" min="0.01" max="5" step="0.01" style="width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:4px; padding:4px 6px; font-size:11px; color:var(--text); font-family:var(--font-mono);" />
+                </div>
+                <div style="flex:1;">
+                  <label style="font-size:10px; color:var(--text-muted);">Layers</label>
+                  <input type="number" id="agent-grid-layers" value="3" min="1" max="10" style="width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:4px; padding:4px 6px; font-size:11px; color:var(--text); font-family:var(--font-mono);" />
+                </div>
+              </div>
+              <div style="display:flex; gap:6px; margin-bottom:6px;">
+                <div style="flex:1;">
+                  <label style="font-size:10px; color:var(--text-muted);">Max DD ($)</label>
+                  <input type="number" id="agent-grid-max-dd" value="10" min="1" max="1000" style="width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:4px; padding:4px 6px; font-size:11px; color:var(--text); font-family:var(--font-mono);" />
+                </div>
+                <div style="flex:1;">
+                  <label style="font-size:10px; color:var(--text-muted);">Cooldown (s)</label>
+                  <input type="number" id="agent-grid-cooldown" value="60" min="5" max="600" style="width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:4px; padding:4px 6px; font-size:11px; color:var(--text); font-family:var(--font-mono);" />
+                </div>
+              </div>
+              <div style="font-size:9px; color:var(--text-muted); margin-bottom:4px; opacity:0.7;">Neutral market-making scalper with auto-pause on drawdown</div>
+            </div>
+
+            <!-- Deleverage Agent Config -->
+            <div id="agent-deleverage-config" style="display:none;">
+              <div style="display:flex; gap:6px; margin-bottom:6px;">
+                <div style="flex:1;">
+                  <label style="font-size:10px; color:var(--text-muted);">Max Notional ($)</label>
+                  <input type="number" id="agent-delev-max-notional" value="500" min="10" max="50000" style="width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:4px; padding:4px 6px; font-size:11px; color:var(--text); font-family:var(--font-mono);" />
+                </div>
+                <div style="flex:1;">
+                  <label style="font-size:10px; color:var(--text-muted);">Unwind %</label>
+                  <input type="number" id="agent-delev-unwind-pct" value="30" min="5" max="100" style="width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:4px; padding:4px 6px; font-size:11px; color:var(--text); font-family:var(--font-mono);" />
+                </div>
+              </div>
+              <div style="display:flex; gap:6px; margin-bottom:6px;">
+                <div style="flex:1;">
+                  <label style="font-size:10px; color:var(--text-muted);">Max Loss (bps)</label>
+                  <input type="number" id="agent-delev-max-loss" value="200" min="0" max="10000" style="width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:4px; padding:4px 6px; font-size:11px; color:var(--text); font-family:var(--font-mono);" />
+                </div>
+                <div style="flex:1;">
+                  <label style="font-size:10px; color:var(--text-muted);">Offset %</label>
+                  <input type="number" id="agent-delev-offset" value="0.2" min="0.01" max="5" step="0.01" style="width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:4px; padding:4px 6px; font-size:11px; color:var(--text); font-family:var(--font-mono);" />
+                </div>
+              </div>
+              <div style="font-size:9px; color:var(--text-muted); margin-bottom:4px; opacity:0.7;">Unwinds position when notional exceeds cap</div>
+            </div>
+
+            <div id="agent-preview" style="font-size:10px; color:var(--text-muted); text-align:center; min-height:20px; margin-bottom:4px;"></div>
           </div>
+
+
 
           <!-- Size -->
           <div style="margin-bottom: 6px;">

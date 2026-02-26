@@ -3,9 +3,15 @@
  * No account-ownership checks needed for these endpoints.
  */
 import { Router } from 'express';
-import exchange from '../../exchange.js';
+import defaultExchange from '../../exchange.js';
+import { fetchAggTrades, fetchKlines, fetchPremiumIndexAll, fetchTicker24hAll } from '../../exchange-public.js';
 
 const router = Router();
+let exchange = defaultExchange;
+
+export function setMarketDataExchangeConnector(exchangeConnector) {
+    exchange = exchangeConnector || defaultExchange;
+}
 
 let tickerCache = { data: null, ts: 0 };
 
@@ -105,8 +111,12 @@ router.get('/klines', async (req, res) => {
             });
             if (endTime) aggParams.set('endTime', endTime);
 
-            const aggResp = await fetch(`https://fapi.binance.com/fapi/v1/aggTrades?${aggParams}`);
-            const trades = await aggResp.json();
+            const trades = await fetchAggTrades({
+                symbol: binanceSymbol,
+                startTime: aggParams.get('startTime'),
+                endTime: aggParams.get('endTime'),
+                limit: aggParams.get('limit'),
+            });
 
             if (!Array.isArray(trades) || trades.length === 0) {
                 return res.json([]);
@@ -154,8 +164,13 @@ router.get('/klines', async (req, res) => {
         if (startTime) params.set('startTime', startTime);
         if (endTime) params.set('endTime', endTime);
 
-        const resp = await fetch(`https://fapi.binance.com/fapi/v1/klines?${params}`);
-        const data = await resp.json();
+        const data = await fetchKlines({
+            symbol: binanceSymbol,
+            interval,
+            limit: params.get('limit'),
+            startTime: params.get('startTime'),
+            endTime: params.get('endTime'),
+        });
         res.json(data);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -199,8 +214,8 @@ router.get('/symbols/tickers', async (req, res) => {
 
         // Fetch 24h tickers + funding from Binance
         const [tickerResp, fundingResp] = await Promise.all([
-            fetch('https://fapi.binance.com/fapi/v1/ticker/24hr').then(r => r.json()),
-            fetch('https://fapi.binance.com/fapi/v1/premiumIndex').then(r => r.json()),
+            fetchTicker24hAll(),
+            fetchPremiumIndexAll(),
         ]);
 
         const tickerMap = {};

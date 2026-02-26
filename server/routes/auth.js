@@ -2,7 +2,7 @@ import { Router } from 'express';
 import prisma from '../db/prisma.js';
 import {
     hashPassword, verifyPassword, generateToken, generateApiKey,
-    authMiddleware, adminMiddleware,
+    authMiddleware, adminMiddleware, invalidateApiKeyCache,
 } from '../auth.js';
 import { validate } from '../middleware/validate.js';
 import { RegisterBody, LoginBody, UserIdParam } from '../contracts/auth.contracts.js';
@@ -102,6 +102,15 @@ router.get('/me', authMiddleware, async (req, res) => {
 /** Generate / regenerate bot API key for current user */
 router.post('/api-key', authMiddleware, async (req, res) => {
     try {
+        // Audit Fix #7: Invalidate old key from cache before generating new one
+        const existing = await prisma.user.findUnique({
+            where: { id: req.user.id },
+            select: { apiKey: true },
+        });
+        if (existing?.apiKey) {
+            invalidateApiKeyCache(existing.apiKey);
+        }
+
         const apiKey = generateApiKey();
         await prisma.user.update({
             where: { id: req.user.id },
@@ -148,6 +157,15 @@ router.post('/approve/:userId', authMiddleware, adminMiddleware, validate(UserId
 /** Ban a user */
 router.post('/ban/:userId', authMiddleware, adminMiddleware, validate(UserIdParam, 'params'), async (req, res) => {
     try {
+        // Audit Fix #7: Invalidate API key cache immediately on ban
+        const existing = await prisma.user.findUnique({
+            where: { id: req.params.userId },
+            select: { apiKey: true },
+        });
+        if (existing?.apiKey) {
+            invalidateApiKeyCache(existing.apiKey);
+        }
+
         const user = await prisma.user.update({
             where: { id: req.params.userId },
             data: { status: 'BANNED' },

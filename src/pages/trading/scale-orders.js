@@ -227,7 +227,7 @@ export function generateSkewWeights(count, skew) {
     const s = skew / 100;
     for (let i = 0; i < count; i++) {
         const t = count === 1 ? 0.5 : i / (count - 1);
-        const w = Math.pow(8, s * (2 * t - 1));
+        const w = Math.pow(3, s * (2 * t - 1));
         weights.push(w);
     }
     const total = weights.reduce((a, b) => a + b, 0);

@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import riskEngine, { prisma } from '../risk/index.js';
+import { closePositionViaCpp, closeAllPositionsViaCpp } from './trading/close-utils.js';
 import { getRiskSnapshot } from '../redis.js';
 import { sanitize } from '../sanitize.js';
 import { validate } from '../middleware/validate.js';
@@ -42,11 +43,8 @@ router.get('/dashboard', async (req, res) => {
 // POST /api/admin/force-close/:positionId - Force close any position
 router.post('/force-close/:positionId', validate(PositionIdParam, 'params'), async (req, res) => {
     try {
-        const result = await riskEngine.closePosition(req.params.positionId, 'CLOSE');
-        if (!result.success) {
-            return res.status(400).json({ error: 'Force close failed', reasons: result.errors });
-        }
-        res.json(result);
+        const result = await closePositionViaCpp(req.params.positionId, 'ADMIN_CLOSE');
+        res.status(202).json(result);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -81,17 +79,8 @@ router.post('/unfreeze/:subAccountId', validate(SubAccountIdParam, 'params'), as
 // POST /api/admin/force-close-all/:subAccountId - Force close all positions
 router.post('/force-close-all/:subAccountId', validate(SubAccountIdParam, 'params'), async (req, res) => {
     try {
-        const positions = await prisma.virtualPosition.findMany({
-            where: { subAccountId: req.params.subAccountId, status: 'OPEN' },
-        });
-
-        const results = [];
-        for (const pos of positions) {
-            const result = await riskEngine.closePosition(pos.id, 'CLOSE');
-            results.push({ positionId: pos.id, symbol: pos.symbol, ...result });
-        }
-
-        res.json({ closed: results.length, results });
+        const result = await closeAllPositionsViaCpp(req.params.subAccountId, 'ADMIN_CLOSE');
+        res.json(result);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

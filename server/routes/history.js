@@ -25,7 +25,7 @@ router.use(flexAuthMiddleware());
 router.get('/orders/:subAccountId', validate(SubAccountIdParam, 'params'), validate(HistoryQuery, 'query'), async (req, res) => {
     try {
         const { subAccountId } = req.params;
-        const { symbol, limit, startTime, endTime, offset } = req.query;
+        const { symbol, limit, startTime, endTime, offset, cursor } = req.query;
 
         // Verify ownership (admin can see all)
         if (req.user.role !== 'ADMIN') {
@@ -42,18 +42,28 @@ router.get('/orders/:subAccountId', validate(SubAccountIdParam, 'params'), valid
             if (startTime) where.timestamp.gte = new Date(startTime);
             if (endTime) where.timestamp.lte = new Date(endTime);
         }
+        // Cursor-based pagination: fetch records older than the cursor ID
+        if (cursor) {
+            where.id = { lt: cursor };
+        }
 
+        const take = Math.min(limit, 1000);
         const trades = await prisma.tradeExecution.findMany({
             where,
-            skip: offset,
-            take: Math.min(limit, 1000),
+            ...(cursor ? {} : { skip: offset || 0 }),
+            take,
             orderBy: { timestamp: 'desc' },
         });
+
+        const nextCursor = trades.length === take && trades.length > 0
+            ? trades[trades.length - 1].id
+            : null;
 
         res.json({
             orders: trades,
             count: trades.length,
-            hasMore: trades.length === limit,
+            hasMore: trades.length === take,
+            nextCursor,
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -65,7 +75,7 @@ router.get('/orders/:subAccountId', validate(SubAccountIdParam, 'params'), valid
 router.get('/trades/:subAccountId', validate(SubAccountIdParam, 'params'), validate(HistoryQuery, 'query'), async (req, res) => {
     try {
         const { subAccountId } = req.params;
-        const { symbol, limit, startTime, endTime } = req.query;
+        const { symbol, limit, startTime, endTime, cursor } = req.query;
 
         if (req.user.role !== 'ADMIN') {
             const sa = await prisma.subAccount.findFirst({
@@ -84,19 +94,30 @@ router.get('/trades/:subAccountId', validate(SubAccountIdParam, 'params'), valid
             if (startTime) where.timestamp.gte = new Date(startTime);
             if (endTime) where.timestamp.lte = new Date(endTime);
         }
+        // Cursor-based pagination
+        if (cursor) {
+            where.id = { lt: cursor };
+        }
 
+        const take = Math.min(limit, 1000);
         const trades = await prisma.tradeExecution.findMany({
             where,
-            take: Math.min(limit, 1000),
+            take,
             orderBy: { timestamp: 'desc' },
             include: {
                 position: { select: { id: true, symbol: true, side: true, entryPrice: true } },
             },
         });
 
+        const nextCursor = trades.length === take && trades.length > 0
+            ? trades[trades.length - 1].id
+            : null;
+
         res.json({
             trades,
             count: trades.length,
+            hasMore: trades.length === take,
+            nextCursor,
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -124,16 +145,17 @@ router.post('/backfill/:subAccountId', validate(SubAccountIdParam, 'params'), va
         const startMs = Date.now() - days * 86400 * 1000;
         const endMs = Date.now();
 
-        let totalOrders = 0;
+        let totalImported = 0;
         const symbolList = symbols || ['BTC/USDT:USDT'];
 
         for (const symbol of symbolList) {
+            // ── Phase 1: Backfill from fetchOrders (order-level data) ──
             let cursor = startMs;
             let pageGuard = 0;
 
             while (pageGuard++ < 500) {
                 try {
-                    const orders = await exchange.exchange.fetchOrders(symbol, cursor, 500);
+                    const orders = await exchange.fetchOrders(symbol, cursor, 500);
                     if (!orders || orders.length === 0) break;
 
                     // Filter only PMS-tagged orders for this sub-account
@@ -156,18 +178,27 @@ router.post('/backfill/:subAccountId', validate(SubAccountIdParam, 'params'), va
                             const orderId = String(order.id);
                             if (existingIds.has(orderId) || !(order.filled > 0)) continue;
 
+                            // Infer action from side rather than just reduceOnly
+                            const side = order.side?.toUpperCase() || 'BUY';
+                            let action = 'OPEN';
+                            if (order.reduceOnly) {
+                                action = 'CLOSE';
+                            } else if (side === 'SELL') {
+                                action = 'CLOSE'; // Sells are typically closes for longs
+                            }
+
                             rows.push({
                                 subAccountId,
                                 exchangeOrderId: orderId,
                                 clientOrderId: order.clientOrderId,
                                 symbol,
-                                side: order.side?.toUpperCase() || 'BUY',
+                                side,
                                 type: order.type?.toUpperCase() || 'MARKET',
                                 price: order.average || order.price || 0,
                                 quantity: order.filled,
                                 notional: (order.average || order.price || 0) * order.filled,
                                 fee: order.fee?.cost || 0,
-                                action: order.reduceOnly ? 'CLOSE' : 'OPEN',
+                                action,
                                 originType: 'BOT',
                                 status: 'FILLED',
                                 signature: `backfill_${order.id}_${subAccountId}`.substring(0, 32),
@@ -178,7 +209,7 @@ router.post('/backfill/:subAccountId', validate(SubAccountIdParam, 'params'), va
 
                         if (rows.length > 0) {
                             await prisma.tradeExecution.createMany({ data: rows });
-                            totalOrders += rows.length;
+                            totalImported += rows.length;
                         }
                     }
 
@@ -190,7 +221,77 @@ router.post('/backfill/:subAccountId', validate(SubAccountIdParam, 'params'), va
                     if (orders.length < 500) break;
 
                 } catch (err) {
-                    console.error(`[History] Backfill error for ${symbol}:`, err.message);
+                    console.error(`[History] Backfill fetchOrders error for ${symbol}:`, err.message);
+                    break;
+                }
+            }
+
+            // ── Phase 2: Backfill from fetchMyTrades (trade-level data — catches fills missed by fetchOrders) ──
+            let tradeCursor = startMs;
+            let tradePageGuard = 0;
+
+            while (tradePageGuard++ < 500) {
+                try {
+                    const trades = await exchange.fetchMyTrades(symbol, tradeCursor, 500);
+                    if (!trades || trades.length === 0) break;
+
+                    const filtered = trades.filter(t => {
+                        const ts = t.timestamp || 0;
+                        return ts >= startMs && ts <= endMs;
+                    });
+
+                    // Deduplicate against existing records by exchangeOrderId
+                    const tradeOrderIds = filtered.map(t => String(t.order || t.id));
+                    if (tradeOrderIds.length > 0) {
+                        const existingRows = await prisma.tradeExecution.findMany({
+                            where: { exchangeOrderId: { in: tradeOrderIds } },
+                            select: { exchangeOrderId: true },
+                        });
+                        const existingIds = new Set(existingRows.map(r => r.exchangeOrderId));
+
+                        const rows = [];
+                        for (const trade of filtered) {
+                            const orderId = String(trade.order || trade.id);
+                            if (existingIds.has(orderId)) continue;
+                            if (!(trade.amount > 0)) continue;
+
+                            const side = trade.side?.toUpperCase() || 'BUY';
+                            const action = side === 'SELL' ? 'CLOSE' : 'OPEN';
+
+                            rows.push({
+                                subAccountId,
+                                exchangeOrderId: orderId,
+                                symbol,
+                                side,
+                                type: trade.type?.toUpperCase() || 'MARKET',
+                                price: trade.price || 0,
+                                quantity: trade.amount,
+                                notional: (trade.price || 0) * trade.amount,
+                                fee: trade.fee?.cost || 0,
+                                action,
+                                originType: 'BOT',
+                                status: 'FILLED',
+                                signature: `backfill_trade_${trade.id}_${subAccountId}`.substring(0, 32),
+                                timestamp: new Date(trade.timestamp),
+                            });
+                            existingIds.add(orderId);
+                        }
+
+                        if (rows.length > 0) {
+                            await prisma.tradeExecution.createMany({ data: rows });
+                            totalImported += rows.length;
+                        }
+                    }
+
+                    // Advance cursor
+                    const maxTs = Math.max(...trades.map(t => t.timestamp || 0));
+                    if (maxTs <= tradeCursor) break;
+                    tradeCursor = maxTs + 1;
+                    if (tradeCursor > endMs) break;
+                    if (trades.length < 500) break;
+
+                } catch (err) {
+                    console.error(`[History] Backfill fetchMyTrades error for ${symbol}:`, err.message);
                     break;
                 }
             }
@@ -198,7 +299,7 @@ router.post('/backfill/:subAccountId', validate(SubAccountIdParam, 'params'), va
 
         res.json({
             subAccountId,
-            imported: totalOrders,
+            imported: totalImported,
             days,
             symbols: symbolList,
         });
@@ -243,31 +344,42 @@ router.get('/exposure', async (req, res) => {
             return res.status(403).json({ error: 'Admin only' });
         }
 
-        const accounts = await prisma.subAccount.findMany({
-            include: {
-                user: { select: { id: true, username: true } },
-                positions: {
-                    where: { status: 'OPEN' },
-                    select: { symbol: true, side: true, notional: true, margin: true, leverage: true },
-                },
-            },
-        });
+        // Server-side aggregation — single SQL query instead of N+1 JS loops
+        const rows = await prisma.$queryRaw`
+            SELECT
+                sa.id              AS "subAccountId",
+                sa.name,
+                sa.type,
+                sa.user_id         AS "userId",
+                u.username,
+                sa.current_balance AS "balance",
+                COALESCE(SUM(vp.notional), 0)::float AS "totalExposure",
+                COALESCE(SUM(vp.margin), 0)::float   AS "totalMargin",
+                COUNT(vp.id)::int                     AS "positionCount"
+            FROM sub_accounts sa
+            LEFT JOIN users u ON u.id = sa.user_id
+            LEFT JOIN virtual_positions vp ON vp.sub_account_id = sa.id AND vp.status = 'OPEN'
+            GROUP BY sa.id, sa.name, sa.type, sa.user_id, u.username, sa.current_balance
+        `;
 
-        const exposure = accounts.map(a => ({
-            subAccountId: a.id,
-            name: a.name,
-            type: a.type,
-            userId: a.userId,
-            username: a.user?.username || null,
-            balance: a.currentBalance,
-            positions: a.positions,
-            totalExposure: a.positions.reduce((s, p) => s + p.notional, 0),
-            totalMargin: a.positions.reduce((s, p) => s + p.margin, 0),
-            positionCount: a.positions.length,
+        // Fetch per-account open positions for the detail payload
+        const openPositions = await prisma.virtualPosition.findMany({
+            where: { status: 'OPEN' },
+            select: { subAccountId: true, symbol: true, side: true, notional: true, margin: true, leverage: true },
+        });
+        const posByAccount = new Map();
+        for (const p of openPositions) {
+            if (!posByAccount.has(p.subAccountId)) posByAccount.set(p.subAccountId, []);
+            posByAccount.get(p.subAccountId).push(p);
+        }
+
+        const exposure = rows.map(a => ({
+            ...a,
+            positions: posByAccount.get(a.subAccountId) || [],
         }));
 
-        const globalExposure = exposure.reduce((s, a) => s + a.totalExposure, 0);
-        const globalMargin = exposure.reduce((s, a) => s + a.totalMargin, 0);
+        const globalExposure = rows.reduce((s, a) => s + a.totalExposure, 0);
+        const globalMargin = rows.reduce((s, a) => s + a.totalMargin, 0);
 
         res.json({
             globalExposure,

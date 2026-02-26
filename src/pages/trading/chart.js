@@ -1,7 +1,7 @@
 // ── Trading Page – Chart Logic ───────────────────────────────
 import { state, api, showToast, formatPrice } from '../../core/index.js';
 import * as S from './state.js';
-import { loadChartAnnotations, refreshChartLeftAnnotationLabels } from './positions-panel.js';
+import { loadChartAnnotations, refreshChartLeftAnnotationLabels } from './chart-annotations.js';
 import { loadFromStorage, saveToStorage, clearSymbolCache } from './candle-storage.js';
 
 // ── Chart ────────────────────────────────────────
@@ -379,7 +379,9 @@ export function setTimeframe(tf) {
     // Reconnect kline stream (use dynamic import to break circular dep)
     import('./ws-handlers.js').then(({ teardownStreams, initWebSockets }) => {
         teardownStreams();
-        loadCandles(tf).then(() => autoscaleChart());
+        const container = document.getElementById('tv-chart');
+        const isMobile = (container?.clientWidth || window.innerWidth) < 768;
+        loadCandles(tf).then(() => { if (!isMobile) autoscaleChart(); });
         initWebSockets();
     });
 }

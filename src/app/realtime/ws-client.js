@@ -3,8 +3,10 @@ function dispatchEvent(type, detail) {
 }
 
 function getEventScope(data, currentAccount) {
-    const eventAccount = data?.subAccountId;
-    return !eventAccount || eventAccount === currentAccount;
+    if (!data) return true;
+    const eventAccount = data.subAccountId;
+    if (!eventAccount) return true;
+    return eventAccount === currentAccount;
 }
 
 export function createWsClient({
@@ -39,13 +41,17 @@ export function createWsClient({
 
         ws.onopen = () => {
             document.getElementById('connection-status')?.classList.replace('offline', 'online');
-            state._wsReconnectDelay = 500; // Reset backoff on successful connect
+            const wasReconnect = state._wsReconnectDelay > 500;
+            state._wsReconnectDelay = 500;
             if (!state.currentAccount) return;
             ws.send(JSON.stringify({
                 type: 'subscribe',
                 subAccountId: state.currentAccount,
                 token: getToken() || null,
             }));
+            if (wasReconnect) {
+                dispatchEvent('positions_resync', {});
+            }
         };
 
         ws.onmessage = (event) => {
@@ -60,29 +66,34 @@ export function createWsClient({
 
                 if (msg.type === 'full_liquidation') {
                     if (!isMyEvent) return;
+                    const d = msg.data || {};
                     const modeLabels = {
                         INSTANT_CLOSE: 'Instant',
                         ADL_30_ESCALATED: 'ADL Escalated',
                         INSOLVENCY_GUARD: 'Insolvency Guard',
                     };
-                    const mode = modeLabels[msg.data.mode] || msg.data.mode || 'Unknown';
-                    showToast(`LIQUIDATION: Account fully liquidated (${mode}) | Margin: ${(msg.data.marginRatio * 100).toFixed(1)}%`, 'error');
-                    dispatchEvent('liquidation', msg.data);
+                    const mode = modeLabels[d.mode] || d.mode || 'Unknown';
+                    const marginPct = Number.isFinite(d.marginRatio) ? (d.marginRatio * 100).toFixed(1) : '?';
+                    showToast(`LIQUIDATION: Account fully liquidated (${mode}) | Margin: ${marginPct}%`, 'error');
+                    dispatchEvent('liquidation', d);
                     return;
                 }
 
                 if (msg.type === 'adl_triggered') {
                     if (!isMyEvent) return;
-                    const pct = (msg.data.fraction * 100).toFixed(0);
-                    showToast(`ADL Tier ${msg.data.tier}: ${pct}% of ${msg.data.symbol?.split('/')[0]} closed | Margin: ${(msg.data.marginRatio * 100).toFixed(1)}%`, 'warning');
-                    dispatchEvent('liquidation', msg.data);
+                    const d = msg.data || {};
+                    const pct = Number.isFinite(d.fraction) ? (d.fraction * 100).toFixed(0) : '?';
+                    const marginPct = Number.isFinite(d.marginRatio) ? (d.marginRatio * 100).toFixed(1) : '?';
+                    showToast(`ADL Tier ${d.tier || '?'}: ${pct}% of ${d.symbol?.split('/')[0]} closed | Margin: ${marginPct}%`, 'warning');
+                    dispatchEvent('liquidation', d);
                     return;
                 }
 
                 if (msg.type === 'margin_warning') {
                     if (!isMyEvent) return;
-                    showToast(msg.data.message, 'warning');
-                    dispatchEvent('margin_warning', msg.data);
+                    const d = msg.data || {};
+                    showToast(d.message || 'Margin warning', 'warning');
+                    dispatchEvent('margin_warning', d);
                     return;
                 }
 
@@ -94,6 +105,11 @@ export function createWsClient({
                     const twapInfo = d.twapLot != null ? ` [TWAP ${d.twapLot}/${d.twapTotal}]` : '';
                     showToast(`Limit placed: ${d.side} ${base} @ $${formatPrice(d.price)}${scaleInfo}${twapInfo}`, 'info');
                     dispatchEvent('order_placed', d);
+                    return;
+                }
+
+                if (msg.type === 'order_acked') {
+                    if (isMyEvent) dispatchEvent('order_acked', msg.data);
                     return;
                 }
 
@@ -115,8 +131,30 @@ export function createWsClient({
 
                 if (msg.type === 'order_cancelled') {
                     if (!isMyEvent) return;
-                    showToast(`Order cancelled: ${msg.data.symbol?.split('/')[0]}`, 'warning');
-                    dispatchEvent('order_cancelled', msg.data);
+                    const d = msg.data || {};
+                    if (!d.suppressToast) {
+                        showToast(`Order cancelled: ${d.symbol?.split('/')[0]}`, 'warning');
+                    }
+                    dispatchEvent('order_cancelled', d);
+                    return;
+                }
+
+                if (msg.type === 'order_rejected') {
+                    if (!isMyEvent) return;
+                    const d = msg.data || {};
+                    const base = d.symbol?.split('/')[0] || d.symbol || '';
+                    const reason = d.reason || 'Unknown reason';
+                    showToast(`Order rejected: ${base} — ${reason}`, 'error');
+                    dispatchEvent('order_rejected', d);
+                    return;
+                }
+
+                if (msg.type === 'order_error') {
+                    if (!isMyEvent) return;
+                    const d = msg.data || {};
+                    const reason = d.reason || d.message || 'Unknown error';
+                    showToast(`Engine error: ${reason}`, 'error');
+                    dispatchEvent('order_error', d);
                     return;
                 }
 
@@ -127,7 +165,7 @@ export function createWsClient({
 
                 if (msg.type === 'position_closed') {
                     if (!isMyEvent) return;
-                    const d = msg.data;
+                    const d = msg.data || {};
                     const pnlText = d.realizedPnl != null ? ` PnL: $${d.realizedPnl.toFixed(2)}` : '';
                     showToast(`Closed: ${d.symbol?.split('/')[0]}${pnlText}`, d.realizedPnl >= 0 ? 'success' : 'warning');
                     onPositionClosed(d);
@@ -137,9 +175,10 @@ export function createWsClient({
 
                 if (msg.type === 'position_reduced') {
                     if (!isMyEvent) return;
-                    const d = msg.data;
-                    const pct = d.closedQty && d.remainingQty != null
-                        ? ((d.closedQty / (d.closedQty + d.remainingQty)) * 100).toFixed(0)
+                    const d = msg.data || {};
+                    const total = (d.closedQty || 0) + (d.remainingQty || 0);
+                    const pct = d.closedQty && total > 0
+                        ? ((d.closedQty / total) * 100).toFixed(0)
                         : '?';
                     showToast(`Reduced ${pct}%: ${d.symbol?.split('/')[0]}`, 'warning');
                     dispatchEvent('position_reduced', d);
@@ -148,6 +187,60 @@ export function createWsClient({
 
                 if (msg.type === 'position_updated') {
                     if (isMyEvent) dispatchEvent('position_updated', msg.data);
+                    return;
+                }
+
+                // ── C++ Engine Events (safety net — fills, snapshots, errors) ──
+                if (msg.type === 'trade_execution') {
+                    if (isMyEvent) dispatchEvent('trade_execution', msg.data);
+                    return;
+                }
+
+                if (msg.type === 'margin_snapshot') {
+                    // Reuse margin_update handler — C++ margin is authoritative
+                    if (isMyEvent) dispatchEvent('margin_update', msg.data);
+                    return;
+                }
+
+                if (msg.type === 'risk_snapshot') {
+                    if (isMyEvent) dispatchEvent('risk_snapshot', msg.data);
+                    return;
+                }
+
+                if (msg.type === 'positions_snapshot') {
+                    // Treat like a resync — C++ position state is authoritative
+                    if (isMyEvent) dispatchEvent('positions_resync', msg.data);
+                    return;
+                }
+
+                if (msg.type === 'engine_error') {
+                    if (isMyEvent) {
+                        showToast(`Engine error: ${msg.data?.reason || msg.data?.message || 'unknown'}`, 'error');
+                        dispatchEvent('engine_error', msg.data);
+                    }
+                    return;
+                }
+
+                // ── Smart Order Events ──
+                if (msg.type === 'smart_order_progress') {
+                    if (isMyEvent) dispatchEvent('smart_order_progress', msg.data);
+                    return;
+                }
+
+                if (msg.type === 'smart_order_status') {
+                    if (!isMyEvent) return;
+                    const d = msg.data || {};
+                    if (d.status === 'completed') {
+                        showToast(`Smart order completed: ${d.symbol?.split('/')[0] || ''}`, 'success');
+                    } else if (d.status === 'failed') {
+                        showToast(`Smart order failed: ${d.reason || 'unknown'}`, 'error');
+                    }
+                    dispatchEvent('smart_order_status', d);
+                    return;
+                }
+
+                if (msg.type === 'positions_resync') {
+                    if (isMyEvent) dispatchEvent('positions_resync', msg.data);
                     return;
                 }
 
@@ -200,6 +293,7 @@ export function createWsClient({
 
                 if (msg.type === 'twap_basket_cancelled') {
                     if (isMyEvent) dispatchEvent('twap_basket_cancelled', msg.data);
+                    return;
                 }
 
                 // ── Chase Limit events ──
@@ -223,31 +317,8 @@ export function createWsClient({
                     return;
                 }
 
-                // ── SURF (Pump Chaser) events ──
-                if (msg.type === 'pump_chaser_progress') {
-                    if (isMyEvent) dispatchEvent('pump_chaser_progress', msg.data);
-                    return;
-                }
 
-                if (msg.type === 'pump_chaser_fill') {
-                    if (isMyEvent) dispatchEvent('pump_chaser_fill', msg.data);
-                    return;
-                }
 
-                if (msg.type === 'pump_chaser_scalp') {
-                    if (isMyEvent) dispatchEvent('pump_chaser_scalp', msg.data);
-                    return;
-                }
-
-                if (msg.type === 'pump_chaser_stopped') {
-                    if (isMyEvent) dispatchEvent('pump_chaser_stopped', msg.data);
-                    return;
-                }
-
-                if (msg.type === 'pump_chaser_deleverage') {
-                    if (isMyEvent) dispatchEvent('pump_chaser_deleverage', msg.data);
-                    return;
-                }
 
                 // ── Trail Stop events ──
                 if (msg.type === 'trail_stop_progress') {
@@ -262,6 +333,43 @@ export function createWsClient({
 
                 if (msg.type === 'trail_stop_cancelled') {
                     if (isMyEvent) dispatchEvent('trail_stop_cancelled', msg.data);
+                    return;
+                }
+
+                // ── Scalper events ──
+                if (msg.type === 'scalper_progress') {
+                    if (isMyEvent) dispatchEvent('scalper_progress', msg.data);
+                    return;
+                }
+
+                if (msg.type === 'scalper_filled') {
+                    if (!isMyEvent) return;
+                    const d = msg.data || {};
+                    const base = d.symbol ? d.symbol.split('/')[0] : '';
+                    const priceText = d.fillPrice ? `@ $${formatPrice(d.fillPrice)}` : '';
+                    showToast(`Scalper filled: ${d.side || ''} ${base} ${priceText}`, 'success');
+                    dispatchEvent('scalper_filled', d);
+                    return;
+                }
+
+                if (msg.type === 'scalper_cancelled') {
+                    if (isMyEvent) dispatchEvent('scalper_cancelled', msg.data);
+                    return;
+                }
+
+                // ── Agent events ──
+                if (msg.type === 'agent_started') {
+                    if (isMyEvent) dispatchEvent('agent_started', msg.data);
+                    return;
+                }
+
+                if (msg.type === 'agent_stopped') {
+                    if (isMyEvent) dispatchEvent('agent_stopped', msg.data);
+                    return;
+                }
+
+                if (msg.type === 'agent_status') {
+                    if (isMyEvent) dispatchEvent('agent_status', msg.data);
                     return;
                 }
             } catch {

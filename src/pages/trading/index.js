@@ -20,6 +20,7 @@ import {
     setSide, setLeverage, setSizePercent, updatePreview, submitTrade,
     submitLimitOrder, setOrderType, showSymbolPicker, showAccountPicker,
     updateAccountDisplay, prefetchSymbolsList, _switchBottomTab,
+    refreshSubmitButton,
 } from './order-form.js';
 import {
     enableScalePickMode, clearScalePreviewLines, removeScaleBoundaryLines,
@@ -28,10 +29,10 @@ import {
 } from './scale-orders.js';
 import { submitTwapOrder, cancelTwap } from './twap.js';
 import { submitTrailStop, cancelTrailStop, refreshTrailPositionDropdown, updateTrailPreview, drawLiveTrailStop, clearAllTrailStopLines, fetchAndDrawActiveTrailStops, onTrailPriceTick } from './trail-stop.js';
-import {
-    loadOpenOrders, loadTradingPositions, loadChartAnnotations,
-    cancelAllOrders, applySymbolFilter,
-} from './positions-panel.js';
+import { loadOpenOrders, cancelAllOrders } from './open-orders.js';
+import { loadTradingPositions } from './compact-positions.js';
+import { loadChartAnnotations } from './chart-annotations.js';
+import { applySymbolFilter } from './positions-panel.js';
 import { initWebSockets, teardownStreams, setupAppEventListeners, startCompactPoll, stopCompactPoll } from './ws-handlers.js';
 import { clearTradingRefreshScheduler } from './refresh-scheduler.js';
 import { startPerfMetrics, stopPerfMetrics } from './perf-metrics.js';
@@ -104,10 +105,12 @@ function attachEventListeners() {
         });
     });
     // close dropdown on outside click
-    document.addEventListener('click', () => {
+    const levDocClickHandler = () => {
         const dd = document.getElementById('lev-dropdown');
         if (dd) dd.style.display = 'none';
-    });
+    };
+    S.set('_levDocClickHandler', levDocClickHandler);
+    document.addEventListener('click', levDocClickHandler);
 
     // ── Size slider ──
     const slider = document.getElementById('size-slider');
@@ -190,8 +193,9 @@ function attachEventListeners() {
         else if (S.orderType === 'SCALE') submitScaleOrder();
         else if (S.orderType === 'LIMIT') submitLimitOrder();
         else if (S.orderType === 'CHASE') { import('./chase-limit.js').then(m => m.submitChase()); }
-        else if (S.orderType === 'SURF') { import('./pump-chaser.js').then(m => m.submitPumpChaser()); }
+
         else if (S.orderType === 'SCALPER') { import('./scalper.js').then(m => m.submitScalper()); }
+        else if (S.orderType === 'AGENT') { import('./agents.js').then(m => m.submitAgent()); }
         else submitTrade();
     });
 
@@ -208,9 +212,11 @@ function attachEventListeners() {
         });
     });
     // close dropdown on outside click (reuse existing doc click handler scope)
-    document.addEventListener('click', () => {
+    const orderTypeDocClickHandler = () => {
         document.getElementById('ot-dropdown')?.classList.remove('open');
-    });
+    };
+    S.set('_orderTypeDocClickHandler', orderTypeDocClickHandler);
+    document.addEventListener('click', orderTypeDocClickHandler);
 
     // ── TWAP controls ──
     document.getElementById('twap-lots')?.addEventListener('input', e => {
@@ -238,6 +244,22 @@ function attachEventListeners() {
     document.getElementById('trail-activation')?.addEventListener('change', () => updateTrailPreview());
     document.getElementById('trail-position')?.addEventListener('change', () => updateTrailPreview());
 
+    // ── Agent controls ──
+    document.querySelectorAll('.agent-type-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            import('./agents.js').then(m => m.setAgentType(btn.dataset.agentType));
+        });
+    });
+    // Agent config inputs → update preview
+    ['agent-trend-fast', 'agent-trend-slow', 'agent-trend-offset', 'agent-trend-layers',
+        'agent-grid-offset', 'agent-grid-layers', 'agent-grid-max-dd', 'agent-grid-cooldown',
+        'agent-delev-max-notional', 'agent-delev-unwind-pct', 'agent-delev-max-loss', 'agent-delev-offset',
+    ].forEach(id => {
+        document.getElementById(id)?.addEventListener('input', () => {
+            import('./agents.js').then(m => m.updateAgentPreview());
+        });
+    });
+
     // ── Chase controls ──
     document.getElementById('chase-offset')?.addEventListener('input', e => {
         const v = parseFloat(e.target.value) || 0;
@@ -246,37 +268,7 @@ function attachEventListeners() {
         import('./chase-limit.js').then(m => m.updateChasePreview());
     });
 
-    // ── Surf controls ──
-    document.getElementById('surf-scalp-ratio')?.addEventListener('input', e => {
-        const v = parseInt(e.target.value) || 60;
-        const el = document.getElementById('surf-scalp-val');
-        if (el) el.textContent = `${v}%`;
-        import('./pump-chaser.js').then(m => m.updatePumpChaserPreview());
-    });
-    document.getElementById('surf-offset-bps')?.addEventListener('input', e => {
-        const v = parseFloat(e.target.value) || 0.3;
-        const el = document.getElementById('surf-offset-val');
-        if (el) el.textContent = v.toFixed(1);
-        import('./pump-chaser.js').then(m => m.updatePumpChaserPreview());
-    });
-    // Max Position slider ↔ input sync
-    const maxPosSlider = document.getElementById('surf-max-pos-slider');
-    const maxPosInput = document.getElementById('surf-max-pos');
-    const maxPosLabel = document.getElementById('surf-max-pos-val');
-    function syncMaxPos(val) {
-        if (maxPosLabel) maxPosLabel.textContent = `$${val}`;
-        import('./pump-chaser.js').then(m => m.updatePumpChaserPreview());
-    }
-    maxPosSlider?.addEventListener('input', e => {
-        const v = parseInt(e.target.value) || 500;
-        if (maxPosInput) maxPosInput.value = v;
-        syncMaxPos(v);
-    });
-    maxPosInput?.addEventListener('input', e => {
-        const v = parseInt(e.target.value) || 500;
-        if (maxPosSlider) maxPosSlider.value = Math.min(v, 5000);
-        syncMaxPos(v);
-    });
+
 
     // ── Scalper controls ──
     document.getElementById('scalper-long-offset')?.addEventListener('input', e => {
@@ -308,7 +300,6 @@ function attachEventListeners() {
         const btnL = document.getElementById('btn-long');
         const btnN = document.getElementById('btn-neutral');
         const btnS = document.getElementById('btn-short');
-        const settings = document.getElementById('scalper-neutral-settings');
         const ctrl = document.getElementById('scalper-controls');
 
         // Only show neutral button when Scalper is the active order type
@@ -325,13 +316,13 @@ function attachEventListeners() {
         else if (mode === 'SHORT') { if (btnS) btnS.className = 'active-short'; }
         else /* NEUTRAL */ { if (btnN) { btnN.style.background = 'rgba(168,85,247,0.2)'; btnN.style.color = '#a855f7'; btnN.style.outline = '2px solid rgba(168,85,247,0.5)'; } }
 
-        if (settings) settings.style.display = mode === 'NEUTRAL' ? 'block' : 'none';
         if (ctrl) ctrl.dataset.scalperMode = mode;
         S.set('selectedSide', mode);
+        refreshSubmitButton();
         import('./scalper.js').then(m => m.updateScalperPreview());
     }
-    // Default state
-    _setScalperMode('LONG');
+    // Initial side sync
+    _setScalperMode(S.selectedSide);
     document.getElementById('btn-long')?.addEventListener('click', () => {
         if (S.orderType !== 'SCALPER') return;
         _setScalperMode('LONG');
@@ -342,11 +333,13 @@ function attachEventListeners() {
         _setScalperMode('SHORT');
     });
     // Re-sync active button whenever SCALPER order type becomes active
-    document.addEventListener('scalper-active', () => {
+    const scalperActiveHandler = () => {
         const ctrl = document.getElementById('scalper-controls');
         const currentMode = ctrl?.dataset?.scalperMode || 'LONG';
         _setScalperMode(currentMode);
-    });
+    };
+    S.set('_scalperActiveHandler', scalperActiveHandler);
+    document.addEventListener('scalper-active', scalperActiveHandler);
 
 
     // ── Pin-to-entry toggle (checkbox: disables input and delegates to backend) ──
@@ -514,6 +507,9 @@ function attachEventListeners() {
     // ── Load orders + positions ──
     loadOpenOrders();
     document.getElementById('cancel-all-orders')?.addEventListener('click', cancelAllOrders);
+    document.getElementById('cancel-all-scalpers')?.addEventListener('click', () => {
+        import('./scalper.js').then(m => m.cancelAllScalpers());
+    });
     loadTradingPositions();
 
     // ── Symbol filter checkbox (Current only) ──
@@ -558,6 +554,9 @@ export function cleanup() {
     if (S._marginUpdateHandler) { window.removeEventListener('margin_update', S._marginUpdateHandler); S.set('_marginUpdateHandler', null); }
     if (S._pnlUpdateHandler) { window.removeEventListener('pnl_update', S._pnlUpdateHandler); S.set('_pnlUpdateHandler', null); }
     if (S._docClickHandler) { document.removeEventListener('click', S._docClickHandler); S.set('_docClickHandler', null); }
+    if (S._levDocClickHandler) { document.removeEventListener('click', S._levDocClickHandler); S.set('_levDocClickHandler', null); }
+    if (S._orderTypeDocClickHandler) { document.removeEventListener('click', S._orderTypeDocClickHandler); S.set('_orderTypeDocClickHandler', null); }
+    if (S._scalperActiveHandler) { document.removeEventListener('scalper-active', S._scalperActiveHandler); S.set('_scalperActiveHandler', null); }
 
     S._positionMap.clear();
     S.set('_cachedBalance', 0);
@@ -596,17 +595,12 @@ export function cleanup() {
     S.set('_compactMarkPrices', {});
     if (S._compactPollInterval) { clearInterval(S._compactPollInterval); S.set('_compactPollInterval', null); }
 
-    const cpL = S._compactPosListeners;
-    if (cpL._filled) window.removeEventListener('order_filled', cpL._filled);
-    if (cpL._closed) window.removeEventListener('position_closed', cpL._closed);
-    if (cpL._liquidation) window.removeEventListener('liquidation', cpL._liquidation);
-    if (cpL._reduced) window.removeEventListener('position_reduced', cpL._reduced);
-    if (cpL._position_updated) window.removeEventListener('position_updated', cpL._position_updated);
-    if (cpL._twapProgress) window.removeEventListener('twap_progress', cpL._twapProgress);
-    if (cpL._twapCompleted) window.removeEventListener('twap_completed', cpL._twapCompleted);
-    if (cpL._twapCancelled) window.removeEventListener('twap_cancelled', cpL._twapCancelled);
-    if (cpL._trailTriggered) window.removeEventListener('trail_stop_triggered', cpL._trailTriggered);
-    if (cpL._trailCancelled) window.removeEventListener('trail_stop_cancelled', cpL._trailCancelled);
+    const cpL = S._compactPosListeners || {};
+    for (const [key, handler] of Object.entries(cpL)) {
+        if (typeof handler !== 'function') continue;
+        const eventName = key.startsWith('_') ? key.slice(1) : key;
+        window.removeEventListener(eventName, handler);
+    }
     S.set('_compactPosListeners', {});
 
     if (S._chartRiskRefreshTimer) { clearTimeout(S._chartRiskRefreshTimer); S.set('_chartRiskRefreshTimer', null); }

@@ -16,6 +16,7 @@ import {
     streamReadGroup,
 } from '../redis.js';
 import riskEngine from '../risk/index.js';
+import { closePositionViaCpp } from '../routes/trading/close-utils.js';
 
 const CONSUMER_NAME = `pms-node-${process.pid}`;
 const CLAIM_IDLE_MS = parseInt(process.env.BBS_ACTION_CLAIM_IDLE_MS || '30000', 10);
@@ -132,7 +133,7 @@ class BabysitterActionConsumer {
         }
 
         try {
-            const result = await riskEngine.closeVirtualPositionByPrice(positionId, closePrice, reason);
+            const result = await closePositionViaCpp(positionId, reason);
             if (result?.success) {
                 return true;
             }

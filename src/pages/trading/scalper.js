@@ -8,12 +8,18 @@ import * as S from './state.js';
 import { showTradeError } from './order-form.js';
 import { scheduleTradingRefresh } from './refresh-scheduler.js';
 
+function clampOffsetPct(value) {
+    const n = Number.parseFloat(value);
+    if (!Number.isFinite(n)) return 0;
+    return Math.max(0, Math.min(3, n));
+}
+
 // ── Preview (before submission) ───────────────────────────────
 
 export function updateScalperPreview() {
     const el = document.getElementById('scalper-preview');
-    const longOff = parseFloat(document.getElementById('scalper-long-offset')?.value) || 0;
-    const shortOff = parseFloat(document.getElementById('scalper-short-offset')?.value) || 0;
+    const longOff = clampOffsetPct(document.getElementById('scalper-long-offset')?.value);
+    const shortOff = clampOffsetPct(document.getElementById('scalper-short-offset')?.value);
     const count = parseInt(document.getElementById('scalper-child-count')?.value) || 1;
     const skew = parseInt(document.getElementById('scalper-skew')?.value) || 0;
     if (!el) return;
@@ -128,8 +134,8 @@ export async function submitScalper() {
     if (totalSizeUsd <= 0) return showToast('Enter a trade size', 'error');
 
 
-    const longOff = parseFloat(document.getElementById('scalper-long-offset')?.value) || 0;
-    const shortOff = parseFloat(document.getElementById('scalper-short-offset')?.value) || 0;
+    const longOff = clampOffsetPct(document.getElementById('scalper-long-offset')?.value);
+    const shortOff = clampOffsetPct(document.getElementById('scalper-short-offset')?.value);
     const count = parseInt(document.getElementById('scalper-child-count')?.value) || 1;
     const skew = parseInt(document.getElementById('scalper-skew')?.value) || 0;
 
@@ -230,14 +236,16 @@ export async function clearScalperById(scalperId) {
     if (!scalperId) return;
     try {
         const { removeChase } = await import('./chase-limit.js');
-        // Remove chart lines for each child chase in the drawer
         const drawer = document.querySelector(`[data-scalper-drawer="${scalperId}"]`);
         if (drawer) {
+            if (drawer._scalperCountdownTimer) {
+                clearInterval(drawer._scalperCountdownTimer);
+                drawer._scalperCountdownTimer = null;
+            }
             drawer.querySelectorAll('[data-chase-id]').forEach(el => {
                 removeChase(el.dataset.chaseId);
             });
         }
-        // Optimistically remove the scalper parent row + drawer from DOM
         document.querySelector(`[data-scalper-id="${scalperId}"]`)?.remove();
         drawer?.remove();
     } catch { /* ignore — chart might not be mounted */ }
@@ -263,6 +271,25 @@ export async function cancelScalper(scalperId) {
     try {
         await api(`/trade/scalper/${scalperId}${closePositions ? '?close=1' : ''}`, { method: 'DELETE' });
         showToast(closePositions ? 'Scalper stopped & positions closed' : 'Scalper stopped', 'success');
+        scheduleTradingRefresh({ positions: true, openOrders: true }, 30);
+    } catch (err) {
+        showToast(`${err.message}`, 'error');
+    }
+}
+
+export async function cancelAllScalpers() {
+    if (!state.currentAccount) return showToast('Select an account first', 'error');
+    const confirmed = await cuteConfirm({
+        title: '⚔ Kill All Scalpers',
+        message: 'Stop ALL active scalpers for this account?',
+        confirmText: '🧹 Stop All',
+        danger: true,
+    });
+    if (!confirmed) return;
+    showToast('Stopping all scalpers...', 'info');
+    try {
+        const result = await api(`/trade/scalper/cancel-all/${state.currentAccount}`, { method: 'DELETE' });
+        showToast(`Stopped ${result.cancelled || 0} scalper(s)`, 'success');
         scheduleTradingRefresh({ positions: true, openOrders: true }, 30);
     } catch (err) {
         showToast(`${err.message}`, 'error');

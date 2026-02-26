@@ -21,6 +21,7 @@ import botManager from '../bot/manager.js';
 import babysitterManager from '../bot/babysitter-manager.js';
 import { requireOwnership, requirePositionOwnership } from '../ownership.js';
 import riskEngine from '../risk/index.js';
+import { closePositionViaCpp } from './trading/close-utils.js';
 const router = Router();
 
 // ─────────────────────────────────────
@@ -317,18 +318,17 @@ router.post('/babysitter/position/:posId/include', requirePositionOwnership('pos
     }
 });
 
-// POST /babysitter/close-position — Python babysitter callback to close a position (exchange-first)
+// POST /babysitter/close-position — Python babysitter callback to close a position
 router.post('/babysitter/close-position', async (req, res) => {
     try {
-        const { positionId, closePrice, reason } = req.body;
-        if (!positionId || !closePrice) {
-            return res.status(400).json({ error: 'positionId and closePrice are required' });
+        const { positionId, reason } = req.body;
+        if (!positionId) {
+            return res.status(400).json({ error: 'positionId is required' });
         }
-        const result = await riskEngine.closeVirtualPositionByPrice(
-            positionId, parseFloat(closePrice), reason || 'BABYSITTER_TP'
-        );
-        console.log(`[BotAPI] Babysitter close-position: ${positionId} @ ${closePrice} → ${result.success ? 'OK' : result.error}`);
-        res.json(result);
+        // V2: close via C++ engine (reduce_only MARKET)
+        const result = await closePositionViaCpp(positionId, reason || 'BABYSITTER_TP');
+        console.log(`[BotAPI] Babysitter close-position: ${positionId} → ${result.success ? 'OK' : 'FAIL'}`);
+        res.status(202).json(result);
     } catch (err) {
         console.error('[BotAPI] Babysitter close-position error:', err.message);
         res.status(500).json({ success: false, error: err.message });

@@ -3,10 +3,19 @@
  */
 import { Router } from 'express';
 import riskEngine, { prisma } from '../../risk/index.js';
-import exchange from '../../exchange.js';
+import defaultExchange from '../../exchange.js';
 import { requireOwnership } from '../../ownership.js';
+import { getSimplxBridge } from '../../simplx-uds-bridge.js';
+import { checkCppWriteReady } from './cpp-write-ready.js';
+import { ensureCppAccountSynced, makeCppClientOrderId } from './cpp-order-utils.js';
+import { toCppSymbol } from './cpp-symbol.js';
 
 const router = Router();
+let exchange = defaultExchange;
+
+export function setBasketExchangeConnector(exchangeConnector) {
+    exchange = exchangeConnector || defaultExchange;
+}
 
 const basketExecutionLocks = new Set();
 
@@ -167,28 +176,32 @@ router.post('/basket', requireOwnership('body'), async (req, res) => {
             });
         }
 
-        // Execute legs in parallel after one-shot margin pre-check.
+        // Execute legs in parallel via C++ engine
+        const bridge = getSimplxBridge();
+        const readiness = checkCppWriteReady(bridge);
+        if (!readiness.ok) {
+            return res.status(503).json({ error: readiness.error });
+        }
+        await ensureCppAccountSynced(bridge, subAccountId);
+
         const results = await Promise.all(pricedLegs.map(async (leg) => {
             try {
-                const result = await riskEngine.executeTrade(
-                    subAccountId,
-                    leg.symbol,
-                    leg.side,
-                    leg.quantity,
-                    leg.leverage,
-                    'MARKET',
-                    {
-                        skipValidation: true,
-                        fastExecution: true,
-                        fallbackPrice: leg.markPrice,
-                    },
-                );
+                const clientOrderId = makeCppClientOrderId('bsk', subAccountId);
+                const cppSide = leg.side === 'LONG' ? 'BUY' : 'SELL';
+                await bridge.sendCommand('new', {
+                    sub_account_id: subAccountId,
+                    client_order_id: clientOrderId,
+                    symbol: toCppSymbol(leg.symbol),
+                    side: cppSide,
+                    type: 'MARKET',
+                    qty: leg.quantity,
+                    leverage: leg.leverage,
+                });
                 return {
                     symbol: leg.symbol,
                     side: leg.side,
-                    success: result.success,
-                    trade: result.trade || null,
-                    errors: result.errors || null,
+                    success: true,
+                    accepted: true,
                 };
             } catch (err) {
                 return {

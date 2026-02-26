@@ -1,6 +1,7 @@
 import Redis from 'ioredis';
 
 let redis = null;
+let _redisHealthy = false; // Audit Fix #16: track Redis health state
 const RISK_SNAPSHOT_TTL_SEC = parseInt(process.env.RISK_SNAPSHOT_TTL_SEC || '120', 10);
 const STREAM_MAXLEN = parseInt(process.env.REDIS_STREAM_MAXLEN || '20000', 10);
 
@@ -27,16 +28,36 @@ export function getRedis() {
         });
 
         redis.on('error', (err) => {
-            if (err.code !== 'ECONNREFUSED') {
+            if (_redisHealthy) {
+                _redisHealthy = false;
+                console.error('[Redis] ⚠ CONNECTION LOST — degraded mode (rate limits, locks, snapshots disabled):', err.message);
+            } else if (err.code !== 'ECONNREFUSED') {
                 console.error('[Redis] Error:', err.message);
             }
         });
 
         redis.on('connect', () => {
-            console.log('[Redis] Connected');
+            const wasUnhealthy = !_redisHealthy;
+            _redisHealthy = true;
+            console.log(`[Redis] Connected${wasUnhealthy ? ' — recovered from degraded mode' : ''}`);
+        });
+
+        redis.on('close', () => {
+            if (_redisHealthy) {
+                _redisHealthy = false;
+                console.error('[Redis] ⚠ Connection closed — entering degraded mode');
+            }
         });
     }
     return redis;
+}
+
+/**
+ * Audit Fix #16: Check if Redis is currently healthy and connected.
+ * @returns {boolean}
+ */
+export function isRedisHealthy() {
+    return _redisHealthy;
 }
 
 function _serializePayload(payload) {
@@ -66,10 +87,12 @@ export async function initRedis() {
         const r = getRedis();
         await r.connect();
         await r.ping();
+        _redisHealthy = true;
         console.log('[Redis] ✓ Ready');
         return true;
     } catch (err) {
         console.warn('[Redis] ⚠ Not available — running without Redis (in-memory fallback)');
+        _redisHealthy = false;
         redis = null;
         return false;
     }

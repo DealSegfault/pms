@@ -7,6 +7,7 @@ export const HistoryQuery = z.object({
     startTime: z.coerce.number().int().positive().optional(),
     endTime: z.coerce.number().int().positive().optional(),
     offset: z.coerce.number().int().min(0).default(0),
+    cursor: z.string().optional(),
 });
 
 /** GET /all query */

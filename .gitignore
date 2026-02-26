@@ -14,3 +14,8 @@ test/__pycache__
 *.pyc
 notes
 sdk
+pg_local/
+engine_simplx/build-release/
+engine_simplx/.cache/
+engine_simplx/build
+.wip

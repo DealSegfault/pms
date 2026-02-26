@@ -1,24 +1,20 @@
 /**
- * RiskEngine — Thin facade that composes all risk sub-modules.
+ * RiskEngine — Read-only risk evaluation facade.
  *
- * Exposes the same public API as the old monolithic risk-engine.js.
- * All consumers import this file; internal structure is invisible.
- *
- * Sub-modules:
- *   - PositionBook:      In-memory position tracking (zero side effects)
+ * V2: All trading (open/close/cancel) goes through C++ engine.
+ * RiskEngine only handles:
+ *   - PositionBook:      In-memory position tracking (fed by handlers/)
  *   - PriceService:      Mark price resolution (WS → REST fallback)
- *   - LiquidationEngine: Risk evaluation + ADL tiers
- *   - TradeExecutor:     Trade validation, execution, position management
+ *   - LiquidationEngine: Risk evaluation + margin ratio alerts
+ *   - Account queries:   getAccountSummary, getMarginInfo, getRules
  */
 import prisma from '../db/prisma.js';
 import exchange from '../exchange.js';
 import { PositionBook } from './position-book.js';
 import { PriceService } from './price-service.js';
 import { LiquidationEngine } from './liquidation.js';
-import { TradeExecutor } from './trade-executor.js';
-import { ERR, parseExchangeError } from './errors.js';
 import { sanitize } from '../sanitize.js';
-import { getRiskSnapshot } from '../redis.js';
+import { getRiskSnapshot, setRiskSnapshot } from '../redis.js';
 import { BoundedMap } from '../bounded-map.js';
 
 
@@ -29,22 +25,12 @@ class RiskEngine {
         this.book = new PositionBook();
         this.priceService = new PriceService(exchange);
         this.liquidation = new LiquidationEngine(this.book, this.priceService);
-        this.tradeExecutor = new TradeExecutor(exchange, this.book, this.priceService, this.liquidation);
 
-        // Wire liquidation → trade actions (avoids circular dep)
-        this.liquidation.setTradeActions({
-            closePosition: (posId, action) => this.tradeExecutor.closePosition(posId, action),
-            partialClose: (posId, fraction, action) => this.tradeExecutor.partialClose(posId, fraction, action),
-            liquidatePosition: (posId) => this.tradeExecutor.liquidatePosition(posId),
-            takeoverPosition: (posId, adminUserId) => this.tradeExecutor.takeoverPosition(posId, adminUserId),
-        });
+        // V2: TradeExecutor deleted — all trades go through C++ engine.
+        // LiquidationEngine evaluateAccount() handles risk alerts + liquidation via C++ close.
 
         this._monitorInterval = null;
-
-        // Dirty flag: skip monitorPositions() DB read when nothing changed
         this._positionsDirty = true;
-
-        // Bounded map for tick evaluation throttle (Fix 8: prevents unbounded growth)
         this._lastEvalTs = new BoundedMap(2000);
     }
 
@@ -57,58 +43,10 @@ class RiskEngine {
 
     setWsEmitter(emitter) {
         this.liquidation.setWsEmitter(emitter);
-        this.tradeExecutor.setWsEmitter(emitter);
         this._wsEmitter = emitter;
     }
 
-    // ── Delegated Public API (same interface as before) ──
-
-    /** Validate a trade before execution. */
-    async validateTrade(...args) {
-        return this.tradeExecutor.validateTrade(...args);
-    }
-
-    /** Execute a trade (open or flip). */
-    async executeTrade(...args) {
-        const result = await this.tradeExecutor.executeTrade(...args);
-        this._positionsDirty = true;
-        return result;
-    }
-
-    /** Close a position entirely. */
-    async closePosition(...args) {
-        const result = await this.tradeExecutor.closePosition(...args);
-        this._positionsDirty = true;
-        return result;
-    }
-
-    /** Partially close a position (ADL). */
-    async partialClose(...args) {
-        const result = await this.tradeExecutor.partialClose(...args);
-        this._positionsDirty = true;
-        return result;
-    }
-
-    /** Admin takeover of a position. */
-    async takeoverPosition(...args) {
-        const result = await this.tradeExecutor.takeoverPosition(...args);
-        this._positionsDirty = true;
-        return result;
-    }
-
-    /** Reconcile exchange position closure. */
-    async reconcilePosition(...args) {
-        const result = await this.tradeExecutor.reconcilePosition(...args);
-        this._positionsDirty = true;
-        return result;
-    }
-
-    /** Close a babysitter position (exchange-first, optional virtual fallback). */
-    async closeVirtualPositionByPrice(...args) {
-        const result = await this.tradeExecutor.closeVirtualPositionByPrice(...args);
-        this._positionsDirty = true;
-        return result;
-    }
+    // ── Delegated Public API (read-only + DB-only operations) ──
 
     /** Get risk rules for an account. */
     async getRules(...args) {
@@ -123,6 +61,15 @@ class RiskEngine {
     /** Calculate account-level liquidation price. */
     calculateAccountLiqPrice(account, positions) {
         return this.liquidation.calculateAccountLiqPrice(account, positions, exchange);
+    }
+
+    /** Admin takeover — DB-only reassignment (no exchange call). */
+    async takeoverPosition(positionId, adminUserId) {
+        const pos = await prisma.virtualPosition.findUnique({ where: { id: positionId } });
+        if (!pos) return { success: false, errors: [{ code: 'NOT_FOUND', message: 'Position not found' }] };
+        await prisma.virtualPosition.update({ where: { id: positionId }, data: { subAccountId: adminUserId } });
+        this._positionsDirty = true;
+        return { success: true, positionId };
     }
 
     // ── Monitoring / Lifecycle ────────────────────────
@@ -431,6 +378,44 @@ class RiskEngine {
             markBySymbol
         );
 
+        // Write-through: cache the expensive computation so subsequent requests
+        // hit the Redis fast path instead of repeating the 3-6s slow path.
+        const slowPathSnapshot = {
+            subAccountId,
+            timestamp: Date.now(),
+            status: account.status,
+            liquidationMode: account.liquidationMode,
+            equity,
+            equityRaw,
+            balance: account.currentBalance,
+            unrealizedPnl: totalUnrealizedPnl,
+            marginUsed: totalMarginUsed,
+            availableMargin: equity - totalMarginUsed,
+            totalExposure,
+            maintenanceMargin,
+            marginRatio,
+            accountLiqPrice,
+            positions: positionsWithRisk.map(pos => ({
+                id: pos.id,
+                symbol: pos.symbol,
+                side: pos.side,
+                entryPrice: pos.entryPrice,
+                markPrice: pos.markPrice,
+                quantity: pos.quantity,
+                notional: pos.notional,
+                leverage: pos.leverage,
+                margin: pos.margin,
+                liquidationPrice: pos.liquidationPrice,
+                unrealizedPnl: pos.unrealizedPnl,
+                pnlPercent: pos.pnlPercent,
+                babysitterExcluded: pos.babysitterExcluded ?? false,
+                openedAt: pos.openedAt || null,
+            })),
+        };
+        setRiskSnapshot(subAccountId, slowPathSnapshot).catch(err => {
+            console.debug('[Risk] Slow-path write-through failed:', err.message);
+        });
+
         return {
             account: sanitize(account),
             positions: positionsWithRisk,
@@ -470,22 +455,12 @@ class RiskEngine {
         };
     }
 
-    // ── Private helpers (kept on facade for backward compat) ──
-
-    /** @deprecated Use priceService.getFreshPrice() directly. */
-    async _getFreshPrice(symbol) {
-        return this.priceService.getFreshPrice(symbol);
-    }
-
-    /** @deprecated Use priceService.calcPositionsUpnl() directly. */
-    async _calcPositionsUpnl(positions) {
-        return this.priceService.calcPositionsUpnl(positions);
-    }
 }
+
 
 const riskEngine = new RiskEngine();
 export default riskEngine;
-export { prisma, parseExchangeError, ERR };
+export { prisma };
 
 /** Convenience — lets external modules mark positions as dirty without importing riskEngine. */
 export function markPositionsDirty() {

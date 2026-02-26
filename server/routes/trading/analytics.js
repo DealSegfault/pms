@@ -5,7 +5,8 @@
 import { Router } from 'express';
 import fs from 'fs/promises';
 import path from 'path';
-import exchange from '../../exchange.js';
+import defaultExchange from '../../exchange.js';
+import { fetchTicker24hAll } from '../../exchange-public.js';
 import {
     DEEP_OUTPUT_DIR,
     DECISION_OUTPUT_DIR,
@@ -38,6 +39,11 @@ import {
 } from './helpers.js';
 
 const router = Router();
+let exchange = defaultExchange;
+
+export function setAnalyticsExchangeConnector(exchangeConnector) {
+    exchange = exchangeConnector || defaultExchange;
+}
 
 const SMART_BASKET_POLICIES = [
     {
@@ -438,8 +444,7 @@ async function fetchTopPerpUniverse(limit = SMART_UNIVERSE_SIZE) {
 
     let tickerResp = [];
     try {
-        const resp = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr');
-        const data = await resp.json();
+        const data = await fetchTicker24hAll();
         if (Array.isArray(data)) tickerResp = data;
     } catch {
         tickerResp = [];

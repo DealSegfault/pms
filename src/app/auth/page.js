@@ -184,7 +184,11 @@ function renderRegisterForm(onAuthenticated) {
             const data = await res.json();
 
             if (!res.ok) {
-                errEl.textContent = data.error || 'Registration failed';
+                if (data.error?.details?.length) {
+                    errEl.textContent = data.error.details.map(d => d.message).join('. ');
+                } else {
+                    errEl.textContent = data.error?.message || data.error || 'Registration failed';
+                }
                 return;
             }
 
@@ -197,7 +201,7 @@ function renderRegisterForm(onAuthenticated) {
 
             errEl.innerHTML = `<span style="color: var(--green);">✓ Registered! Awaiting admin approval.</span>`;
         } catch (err) {
-            errEl.textContent = err.message;
+            errEl.textContent = 'Network error — server may be down';
         }
     };
 }

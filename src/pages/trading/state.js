@@ -61,6 +61,9 @@ export let _negativeLockState = null;
 
 // ── Document Click Handler ──────────────────────────────
 export let _docClickHandler = null;
+export let _levDocClickHandler = null;
+export let _orderTypeDocClickHandler = null;
+export let _scalperActiveHandler = null;
 
 // ── WS Timing ───────────────────────────────────────────
 export let _lastTradingWsPnlTs = 0;
@@ -97,7 +100,7 @@ export let _marginUpdateHandler = null;
 export let _pnlUpdateHandler = null;
 
 // ── Edit Mode (prefill-and-update complex orders) ─────────────
-// { type: 'TWAP'|'TRAIL'|'CHASE'|'SCALPER'|'SURF', orderId: string }
+// { type: 'TWAP'|'TRAIL'|'CHASE'|'SCALPER', orderId: string }
 export let _editState = null;
 
 // ── LocalStorage Helpers ─────────────────────────────────
@@ -187,6 +190,9 @@ export function set(key, value) {
         case '_cachedMarginUsed': _cachedMarginUsed = value; break;
         case '_negativeLockState': _negativeLockState = value; break;
         case '_docClickHandler': _docClickHandler = value; break;
+        case '_levDocClickHandler': _levDocClickHandler = value; break;
+        case '_orderTypeDocClickHandler': _orderTypeDocClickHandler = value; break;
+        case '_scalperActiveHandler': _scalperActiveHandler = value; break;
         case '_lastTradingWsPnlTs': _lastTradingWsPnlTs = value; break;
         case 'chart': chart = value; break;
         case 'candleSeries': candleSeries = value; break;

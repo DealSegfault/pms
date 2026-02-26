@@ -6,6 +6,11 @@
  */
 
 import MicroSignals from './signals.js';
+import { closePositionViaCpp } from '../routes/trading/close-utils.js';
+import { getSimplxBridge } from '../simplx-uds-bridge.js';
+import { checkCppWriteReady } from '../routes/trading/cpp-write-ready.js';
+import { ensureCppAccountSynced, makeCppClientOrderId } from '../routes/trading/cpp-order-utils.js';
+import { toCppSymbol } from '../routes/trading/cpp-symbol.js';
 
 // ═══════════════════════════════════════════════════════
 // GRID LAYER
@@ -139,35 +144,42 @@ class BotEngine {
         const quantity = notional / price;
 
         try {
-            const result = await this.riskEngine.executeTrade(
-                this.subAccountId,
-                this.symbol,
-                'SHORT',
-                quantity,
-                10, // leverage
-                'MARKET',
-            );
+            // V2: route trade through C++ engine
+            const bridge = getSimplxBridge();
+            const readiness = checkCppWriteReady(bridge);
+            if (!readiness.ok) throw new Error(readiness.error);
+            await ensureCppAccountSynced(bridge, this.subAccountId);
 
-            if (result.success) {
-                const layer = new GridLayer({
-                    price: result.trade.price,
-                    qty: result.trade.quantity,
-                    notional: result.trade.notional,
-                    entryTs: now,
-                    layerIdx: 0,
-                    positionId: result.position.id,
-                });
+            const clientOrderId = makeCppClientOrderId('bot', this.subAccountId);
+            await bridge.sendCommand('new', {
+                sub_account_id: this.subAccountId,
+                client_order_id: clientOrderId,
+                symbol: toCppSymbol(this.symbol),
+                side: 'SELL',
+                type: 'MARKET',
+                qty: quantity,
+                leverage: 10,
+            });
 
-                this.layers.push(layer);
-                this.state = 'ACTIVE';
-                this._recalcAvgEntry();
-                this._bestBidSinceEntry = this.signals.bid;
-                this.totalTrades++;
-                this.lastTradeTs = now;
+            // ACK-first: record layer optimistically, fill-handler will persist
+            const layer = new GridLayer({
+                price,
+                qty: quantity,
+                notional,
+                entryTs: now,
+                layerIdx: 0,
+                positionId: null, // will be set by fill-handler
+            });
 
-                console.log(`[BOT] ${this.symbol} ENTRY L0 @ ${result.trade.price.toFixed(4)} notional=$${notional.toFixed(0)} signal=${signal.signalStrength.toFixed(2)}`);
-                this._emit('entry', { layer: 0, price: result.trade.price, notional, signal: signal.signalStrength });
-            }
+            this.layers.push(layer);
+            this.state = 'ACTIVE';
+            this._recalcAvgEntry();
+            this._bestBidSinceEntry = this.signals.bid;
+            this.totalTrades++;
+            this.lastTradeTs = now;
+
+            console.log(`[BOT] ${this.symbol} ENTRY L0 @ ~$${price.toFixed(4)} notional=$${notional.toFixed(0)} signal=${signal.signalStrength.toFixed(2)}`);
+            this._emit('entry', { layer: 0, price, notional, signal: signal.signalStrength });
         } catch (err) {
             console.error(`[BOT] ${this.symbol} Entry failed:`, err.message);
             this._emit('error', { action: 'entry', message: err.message });
@@ -208,32 +220,38 @@ class BotEngine {
         const quantity = layerNotional / price;
 
         try {
-            const result = await this.riskEngine.executeTrade(
-                this.subAccountId,
-                this.symbol,
-                'SHORT',
-                quantity,
-                10,
-                'MARKET',
-            );
+            // V2: route trade through C++ engine
+            const bridge = getSimplxBridge();
+            const readiness = checkCppWriteReady(bridge);
+            if (!readiness.ok) throw new Error(readiness.error);
+            await ensureCppAccountSynced(bridge, this.subAccountId);
 
-            if (result.success) {
-                this.layers.push(new GridLayer({
-                    price: result.trade.price,
-                    qty: result.trade.quantity,
-                    notional: result.trade.notional,
-                    entryTs: now,
-                    layerIdx,
-                    positionId: result.position.id,
-                }));
+            const clientOrderId = makeCppClientOrderId('bot', this.subAccountId);
+            await bridge.sendCommand('new', {
+                sub_account_id: this.subAccountId,
+                client_order_id: clientOrderId,
+                symbol: toCppSymbol(this.symbol),
+                side: 'SELL',
+                type: 'MARKET',
+                qty: quantity,
+                leverage: 10,
+            });
 
-                this._recalcAvgEntry();
-                this.totalTrades++;
-                this.lastTradeTs = now;
+            this.layers.push(new GridLayer({
+                price,
+                qty: quantity,
+                notional: layerNotional,
+                entryTs: now,
+                layerIdx,
+                positionId: null,
+            }));
 
-                console.log(`[BOT] ${this.symbol} AVERAGE L${layerIdx} @ ${result.trade.price.toFixed(4)} notional=$${layerNotional.toFixed(0)} grid=${this.layers.length} layers`);
-                this._emit('averaging', { layer: layerIdx, price: result.trade.price, notional: layerNotional, totalLayers: this.layers.length });
-            }
+            this._recalcAvgEntry();
+            this.totalTrades++;
+            this.lastTradeTs = now;
+
+            console.log(`[BOT] ${this.symbol} AVERAGE L${layerIdx} @ ~$${price.toFixed(4)} notional=$${layerNotional.toFixed(0)} grid=${this.layers.length} layers`);
+            this._emit('averaging', { layer: layerIdx, price, notional: layerNotional, totalLayers: this.layers.length });
         } catch (err) {
             console.error(`[BOT] ${this.symbol} Averaging failed:`, err.message);
             this._emit('error', { action: 'averaging', message: err.message });
@@ -320,12 +338,11 @@ class BotEngine {
                 if (!posId) continue;
 
                 try {
-                    const result = await this.riskEngine.partialClose(posId, fraction, 'PARTIAL_LIQUIDATION');
+                    // V2: close position via C++
+                    const result = await closePositionViaCpp(posId, 'BOT_INVERSE_TP');
                     if (result.success) {
-                        // Remove the outermost layer
                         const removed = this.layers.pop();
                         this._recalcAvgEntry();
-                        this.totalPnl += result.realizedPnl || 0;
                         this.wins++;
                         console.log(`[BOT] ${this.symbol} INVERSE TP zone ${zone.idx} @ ${bid.toFixed(4)} pnl=${currentPnlBps.toFixed(1)}bps`);
                         this._emit('inverse_tp', { zone: zone.idx, price: bid, pnlBps: currentPnlBps, remainingLayers: this.layers.length });
@@ -374,13 +391,11 @@ class BotEngine {
 
             if (layerPnlBps >= layerTP && layer.positionId) {
                 try {
-                    // Close this specific layer
-                    const fraction = layer.notional / this.totalNotional;
-                    const result = await this.riskEngine.partialClose(layer.positionId, fraction);
+                    // V2: close position via C++
+                    const result = await closePositionViaCpp(layer.positionId, 'BOT_SCALED_EXIT');
                     if (result.success) {
                         this.layers.splice(i, 1);
                         this._recalcAvgEntry();
-                        this.totalPnl += result.realizedPnl || 0;
                         this.wins++;
                         console.log(`[BOT] ${this.symbol} SCALED EXIT L${layer.layerIdx} @ ${bid.toFixed(4)} pnl=${layerPnlBps.toFixed(1)}bps`);
                         this._emit('scaled_exit', { layer: layer.layerIdx, price: bid, pnlBps: layerPnlBps, remainingLayers: this.layers.length });
@@ -409,7 +424,7 @@ class BotEngine {
 
         for (const posId of positionIds) {
             try {
-                await this.riskEngine.closePosition(posId, 'CLOSE');
+                await closePositionViaCpp(posId, 'BOT_CLOSE');
             } catch (err) {
                 console.error(`[BOT] ${this.symbol} Close failed (${posId}):`, err.message);
             }

@@ -2,6 +2,12 @@
 import { state, api, showToast, formatPrice, formatUsd } from '../../core/index.js';
 import { cuteConfirm } from '../../lib/cute-confirm.js';
 import { cuteKittenSearch, cuteWallet } from '../../lib/cute-empty.js';
+import { submitTwapOrder } from './twap.js';
+import { submitTrailStop } from './trail-stop.js';
+import { submitChase } from './chase-limit.js';
+import { submitScalper } from './scalper.js';
+import { submitAgent } from './agents.js';
+import { submitSmartOrder } from './smart-order.js';
 import * as S from './state.js';
 import { formatQty } from './orderbook.js';
 import { initChart, fetchTickerData, fetchSymbolInfo } from './chart.js';
@@ -14,34 +20,68 @@ import { beginOrderLatency, markOrderSent, markOrderAck, markOrderPaint } from '
 export function setSide(side) {
     S.set('selectedSide', side);
     localStorage.setItem('pms_trade_side', side);
-    document.getElementById('btn-long').className = side === 'LONG' ? 'active-long' : '';
-    document.getElementById('btn-neutral').className = side === 'NEUTRAL' ? 'active-neutral' : '';
-    document.getElementById('btn-short').className = side === 'SHORT' ? 'active-short' : '';
-    const btn = document.getElementById('submit-trade');
-    if (btn) {
-        if (S.orderType === 'SURF') {
-            const surfSide = side === 'LONG' ? 'Long' : 'Short';
-            btn.textContent = `🏄 Surf ${surfSide}`;
-            btn.className = 'btn-submit';
-            btn.style.background = side === 'LONG' ? '#22c55e' : '#f97316';
-            btn.style.color = '#000';
-        } else if (S.orderType === 'TRAIL') {
-            // Don't change trail button on side toggle
-        } else if (S.orderType === 'CHASE') {
-            // Don't change chase button on side toggle
-        } else {
-            btn.className = `btn-submit btn-submit-${side.toLowerCase()}`;
-            btn.textContent = side === 'LONG' ? 'Buy / Long' : 'Sell / Short';
-            btn.style.background = '';
-            btn.style.color = '';
-        }
-    }
+    const btnL = document.getElementById('btn-long');
+    const btnN = document.getElementById('btn-neutral');
+    const btnS = document.getElementById('btn-short');
+    if (btnL) btnL.className = side === 'LONG' ? 'active-long' : '';
+    if (btnN) btnN.className = side === 'NEUTRAL' ? 'active-neutral' : '';
+    if (btnS) btnS.className = side === 'SHORT' ? 'active-short' : '';
+
+    refreshSubmitButton();
+
     // Update TWAP price limit label/hint for current side
     const plLabel = document.getElementById('twap-price-limit-label');
     if (plLabel) plLabel.textContent = side === 'SHORT' ? 'Min Sell Price' : 'Max Buy Price';
     const plHint = document.getElementById('twap-price-limit-hint');
     if (plHint) plHint.textContent = side === 'SHORT' ? 'TWAP will skip lots if price drops below this' : 'TWAP will skip lots if price rises above this';
     updatePreview();
+}
+
+export function refreshSubmitButton() {
+    const btn = document.getElementById('submit-trade');
+    if (!btn) return;
+
+    const type = S.orderType;
+    const side = S.selectedSide;
+    const isScalperNeutral = type === 'SCALPER' && side === 'NEUTRAL';
+    const isSmartNeutral = type === 'SMART' && side === 'NEUTRAL';
+
+    if (type === 'TRAIL') {
+        btn.textContent = '⚡ Set Trail Stop';
+        btn.className = 'btn-submit';
+        btn.style.background = '#f59e0b';
+        btn.style.color = '#000';
+    } else if (type === 'CHASE') {
+        btn.textContent = '🎯 Start Chase';
+        btn.className = 'btn-submit';
+        btn.style.background = '#06b6d4';
+        btn.style.color = '#000';
+    } else if (type === 'SCALPER') {
+        btn.textContent = isScalperNeutral ? 'Start Scalper (Neutral)' : '⚔️ Start Scalper';
+        btn.className = `btn-submit ${isScalperNeutral ? 'submit-neutral' : ''}`;
+        btn.style.background = 'linear-gradient(90deg, #06b6d4 0%, #f97316 100%)';
+        btn.style.color = '#000';
+    } else if (type === 'AGENT') {
+        btn.textContent = '🤖 Start Agent';
+        btn.className = 'btn-submit';
+        btn.style.background = 'linear-gradient(135deg, #8b5cf6 0%, #06b6d4 50%, #22c55e 100%)';
+        btn.style.color = '#fff';
+    } else if (type === 'SMART') {
+        btn.textContent = isSmartNeutral ? 'Start SmartOrder (Neutral)' : '🧠 Start SmartOrder';
+        btn.className = `btn-submit ${isSmartNeutral ? 'submit-neutral' : ''}`;
+        btn.style.background = 'linear-gradient(135deg, #0ea5e9 0%, #8b5cf6 100%)';
+        btn.style.color = '#fff';
+    } else if (type === 'SCALE') {
+        btn.textContent = side === 'LONG' ? 'Ladder Buy' : 'Ladder Sell';
+        btn.className = `btn-submit btn-submit-${side.toLowerCase()}`;
+        btn.style.background = '';
+        btn.style.color = '';
+    } else {
+        btn.textContent = side === 'LONG' ? 'Buy / Long' : 'Sell / Short';
+        btn.className = `btn-submit btn-submit-${side.toLowerCase()}`;
+        btn.style.background = '';
+        btn.style.color = '';
+    }
 }
 
 export function setLeverage(val) {
@@ -154,7 +194,8 @@ export function showTradeError(errors) {
 
 export async function submitTrade() {
     if (!state.currentAccount) return showToast('Select an account first', 'error');
-    if (S.cachedMarginInfo?.availableMargin != null && S.cachedMarginInfo.availableMargin < 0) {
+    const isReduceOnly = document.getElementById('reduce-only-toggle')?.checked;
+    if (!isReduceOnly && S.cachedMarginInfo?.availableMargin != null && S.cachedMarginInfo.availableMargin < 0) {
         return showToast('⚠️ Insufficient balance — available margin is negative', 'error');
     }
     const sizeUsd = parseFloat(document.getElementById('trade-size')?.value);
@@ -185,6 +226,7 @@ export async function submitTrade() {
                 symbol: S.selectedSymbol,
                 side: S.selectedSide,
                 quantity,
+                notionalUsd: notional,
                 leverage: S.leverage,
                 fastExecution: true,
                 fallbackPrice: S.currentPrice,
@@ -216,13 +258,14 @@ export async function submitTrade() {
             showToast(`${err.message || 'Trade failed'}`, 'error');
         }
     } finally {
-        if (btn) { btn.disabled = false; btn.textContent = S.selectedSide === 'LONG' ? 'Buy / Long' : 'Sell / Short'; }
+        if (btn) { btn.disabled = false; refreshSubmitButton(); }
     }
 }
 
 export async function submitLimitOrder() {
     if (!state.currentAccount) return showToast('Select an account first', 'error');
-    if (S.cachedMarginInfo?.availableMargin != null && S.cachedMarginInfo.availableMargin < 0) {
+    const isReduceOnly = document.getElementById('reduce-only-toggle')?.checked;
+    if (!isReduceOnly && S.cachedMarginInfo?.availableMargin != null && S.cachedMarginInfo.availableMargin < 0) {
         return showToast('⚠️ Insufficient balance — available margin is negative', 'error');
     }
     const sizeUsd = parseFloat(document.getElementById('trade-size')?.value);
@@ -250,7 +293,17 @@ export async function submitLimitOrder() {
         const reduceOnly = document.getElementById('reduce-only-toggle')?.checked ?? false;
         const result = await api('/trade/limit', {
             method: 'POST',
-            body: { subAccountId: state.currentAccount, symbol: S.selectedSymbol, side: S.selectedSide, quantity, price: limitPrice, leverage: S.leverage, babysitterExcluded: !babysitterChecked, ...(reduceOnly ? { reduceOnly: true } : {}) },
+            body: {
+                subAccountId: state.currentAccount,
+                symbol: S.selectedSymbol,
+                side: S.selectedSide,
+                quantity,
+                notionalUsd: notional,
+                price: limitPrice,
+                leverage: S.leverage,
+                babysitterExcluded: !babysitterChecked,
+                ...(reduceOnly ? { reduceOnly: true } : {}),
+            },
         });
         markOrderAck(latencyId);
         requestAnimationFrame(() => markOrderPaint(latencyId));
@@ -272,7 +325,7 @@ export async function submitLimitOrder() {
             showToast(`${err.message || 'Limit order failed'}`, 'error');
         }
     } finally {
-        if (btn) { btn.disabled = false; btn.textContent = S.selectedSide === 'LONG' ? 'Buy / Long' : 'Sell / Short'; }
+        if (btn) { btn.disabled = false; refreshSubmitButton(); }
     }
 }
 
@@ -289,8 +342,8 @@ export function setOrderType(type) {
     localStorage.setItem('pms_trade_order_type', type);
 
     // Sync the custom dropdown trigger
-    const LABELS = { MARKET: 'Market', LIMIT: 'Limit', SCALE: 'Scale', TWAP: 'TWAP', TRAIL: 'Trail Stop', CHASE: 'Chase', SURF: 'Surf', SCALPER: 'Scalper' };
-    const ICONS = { MARKET: '⚡', LIMIT: '📌', SCALE: '📊', TWAP: '⏱️', TRAIL: '🛡️', CHASE: '🎯', SURF: '🏄', SCALPER: '⚔️' };
+    const LABELS = { MARKET: 'Market', LIMIT: 'Limit', SCALE: 'Scale', TWAP: 'TWAP', TRAIL: 'Trail Stop', CHASE: 'Chase', SCALPER: 'Scalper', AGENT: 'Agent', SMART: 'SmartOrder' };
+    const ICONS = { MARKET: '⚡', LIMIT: '📌', SCALE: '📊', TWAP: '⏱️', TRAIL: '🛡️', CHASE: '🎯', SCALPER: '⚔️', AGENT: '🤖', SMART: '🧠' };
     const labelEl = document.getElementById('ot-selected-label');
     const iconEl = document.getElementById('ot-selected-icon');
     if (labelEl) labelEl.textContent = LABELS[type] || type;
@@ -304,8 +357,9 @@ export function setOrderType(type) {
     const twapControls = document.getElementById('twap-controls');
     const trailControls = document.getElementById('trail-stop-controls');
     const chaseControls = document.getElementById('chase-controls');
-    const surfControls = document.getElementById('surf-controls');
     const scalperControls = document.getElementById('scalper-controls');
+    const agentControls = document.getElementById('agent-controls');
+    const smartControls = document.getElementById('smart-order-controls');
 
     if (priceGroup) priceGroup.style.display = type === 'LIMIT' ? '' : 'none';
     if (type === 'LIMIT') {
@@ -313,13 +367,13 @@ export function setOrderType(type) {
         if (priceInput && S.currentPrice) priceInput.value = formatPrice(S.currentPrice);
     }
 
-    // Show/hide Neutral button — only for SCALPER
+    // Show/hide Neutral button — only for SCALPER and SMART
     const btnNeutral = document.getElementById('btn-neutral');
-    if (btnNeutral) btnNeutral.style.display = type === 'SCALPER' ? '' : 'none';
+    if (btnNeutral) btnNeutral.style.display = (type === 'SCALPER' || type === 'SMART') ? '' : 'none';
     // If entering SCALPER, fire event so index.js can sync mode button state
     if (type === 'SCALPER') document.dispatchEvent(new CustomEvent('scalper-active'));
-    // If we're leaving SCALPER and current side is NEUTRAL, snap back to LONG
-    if (type !== 'SCALPER' && S.selectedSide === 'NEUTRAL') setSide('LONG');
+    // If we're leaving SCALPER/SMART and current side is NEUTRAL, snap back to LONG
+    if (type !== 'SCALPER' && type !== 'SMART' && S.selectedSide === 'NEUTRAL') setSide('LONG');
 
     if (scaleControls) scaleControls.style.display = type === 'SCALE' ? '' : 'none';
 
@@ -328,56 +382,28 @@ export function setOrderType(type) {
 
     if (trailControls) trailControls.style.display = type === 'TRAIL' ? '' : 'none';
     if (chaseControls) chaseControls.style.display = type === 'CHASE' ? '' : 'none';
-    if (surfControls) surfControls.style.display = type === 'SURF' ? '' : 'none';
     if (scalperControls) scalperControls.style.display = type === 'SCALPER' ? '' : 'none';
+    if (agentControls) agentControls.style.display = type === 'AGENT' ? '' : 'none';
+    if (smartControls) smartControls.style.display = type === 'SMART' ? '' : 'none';
 
-    // SURF uses its own budget — hide size/babysitter (but keep side toggle!). TRAIL hides everything.
+    // TRAIL hides all controls. SCALPER keeps size visible but hides babysitter.
     // SCALPER keeps size input visible (total budget) but hides babysitter.
     const hideControls = type === 'TRAIL';
-    const hideSizeOnly = type === 'SURF';
-    const hideOnlyBabysitter = type === 'SCALPER';
+    const hideOnlyBabysitter = type === 'SCALPER' || type === 'AGENT' || type === 'SMART';
     const babysitterGroup = document.getElementById('babysitter-toggle-group');
     const sideToggle = document.querySelector('.side-toggle-mini');
     const sizeGroup = document.getElementById('size-slider-track')?.parentElement;
     const tradeSizeInput = document.getElementById('trade-size')?.parentElement;
     const orderPreview = document.getElementById('order-preview');
     const submitBtn = document.getElementById('submit-trade');
-    if (babysitterGroup) babysitterGroup.style.display = (hideControls || hideSizeOnly || hideOnlyBabysitter) ? 'none' : '';
+    if (babysitterGroup) babysitterGroup.style.display = (hideControls || hideOnlyBabysitter) ? 'none' : '';
     const reduceOnlyGroup = document.getElementById('reduce-only-toggle-group');
-    if (reduceOnlyGroup) reduceOnlyGroup.style.display = (hideControls || hideSizeOnly || hideOnlyBabysitter) ? 'none' : '';
+    if (reduceOnlyGroup) reduceOnlyGroup.style.display = (hideControls || hideOnlyBabysitter) ? 'none' : '';
     if (sideToggle) sideToggle.style.display = hideControls ? 'none' : '';
-    if (sizeGroup) sizeGroup.style.display = (hideControls || hideSizeOnly) ? 'none' : '';
-    if (tradeSizeInput) tradeSizeInput.style.display = (hideControls || hideSizeOnly) ? 'none' : '';
-    if (orderPreview && (hideControls || hideSizeOnly)) orderPreview.style.display = 'none';
-    if (submitBtn) {
-        if (type === 'TRAIL') {
-            submitBtn.textContent = '⚡ Set Trail Stop';
-            submitBtn.className = 'btn-submit';
-            submitBtn.style.background = '#f59e0b';
-            submitBtn.style.color = '#000';
-        } else if (type === 'CHASE') {
-            submitBtn.textContent = '🎯 Start Chase';
-            submitBtn.className = 'btn-submit';
-            submitBtn.style.background = '#06b6d4';
-            submitBtn.style.color = '#000';
-        } else if (type === 'SURF') {
-            const surfSide = S.selectedSide === 'LONG' ? 'Long' : 'Short';
-            submitBtn.textContent = `🏄 Surf ${surfSide}`;
-            submitBtn.className = 'btn-submit';
-            submitBtn.style.background = S.selectedSide === 'LONG' ? '#22c55e' : '#f97316';
-            submitBtn.style.color = '#000';
-        } else if (type === 'SCALPER') {
-            submitBtn.textContent = '⚔️ Start Scalper';
-            submitBtn.className = 'btn-submit';
-            submitBtn.style.background = 'linear-gradient(90deg, #06b6d4 0%, #f97316 100%)';
-            submitBtn.style.color = '#000';
-        } else {
-            submitBtn.textContent = S.selectedSide === 'LONG' ? 'Buy / Long' : 'Sell / Short';
-            submitBtn.className = `btn-submit btn-submit-${S.selectedSide.toLowerCase()}`;
-            submitBtn.style.background = '';
-            submitBtn.style.color = '';
-        }
-    }
+    if (sizeGroup) sizeGroup.style.display = hideControls ? 'none' : '';
+    if (tradeSizeInput) tradeSizeInput.style.display = hideControls ? 'none' : '';
+    if (orderPreview && hideControls) orderPreview.style.display = 'none';
+    refreshSubmitButton();
 
     if (type === 'TRAIL') {
         import('./trail-stop.js').then(m => {
@@ -392,15 +418,15 @@ export function setOrderType(type) {
         });
     }
 
-    if (type === 'SURF') {
-        import('./pump-chaser.js').then(m => {
-            m.updatePumpChaserPreview();
-        });
-    }
-
     if (type === 'SCALPER') {
         import('./scalper.js').then(m => {
             m.updateScalperPreview();
+        });
+    }
+
+    if (type === 'AGENT') {
+        import('./agents.js').then(m => {
+            m.updateAgentPreview();
         });
     }
 
@@ -425,271 +451,13 @@ export function setOrderType(type) {
         import('./chase-limit.js').then(m => m.clearAllChaseLines()).catch(() => { });
     }
 
-    if (type !== 'SURF') {
-        import('./pump-chaser.js').then(m => {
-            m.clearAllPumpChaserLines();
-            m.clearContinuousMode();
-        }).catch(() => { });
-    }
+
 }
 
-// ── Symbol Picker ───────────────────────────────
+// ── Symbol & Account Pickers (delegated) ────────
+// Re-exported from ./symbol-picker.js for backward compatibility
+export { prefetchSymbolsList, showSymbolPicker, switchSymbol, showAccountPicker } from './symbol-picker.js';
 
-export async function prefetchSymbolsList() {
-    const cached = S.getCachedSymbols();
-    if (cached) return;
-    try {
-        const symbols = await api('/trade/symbols/all');
-        if (Array.isArray(symbols) && symbols.length > 0) {
-            S.setCachedSymbols(symbols);
-        }
-    } catch { }
-}
-
-export function showSymbolPicker() {
-    const overlay = document.createElement('div');
-    overlay.className = 'modal-overlay';
-    overlay.style.alignItems = 'flex-start';
-    overlay.style.paddingTop = '40px';
-    overlay.innerHTML = `
-    <div class="modal-content" style="max-height: 80vh; display: flex; flex-direction: column;">
-      <div class="modal-header">
-        <span class="modal-title">Select Symbol</span>
-        <button class="modal-close">×</button>
-      </div>
-      <input class="search-input" id="symbol-search" placeholder="Search symbol..." autofocus />
-      <div class="symbol-list-header" style="display:flex; justify-content:space-between; padding:6px 12px; font-size:11px; color:var(--text-muted); border-bottom:1px solid var(--border); cursor:pointer; user-select:none;">
-        <span data-sort="name" style="flex:2;">Name ↕</span>
-        <span data-sort="price" style="flex:1.5; text-align:right;">Price ↕</span>
-        <span data-sort="change24h" style="flex:1; text-align:right;">24h% ↕</span>
-        <span data-sort="volume24h" style="flex:1; text-align:right;">Volume ↕</span>
-        <span data-sort="fundingRate" style="flex:1; text-align:right;">Funding ↕</span>
-      </div>
-      <div class="symbol-list" id="symbol-results" style="overflow-y:auto; flex:1; max-height:60vh;"></div>
-    </div>
-  `;
-
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
-    overlay.querySelector('.modal-close').addEventListener('click', () => overlay.remove());
-    document.body.appendChild(overlay);
-
-    let allTickers = [];
-    let currentSort = { key: 'change24h', dir: -1 };
-
-    overlay.querySelectorAll('[data-sort]').forEach(el => {
-        el.addEventListener('click', () => {
-            const key = el.dataset.sort;
-            if (currentSort.key === key) currentSort.dir *= -1;
-            else currentSort = { key, dir: key === 'name' ? 1 : -1 };
-            const q = document.getElementById('symbol-search')?.value?.trim() || '';
-            renderTickerResults(filterSymbols(allTickers, q), q);
-        });
-    });
-
-    loadTickerResults();
-
-    async function loadTickerResults() {
-        try {
-            allTickers = await api('/trade/symbols/tickers');
-            sortTickers(allTickers);
-            renderTickerResults(allTickers, '');
-        } catch (err) {
-            try {
-                const basics = await api('/trade/symbols/all');
-                allTickers = basics.map(s => ({ ...s, price: 0, change24h: 0, volume24h: 0, fundingRate: 0 }));
-                sortTickers(allTickers);
-                renderTickerResults(allTickers, '');
-            } catch {
-                const list = document.getElementById('symbol-results');
-                if (list) list.innerHTML = '<div style="padding:20px; text-align:center; color:var(--text-muted);">Failed to load symbols</div>';
-            }
-        }
-    }
-
-    function filterSymbols(list, q) {
-        if (!q) return [...list];
-        const lower = q.toLowerCase();
-        return list.filter(s =>
-            s.base.toLowerCase().includes(lower) || s.symbol.toLowerCase().includes(lower)
-        );
-    }
-
-    function sortTickers(list) {
-        list.sort((a, b) => {
-            if (currentSort.key === 'name') return currentSort.dir * a.base.localeCompare(b.base);
-            return currentSort.dir * ((a[currentSort.key] || 0) - (b[currentSort.key] || 0));
-        });
-    }
-
-    function renderTickerResults(results, query) {
-        const list = document.getElementById('symbol-results');
-        if (!list) return;
-        sortTickers(results);
-
-        // Build a map of symbols with active positions → side
-        const tradedMap = new Map();
-        for (const [, pos] of S._positionMap) {
-            tradedMap.set(pos.symbol, pos.side);
-        }
-
-        // TradFi asset classification
-        const EQUITIES = new Set(['TSLA', 'AMZN', 'COIN', 'CRCL', 'HOOD', 'INTC', 'MSTR', 'PLTR']);
-        const COMMODITIES = new Set(['XAU', 'XAG', 'XPD', 'XPT']);
-
-        list.innerHTML = results.map(s => {
-            const chgColor = s.change24h >= 0 ? 'var(--green)' : 'var(--red)';
-            const fundColor = s.fundingRate >= 0 ? 'var(--green)' : 'var(--red)';
-            const vol = s.volume24h || 0;
-            const volStr = vol >= 1e9 ? `${(vol / 1e9).toFixed(1)}B` : vol >= 1e6 ? `${(vol / 1e6).toFixed(1)}M` : vol >= 1e3 ? `${(vol / 1e3).toFixed(0)}K` : vol > 0 ? vol.toFixed(0) : '—';
-
-            const side = tradedMap.get(s.symbol);
-            const tradedIndicator = side
-                ? `<span class="symbol-traded-dot ${side === 'LONG' ? 'dot-long' : 'dot-short'}"></span><span class="symbol-traded-badge ${side === 'LONG' ? 'badge-long' : 'badge-short'}">${side === 'LONG' ? 'L' : 'S'}</span>`
-                : '';
-
-            // TradFi type badge
-            const base = s.base?.toUpperCase();
-            const typeBadge = EQUITIES.has(base)
-                ? '<span class="symbol-type-badge type-equity">📈 Equity</span>'
-                : COMMODITIES.has(base)
-                    ? '<span class="symbol-type-badge type-commodity">🪙 Metal</span>'
-                    : '';
-
-            return `
-        <div class="symbol-item" data-symbol="${s.symbol}" style="display:flex; justify-content:space-between; align-items:center;">
-          <span style="flex:2; font-weight:600; display:flex; align-items:center; gap:6px;">${tradedIndicator}${s.base}/USDT${typeBadge}</span>
-          <span style="flex:1.5; text-align:right; font-family:var(--font-mono); font-size:12px;">${s.price ? '$' + formatPrice(s.price) : '—'}</span>
-          <span style="flex:1; text-align:right; font-family:var(--font-mono); font-size:12px; color:${chgColor};">${s.change24h >= 0 ? '+' : ''}${s.change24h.toFixed(2)}%</span>
-          <span style="flex:1; text-align:right; font-family:var(--font-mono); font-size:11px; color:var(--text-muted);">${volStr}</span>
-          <span style="flex:1; text-align:right; font-family:var(--font-mono); font-size:11px; color:${fundColor};">${(s.fundingRate * 100).toFixed(4)}%</span>
-        </div>
-      `;
-        }).join('') || '<div style="padding:20px; text-align:center; color:var(--text-muted);">No symbols found</div>';
-
-        list.querySelectorAll('.symbol-item').forEach(item => {
-            item.addEventListener('click', () => switchSymbol(item.dataset.symbol));
-        });
-    }
-
-    let searchTimeout;
-    document.getElementById('symbol-search')?.addEventListener('input', (e) => {
-        clearTimeout(searchTimeout);
-        const q = e.target.value.trim();
-        searchTimeout = setTimeout(() => {
-            renderTickerResults(filterSymbols(allTickers, q), q);
-        }, 100);
-    });
-}
-
-export function switchSymbol(symbol) {
-    S.set('selectedSymbol', symbol);
-    localStorage.setItem('pms_last_symbol', symbol);
-    let raw = symbol.replace('/', '').replace(':USDT', '').toLowerCase();
-    if (!raw.endsWith('usdt')) raw += 'usdt';
-    S.set('rawSymbol', raw);
-
-    document.getElementById('sym-name').textContent = `${symbol.split('/')[0]}/USDT`;
-    document.querySelector('.modal-overlay')?.remove();
-
-    S.set('currentPrice', null);
-    S.set('recentTrades', []);
-    S.set('orderBookBids', []);
-    S.set('orderBookAsks', []);
-    S.set('sizePercent', 0);
-    const slider = document.getElementById('size-slider');
-    if (slider) slider.value = 0;
-    setSizePercent(0);
-
-    // restore per-instrument leverage
-    setLeverage(S.leverageMap[symbol] || 1);
-
-    // Re-apply bottom panel filter for the new symbol
-    import('./positions-panel.js').then(m => m.applySymbolFilter());
-
-    // Clear stale SURF chart lines from previous symbol
-    import('./pump-chaser.js').then(m => {
-        m.clearAllPumpChaserLines();
-        m.clearContinuousMode();
-    }).catch(() => { });
-
-
-    // Use the orchestrator's lightweight re-init (teardown streams + chart only)
-    import('./ws-handlers.js').then(({ teardownStreams, initWebSockets }) => {
-        teardownStreams();
-        if (S.chartResizeObserver) {
-            try { S.chartResizeObserver.disconnect(); } catch { }
-            S.set('chartResizeObserver', null);
-        }
-        if (S.chart) { try { S.chart.remove(); } catch { } S.set('chart', null); }
-        S.set('chartReady', false);
-        S.set('candleSeries', null);
-        S.set('volumeSeries', null);
-        S.set('chartPriceLines', []);
-        S.set('_chartAnnotationCache', null);
-        S.set('_chartAnnotationLastFetch', 0);
-        S.set('_chartAnnotationFingerprint', null);
-        S.set('_chartAnnotationForceNext', false);
-
-        requestAnimationFrame(() => {
-            initChart();
-            initWebSockets();
-            scheduleTradingRefresh({ annotations: true, forceAnnotations: true }, 20);
-        });
-        fetchTickerData();
-        fetchSymbolInfo(symbol);
-    });
-}
-
-export function showAccountPicker() {
-    const overlay = document.createElement('div');
-    overlay.className = 'modal-overlay';
-
-    const accts = state.accounts.map(a => `
-    <div class="symbol-item" data-id="${a.id}" style="${a.id === state.currentAccount ? 'background:var(--bg-card-hover);' : ''}">
-      <div>
-        <span class="symbol-name">${a.name}</span>
-        <span class="badge badge-${a.status.toLowerCase()}" style="margin-left:8px;">${a.status}</span>
-      </div>
-      <span class="symbol-price">$${a.currentBalance.toFixed(2)}</span>
-    </div>
-  `).join('');
-
-    overlay.innerHTML = `
-    <div class="modal-content">
-      <div class="modal-header">
-        <span class="modal-title">Select Account</span>
-        <button class="modal-close">×</button>
-      </div>
-      <div class="symbol-list">${accts || '<div style="padding:20px; text-align:center; color:var(--text-muted);">No Accounts</div>'}</div>
-    </div>
-  `;
-
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
-    overlay.querySelector('.modal-close')?.addEventListener('click', () => overlay.remove());
-    overlay.querySelectorAll('.symbol-item').forEach(item => {
-        item.addEventListener('click', () => {
-            state.currentAccount = item.dataset.id;
-            localStorage.setItem('pms_currentAccount', state.currentAccount);
-            scheduleTradingRefresh({
-                account: true,
-                positions: true,
-                openOrders: true,
-                annotations: true,
-                forceAnnotations: true,
-            }, 0);
-            overlay.remove();
-            if (state.ws?.readyState === 1) {
-                state.ws.send(JSON.stringify({
-                    type: 'subscribe',
-                    subAccountId: state.currentAccount,
-                    token: localStorage.getItem('pms_token') || null,
-                }));
-            }
-        });
-    });
-
-    document.body.appendChild(overlay);
-}
 
 // ── Helpers ─────────────────────────────────────
 

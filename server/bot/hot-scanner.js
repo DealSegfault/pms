@@ -68,7 +68,7 @@ class HotScanner {
 
         this._scanning = true;
         try {
-            const tickers = await exchange.exchange.fetchTickers();
+            const tickers = await exchange.fetchTickers();
             const markets = exchange.markets;
             if (!Object.keys(markets).length) return;
 
@@ -78,8 +78,8 @@ class HotScanner {
                 const market = markets[symbol];
                 if (!market) continue;
 
-                // Only linear USDT perpetuals
-                if (!market.linear || !market.active || !market.swap) continue;
+                // Only active USDT perpetuals
+                if (!market.active) continue;
                 if (!symbol.endsWith(':USDT')) continue;
 
                 // Skip stablecoins

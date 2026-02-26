@@ -1,5 +1,5 @@
 import * as S from './state.js';
-import { noteQueueDepth } from './perf-metrics.js';
+import { noteQueueDepth, recordLatency } from './perf-metrics.js';
 
 const pending = {
     openOrders: false,
@@ -13,6 +13,21 @@ let timerId = null;
 let inFlight = false;
 let positionsModulePromise = null;
 let orderFormModulePromise = null;
+
+function _perfNow() {
+    return (typeof performance !== 'undefined' && performance.now)
+        ? performance.now()
+        : Date.now();
+}
+
+function _timedTask(metricName, run) {
+    const started = _perfNow();
+    return Promise.resolve()
+        .then(run)
+        .finally(() => {
+            recordLatency(metricName, _perfNow() - started);
+        });
+}
 
 function _pendingCount() {
     let count = 0;
@@ -57,6 +72,7 @@ function _ensureOrderFormModule() {
 
 async function _flushPendingRefreshes() {
     timerId = null;
+    const flushStarted = _perfNow();
     if (!S._tradingMounted) {
         _consumePending();
         noteQueueDepth('refresh', 0);
@@ -77,14 +93,14 @@ async function _flushPendingRefreshes() {
 
         if (next.openOrders || next.positions || next.annotations) {
             const positionsPanel = await _ensurePositionsModule();
-            if (next.openOrders) tasks.push(positionsPanel.loadOpenOrders());
-            if (next.positions) tasks.push(positionsPanel.loadTradingPositions());
-            if (next.annotations) tasks.push(positionsPanel.loadChartAnnotations(!!next.forceAnnotations));
+            if (next.openOrders) tasks.push(_timedTask('refresh_open_orders_ms', () => positionsPanel.loadOpenOrders()));
+            if (next.positions) tasks.push(_timedTask('refresh_positions_ms', () => positionsPanel.loadTradingPositions()));
+            if (next.annotations) tasks.push(_timedTask('refresh_annotations_ms', () => positionsPanel.loadChartAnnotations(!!next.forceAnnotations)));
         }
 
         if (next.account) {
             const orderForm = await _ensureOrderFormModule();
-            tasks.push(orderForm.updateAccountDisplay());
+            tasks.push(_timedTask('refresh_account_ms', () => orderForm.updateAccountDisplay()));
         }
 
         if (tasks.length > 0) {
@@ -93,6 +109,7 @@ async function _flushPendingRefreshes() {
     } catch (err) {
         console.debug('[RefreshScheduler] refresh flush error:', err?.message || err);
     } finally {
+        recordLatency('refresh_flush_ms', _perfNow() - flushStarted);
         inFlight = false;
         if (_pendingCount() > 0) {
             scheduleTradingRefresh({}, 80);

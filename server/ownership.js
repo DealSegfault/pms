@@ -9,7 +9,7 @@ import prisma from './db/prisma.js';
 
 /**
  * Factory: returns middleware that extracts subAccountId from the given source.
- * @param {'params' | 'body' | 'header'} source — where to find the subAccountId
+ * @param {'params' | 'body' | 'query' | 'header'} source — where to find the subAccountId
  * @param {string} [key='subAccountId'] — key name in the source
  */
 export function requireOwnership(source = 'params', key = 'subAccountId') {
@@ -17,6 +17,7 @@ export function requireOwnership(source = 'params', key = 'subAccountId') {
         const subAccountId =
             source === 'params' ? req.params[key] :
                 source === 'body' ? req.body[key] :
+                    source === 'query' ? req.query[key] :
                     source === 'header' ? req.headers[key.toLowerCase()] :
                         null;
 

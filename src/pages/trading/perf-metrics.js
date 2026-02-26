@@ -57,6 +57,14 @@ function _report() {
         _formatStat('depth_tick_to_paint_ms'),
         _formatStat('trade_tick_to_paint_ms'),
         _formatStat('frame_time_ms'),
+        _formatStat('refresh_flush_ms'),
+        _formatStat('refresh_open_orders_ms'),
+        _formatStat('refresh_open_orders_fetch_ms'),
+        _formatStat('refresh_open_orders_render_ms'),
+        _formatStat('refresh_positions_ms'),
+        _formatStat('refresh_annotations_ms'),
+        _formatStat('refresh_chart_data_fetch_ms'),
+        _formatStat('refresh_account_ms'),
     ];
 
     const queueSummary = [...queueDepths.entries()]

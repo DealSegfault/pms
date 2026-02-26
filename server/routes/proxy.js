@@ -136,20 +136,22 @@ router.post('/v1/order',
                 }
             }
 
-            // Forward to Binance via ccxt
-            const orderType = type.toLowerCase();
+            // Forward to Binance via vanilla API
             const orderSide = side.toLowerCase();
+            const orderType = type.toLowerCase();
             const params = {};
             if (timeInForce) params.timeInForce = timeInForce;
             if (reduceOnly) params.reduceOnly = true;
-            if (taggedClientId) params.clientOrderId = taggedClientId;
+            if (taggedClientId) params.newClientOrderId = taggedClientId;
 
-            const ccxtOrder = await exchange.exchange.createOrder(
-                ccxtSymbol, orderType, orderSide, qty, prc, params,
-            );
+            let result;
+            if (orderType === 'market') {
+                result = await exchange.createMarketOrder(ccxtSymbol, orderSide, qty, params);
+            } else {
+                result = await exchange.createLimitOrder(ccxtSymbol, orderSide, qty, prc, params);
+            }
 
-            // Store order mapping in Redis
-            const exchangeOrderId = String(ccxtOrder.id);
+            const exchangeOrderId = String(result.orderId);
             await setOrderMapping(exchangeOrderId, {
                 subAccountId: req.subAccount.id,
                 clientOrderId: taggedClientId,
@@ -159,7 +161,6 @@ router.post('/v1/order',
                 ts: Date.now(),
             });
 
-            // Also record in PMS DB
             const sig = crypto.createHash('sha256')
                 .update(`${req.subAccount.id}:${exchangeOrderId}:${Date.now()}`)
                 .digest('hex').substring(0, 16);
@@ -172,26 +173,25 @@ router.post('/v1/order',
                     symbol: ccxtSymbol,
                     side: side.toUpperCase(),
                     type: type.toUpperCase(),
-                    price: ccxtOrder.average || ccxtOrder.price || prc || 0,
-                    quantity: ccxtOrder.filled || qty,
-                    notional: (ccxtOrder.average || prc || 0) * (ccxtOrder.filled || qty),
-                    fee: ccxtOrder.fee?.cost || 0,
+                    price: result.price || prc || 0,
+                    quantity: result.quantity || qty,
+                    notional: (result.price || prc || 0) * (result.quantity || qty),
+                    fee: result.fee || 0,
                     action: reduceOnly ? 'CLOSE' : 'OPEN',
                     originType: 'BOT',
-                    status: ccxtOrder.status === 'closed' ? 'FILLED' : ccxtOrder.status?.toUpperCase() || 'PENDING',
+                    status: result.status === 'FILLED' ? 'FILLED' : result.status?.toUpperCase() || 'PENDING',
                     signature: sig,
                 },
             });
 
-            // Return Binance-compatible response
             res.json({
                 orderId: parseInt(exchangeOrderId) || exchangeOrderId,
                 symbol,
                 clientOrderId: taggedClientId,
-                status: ccxtOrder.status?.toUpperCase() || 'NEW',
+                status: result.status?.toUpperCase() || 'NEW',
                 origQty: String(qty),
-                executedQty: String(ccxtOrder.filled || 0),
-                avgPrice: String(ccxtOrder.average || 0),
+                executedQty: String(result.quantity || 0),
+                avgPrice: String(result.price || 0),
                 type: type.toUpperCase(),
                 side: side.toUpperCase(),
                 timeInForce: timeInForce || 'GTC',
@@ -224,7 +224,7 @@ router.delete('/v1/order',
             }
 
             const ccxtSymbol = rawToCcxt(symbol);
-            await exchange.exchange.cancelOrder(orderId, ccxtSymbol);
+            await exchange.cancelOrder(ccxtSymbol, orderId);
 
             res.json({ orderId, symbol, status: 'CANCELED' });
         } catch (err) {
@@ -254,14 +254,16 @@ router.put('/v1/order',
             const qty = parseFloat(quantity);
             const prc = parseFloat(price);
 
-            const order = await exchange.exchange.editOrder(
-                orderId, ccxtSymbol, 'limit', side?.toLowerCase() || 'sell', qty, prc,
+            // Cancel + re-place (Binance Futures doesn't have native edit)
+            try { await exchange.cancelOrder(ccxtSymbol, orderId); } catch { }
+            const newOrder = await exchange.createLimitOrder(
+                ccxtSymbol, side?.toLowerCase() || 'sell', qty, prc,
             );
 
             res.json({
-                orderId: order.id,
+                orderId: newOrder.orderId,
                 symbol,
-                status: order.status?.toUpperCase() || 'NEW',
+                status: newOrder.status?.toUpperCase() || 'NEW',
                 origQty: String(qty),
                 price: String(prc),
             });
@@ -399,13 +401,12 @@ router.get('/v2/balance',
 
 router.get('/v1/exchangeInfo', async (req, res) => {
     try {
-        // Just return market data from ccxt
         const markets = exchange?.markets || {};
         if (!Object.keys(markets).length) {
             return res.json({ symbols: [] });
         }
         const symbols = Object.values(markets)
-            .filter(m => m.linear && m.active)
+            .filter(m => m.active)
             .slice(0, 100)
             .map(m => ({
                 symbol: m.id,

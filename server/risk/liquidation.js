@@ -12,6 +12,15 @@
  */
 import prisma from '../db/prisma.js';
 import { setRiskSnapshot } from '../redis.js';
+
+let _closePositionViaCpp = null;
+async function closePositionViaCppSafe(positionId, reason) {
+    if (!_closePositionViaCpp) {
+        const mod = await import('../routes/trading/close-utils.js');
+        _closePositionViaCpp = mod.closePositionViaCpp;
+    }
+    return _closePositionViaCpp(positionId, reason);
+}
 const DEFAULT_LIQUIDATION_THRESHOLD = 0.90;
 const INSOLVENCY_MARGIN_RATIO = 1.0;
 const PNL_EMIT_MIN_INTERVAL_MS = 50;   // was 150ms — faster PnL delivery
@@ -38,16 +47,11 @@ export class LiquidationEngine {
         this._pendingMarginPayload = new Map();
         this._marginEmitTimers = new Map();
 
-        // In-memory rules cache with 60s TTL (Fix 4: eliminates DB reads during tick evaluation)
-        this._rulesCache = new Map(); // subAccountId → { rules, expiresAt }
+        // In-memory rules cache with 60s TTL
+        this._rulesCache = new Map();
 
-        // Snapshot write throttle (Fix 11: max 1 Redis write/sec per account)
-        this._lastSnapshotTs = new Map(); // subAccountId → timestamp
-
-        // Injected later to avoid circular dependency with TradeExecutor
-        this._closePosition = null;
-        this._partialClose = null;
-        this._takeoverPosition = null;
+        // Snapshot write throttle (max 4/sec per account)
+        this._lastSnapshotTs = new Map();
     }
 
     setWsEmitter(emitter) {
@@ -121,16 +125,7 @@ export class LiquidationEngine {
         });
     }
 
-    /**
-     * Inject trade actions (avoids circular dep with TradeExecutor).
-     * Must be called during wiring before any evaluations.
-     */
-    setTradeActions({ closePosition, partialClose, liquidatePosition, takeoverPosition }) {
-        this._closePosition = closePosition;
-        this._partialClose = partialClose;
-        this._liquidatePosition = liquidatePosition;
-        this._takeoverPosition = takeoverPosition;
-    }
+
 
     /** Check if an account is currently being evaluated. */
     isEvaluating(subAccountId) {
@@ -275,8 +270,15 @@ export class LiquidationEngine {
      */
     async evaluateAccount(subAccountId) {
         const entry = this._book.getEntry(subAccountId);
-        if (!entry || entry.positions.size === 0) return;
+        if (!entry) return;
         if (entry.account.status === 'LIQUIDATED' || entry.account.status === 'FROZEN') return;
+
+        // Account exists but has no open positions — write zeroed snapshot
+        // so the margin endpoint fast path still works for idle accounts.
+        if (entry.positions.size === 0) {
+            this._emitZeroedMargin(subAccountId);
+            return;
+        }
 
         // Resolve threshold first so derived liquidation prices are consistent with live triggers
         if (!entry.rules) {
@@ -431,10 +433,9 @@ export class LiquidationEngine {
                 : [...positions].map(p => p.id);
             for (const posId of posIds) {
                 try {
-                    await this._liquidatePosition(posId);
+                    await closePositionViaCppSafe(posId, mode);
                 } catch (err) {
                     console.error(`[Risk] Failed to liquidate position ${posId}:`, err.message);
-                    // Continue liquidating remaining positions
                 }
             }
             await prisma.subAccount.update({ where: { id: subAccountId }, data: { status: 'LIQUIDATED' } });
@@ -474,7 +475,7 @@ export class LiquidationEngine {
                 : [...positions].map(p => p.id);
             for (const posId of posIds) {
                 try {
-                    await this._takeoverPosition(posId, 'SYSTEM_LIQ');
+                    await closePositionViaCppSafe(posId, mode);
                 } catch (err) {
                     console.error(`[Risk] Failed to takeover position ${posId}:`, err.message);
                 }
@@ -530,7 +531,7 @@ export class LiquidationEngine {
         }
 
         try {
-            await this._partialClose(largest.id, 0.3, 'ADL_TIER2');
+            await closePositionViaCppSafe(largest.id, 'ADL_TIER2');
         } catch (err) {
             console.error(`[Risk] Tier 2 ADL error:`, err.message);
         } finally {
@@ -550,7 +551,7 @@ export class LiquidationEngine {
         }
 
         try {
-            await this._partialClose(largest.id, 0.3, 'ADL_TIER3');
+            await closePositionViaCppSafe(largest.id, 'ADL_TIER3');
 
             // Re-check after partial close
             const freshEntry = this._book.getEntry(subAccountId);
@@ -575,7 +576,7 @@ export class LiquidationEngine {
                     const remainingIds = [...freshEntry.positions.keys()];
                     for (const pid of remainingIds) {
                         try {
-                            await this._liquidatePosition(pid);
+                            await closePositionViaCppSafe(pid, 'ADL_ESCALATED');
                         } catch (err) {
                             console.error(`[Risk] Failed to liquidate position ${pid} in Tier 3 escalation:`, err.message);
                         }
@@ -627,10 +628,10 @@ export class LiquidationEngine {
     }
 
     _publishRiskSnapshot(subAccountId, snapshot) {
-        // Throttle: max 1 Redis write/sec per account
+        // Throttle: max 4 Redis writes/sec per account (250ms interval)
         const now = Date.now();
         const last = this._lastSnapshotTs.get(subAccountId) || 0;
-        if (now - last < 1000) return;
+        if (now - last < 250) return;
         this._lastSnapshotTs.set(subAccountId, now);
 
         setRiskSnapshot(subAccountId, snapshot).catch((err) => {

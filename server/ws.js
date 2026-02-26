@@ -3,6 +3,7 @@ import prisma from './db/prisma.js';
 import riskEngine from './risk/index.js';
 import botManager from './bot/manager.js';
 import { verifyToken } from './auth.js';
+import { log } from './structured-logger.js';
 
 
 let wss = null;
@@ -33,7 +34,7 @@ const MAX_BUFFER_BYTES = 1024 * 1024; // 1MB
 function safeSend(ws, message) {
     if (ws.readyState !== 1) return;
     if (ws.bufferedAmount > MAX_BUFFER_BYTES) {
-        console.warn('[WS] Client too slow, terminating');
+        log.warn('ws', 'CLIENT_SLOW', 'Client too slow, terminating', { bufferedAmount: ws.bufferedAmount });
         ws.terminate();
         return;
     }
@@ -43,8 +44,14 @@ function safeSend(ws, message) {
 export function initWebSocket(server) {
     wss = new WebSocketServer({ server, path: '/ws' });
 
-    // Wire up the risk engine's WS emitter
-    riskEngine.setWsEmitter(broadcast);
+    // Phase 4: When UDS is active, C++ sends pre-computed risk snapshots
+    // via engine-event-relay — no need for JS-side risk polling
+    const _isUdsWs = process.env.CPP_ENGINE_UDS === '1' || process.env.CPP_ENGINE_UDS === 'true';
+    if (!_isUdsWs) {
+        riskEngine.setWsEmitter(broadcast);
+    } else {
+        console.log('[WS] Risk engine WS emitter skipped — C++ engine provides pre-computed snapshots');
+    }
 
     // Wire up the bot manager's WS emitter for live scanner
     botManager.setWsEmitter(broadcast);
@@ -92,13 +99,20 @@ export function initWebSocket(server) {
                                 ws.subscribedAccount = subAccountId;
                                 indexSocket(ws, subAccountId);
                             } else {
-                                console.warn(`[WS] User ${ws.userId} tried to subscribe to unowned account ${subAccountId}`);
+                                log.warn('ws', 'UNAUTHORIZED_SUBSCRIBE', `User ${ws.userId} tried to subscribe to unowned account ${subAccountId}`, { userId: ws.userId, subAccountId });
                                 ws.send(JSON.stringify({ type: 'error', message: 'Not authorized for this account' }));
                             }
                         }
                     } else if (subAccountId) {
                         // No auth token provided — reject subscription
                         ws.send(JSON.stringify({ type: 'error', message: 'Authentication token required' }));
+                    }
+                } else if (msg.type === 'warm_symbol' && msg.symbol) {
+                    try {
+                        const exchangeLib = await import('./exchange.js');
+                        exchangeLib.default.subscribeToPrices([msg.symbol]);
+                    } catch (err) {
+                        log.error('ws', 'WARM_SYMBOL_FAILED', err.message, { symbol: msg.symbol });
                     }
                 }
             } catch { }
@@ -129,18 +143,19 @@ export function initWebSocket(server) {
 
 function broadcast(type, data) {
     if (!wss) return;
-    const message = JSON.stringify({ type, data, timestamp: Date.now() });
 
     if (data.subAccountId) {
         // Targeted broadcast: O(1) lookup + O(subscribers)
         const sockets = subAccountSockets.get(data.subAccountId);
-        if (sockets) {
-            for (const ws of sockets) {
-                safeSend(ws, message);
-            }
+        if (!sockets || sockets.size === 0) return;
+        const message = JSON.stringify({ type, data, timestamp: Date.now() });
+        for (const ws of sockets) {
+            safeSend(ws, message);
         }
     } else {
         // Global broadcast (rare — no subAccountId)
+        if (!wss.clients || wss.clients.size === 0) return;
+        const message = JSON.stringify({ type, data, timestamp: Date.now() });
         for (const ws of wss.clients) {
             safeSend(ws, message);
         }
@@ -148,4 +163,3 @@ function broadcast(type, data) {
 }
 
 export { broadcast };
-
