@@ -16,7 +16,6 @@ import prisma from '../db/prisma.js';
 import { ERR, parseExchangeError } from './errors.js';
 import { computePnl, createTradeSignature, createOpenTradeSignature } from './risk-math.js';
 import { TradeValidator } from './trade-validator.js';
-import babysitterManager from '../bot/babysitter-manager.js';
 import { setRiskSnapshot } from '../redis.js';
 import { markSymbolClosed } from '../recent-close.js';
 
@@ -66,12 +65,7 @@ export class TradeExecutor {
         });
     }
 
-    _refreshBabysitter(subAccountId, reason) {
-        if (!subAccountId) return;
-        babysitterManager.refreshForSubAccount(subAccountId, reason).catch((err) => {
-            console.warn(`[Babysitter] Refresh failed for ${subAccountId}:`, err.message);
-        });
-    }
+
 
     /**
      * Write a fresh Redis risk snapshot using in-memory book data (fast, no REST/DB).
@@ -105,7 +99,6 @@ export class TradeExecutor {
                     liquidationPrice: pos.liquidationPrice || 0,
                     unrealizedPnl: upnl,
                     pnlPercent: pos.margin > 0 ? (upnl / pos.margin) * 100 : 0,
-                    babysitterExcluded: pos.babysitterExcluded ?? false,
                     openedAt: pos.openedAt || null,
                 });
             }
@@ -225,7 +218,6 @@ export class TradeExecutor {
                             leverage: position.leverage,
                             margin: position.margin,
                             liquidationPrice: dynLiq,
-                            babysitterExcluded: position.babysitterExcluded ?? false,
                         });
                     }
                 }
@@ -424,7 +416,7 @@ export class TradeExecutor {
                 });
             }
 
-            this._refreshBabysitter(position.subAccountId, 'close_position');
+
 
             console.log(`[Risk] Position closed: ${position.side} ${position.symbol} | PnL: $${realizedPnl.toFixed(4)} | New Balance: $${result.newBalance.toFixed(2)}`);
             return { success: true, ...result };
@@ -555,7 +547,7 @@ export class TradeExecutor {
             });
         }
 
-        this._refreshBabysitter(position.subAccountId, 'liquidation');
+
 
         console.log(`[Risk] Position LIQUIDATED: ${position.side} ${position.symbol} @ ${closePrice.toFixed(6)} | PnL: $${realizedPnl.toFixed(4)} | Balance: $${result.newBalance.toFixed(2)}`);
         return { success: true, ...result };
@@ -657,7 +649,7 @@ export class TradeExecutor {
                 });
             }
 
-            this._refreshBabysitter(position.subAccountId, 'partial_close');
+
 
             console.log(`[Risk] ADL ${(fraction * 100).toFixed(0)}%: ${position.symbol} | Closed ${closeQty} | PnL: $${realizedPnl.toFixed(4)} | Remaining: ${remainingQty}`);
             return { success: true, ...result };
@@ -717,7 +709,7 @@ export class TradeExecutor {
             });
         }
 
-        this._refreshBabysitter(position.subAccountId, 'admin_takeover');
+
 
         return { success: true, ...result };
     }
@@ -814,171 +806,13 @@ export class TradeExecutor {
         }
 
         for (const subAccountId of touchedSubAccounts) {
-            this._refreshBabysitter(subAccountId, 'reconcile');
+
         }
 
         return { closed: closedCount };
     }
 
-    // ── Babysitter close path ─────────────────────────
-    // Default behavior is exchange-first (reduce-only market close), then virtual settle.
-    // Set BBS_ALLOW_VIRTUAL_CLOSE_FALLBACK=1 to allow legacy virtual-only fallback.
 
-    async closeVirtualPositionByPrice(positionId, closePrice, reason = 'BABYSITTER_TP') {
-        const action = String(reason || 'BABYSITTER_TP').trim() || 'BABYSITTER_TP';
-        const legacyFallback = ['1', 'true', 'yes', 'on'].includes(
-            String(process.env.BBS_ALLOW_VIRTUAL_CLOSE_FALLBACK || '').trim().toLowerCase(),
-        );
-
-        // --- Pre-check: does a real exchange position exist for this symbol? ---
-        const position = await prisma.virtualPosition.findUnique({ where: { id: positionId } });
-        if (!position || position.status !== 'OPEN') {
-            return { success: false, error: 'Position not found or already closed' };
-        }
-
-        let hasExchangePosition = true; // assume yes if check fails
-        try {
-            const exchangePositions = await this._exchange.fetchPositions();
-            hasExchangePosition = exchangePositions.some(
-                (p) => p.symbol === position.symbol && Math.abs(parseFloat(p.contracts || 0)) > 0
-            );
-        } catch (err) {
-            console.warn(`[Babysitter] Failed to check exchange positions for ${position.symbol}: ${err.message}`);
-            // If we can't check, assume position exists and try regular close
-        }
-
-        if (!hasExchangePosition) {
-            // No exchange position → close virtual only, don't touch exchange
-            console.log(`[Babysitter] No exchange position for ${position.symbol} — closing virtual only @ ${closePrice}`);
-            const fallbackPrice = Number(closePrice);
-            if (!Number.isFinite(fallbackPrice) || fallbackPrice <= 0) {
-                return { success: false, error: 'Virtual-only close requires valid closePrice' };
-            }
-            const result = await this._closeVirtualOnlyByPrice(positionId, fallbackPrice, action);
-            if (!result?.success) return result;
-            return { ...result, source: 'virtual_no_exchange' };
-        }
-
-        // --- Exchange position exists → proceed with exchange-first close ---
-        const exchangeClose = await this.closePosition(positionId, action);
-        if (exchangeClose?.success) {
-            const realizedPnl = exchangeClose.trade?.realizedPnl
-                ?? exchangeClose.position?.realizedPnl
-                ?? 0;
-            return {
-                success: true,
-                positionId,
-                realizedPnl,
-                newBalance: exchangeClose.newBalance,
-                closePrice: exchangeClose.trade?.price ?? closePrice,
-                exchangeOrderId: exchangeClose.trade?.exchangeOrderId || null,
-                source: 'exchange',
-            };
-        }
-
-        const exchangeError = exchangeClose?.errors?.[0]?.message
-            || exchangeClose?.error
-            || 'Exchange close failed';
-
-        if (!legacyFallback) {
-            return { success: false, error: `Exchange close failed: ${exchangeError}` };
-        }
-
-        const fallbackPrice = Number(closePrice);
-        if (!Number.isFinite(fallbackPrice) || fallbackPrice <= 0) {
-            return {
-                success: false,
-                error: `Exchange close failed: ${exchangeError}; fallback requires valid closePrice`,
-            };
-        }
-
-        console.warn(`[Babysitter] Exchange close failed for ${positionId}, using virtual fallback @ ${fallbackPrice}: ${exchangeError}`);
-        const fallback = await this._closeVirtualOnlyByPrice(positionId, fallbackPrice, action);
-        if (!fallback?.success) return fallback;
-        return {
-            ...fallback,
-            source: 'virtual_fallback',
-            exchangeError,
-        };
-    }
-
-    async _closeVirtualOnlyByPrice(positionId, closePrice, reason = 'BABYSITTER_TP') {
-        const position = await prisma.virtualPosition.findUnique({
-            where: { id: positionId },
-        });
-        if (!position) return { success: false, error: 'Position not found' };
-        if (position.status !== 'OPEN') return { success: false, error: 'Position already closed' };
-
-        const realizedPnl = computePnl(position.side, position.entryPrice, closePrice, position.quantity);
-
-        const signature = createTradeSignature(position.subAccountId, reason, positionId);
-
-        const result = await prisma.$transaction(async (tx) => {
-            const updatedPosition = await tx.virtualPosition.update({
-                where: { id: positionId },
-                data: {
-                    status: 'CLOSED',
-                    realizedPnl,
-                    closedAt: new Date(),
-                },
-            });
-
-            const trade = await tx.tradeExecution.create({
-                data: {
-                    subAccountId: position.subAccountId,
-                    positionId,
-                    symbol: position.symbol,
-                    side: position.side === 'LONG' ? 'SELL' : 'BUY',
-                    type: 'MARKET',
-                    price: closePrice,
-                    quantity: position.quantity,
-                    notional: closePrice * position.quantity,
-                    fee: 0,
-                    realizedPnl,
-                    action: reason,
-                    status: 'FILLED',
-                    signature,
-                },
-            });
-
-            const { balanceAfter } = await this._applyBalanceDelta(
-                tx,
-                position.subAccountId,
-                realizedPnl,
-                reason,
-                trade.id,
-            );
-
-            return { position: updatedPosition, trade, newBalance: balanceAfter };
-        });
-
-        // Sync in-memory book
-        this._book.remove(positionId, position.subAccountId);
-        this._book.updateBalance(position.subAccountId, result.newBalance);
-
-        // Write fresh snapshot so next /positions fetch gets up-to-date data
-        await this._syncSnapshot(position.subAccountId);
-
-        console.log(`[Babysitter] Closed ${position.side} ${position.symbol} @ ${closePrice.toFixed(6)} | PnL: $${realizedPnl.toFixed(4)} | Balance: $${result.newBalance.toFixed(2)} (virtual fallback)`);
-
-        if (this._wsEmitter) {
-            this._wsEmitter('position_closed', {
-                subAccountId: position.subAccountId,
-                positionId,
-                symbol: position.symbol,
-                side: position.side,
-                realizedPnl,
-                newBalance: result.newBalance,
-                reason,
-            });
-        }
-
-        this._refreshBabysitter(position.subAccountId, 'babysitter_close');
-
-        // Debounce reconcile in proxy-stream for this symbol
-        markSymbolClosed(position.symbol);
-        return { success: true, positionId, realizedPnl, newBalance: result.newBalance };
-    }
 
     // ── Private: Trade Execution Flows ───────────────
 
@@ -1057,10 +891,6 @@ export class TradeExecutor {
                 liqThreshold,
             );
 
-            // Determine babysitterExcluded for the new flipped position
-            // Default: excluded (babysitter OFF) unless explicitly enabled by the checkbox.
-            const flipBabysitterExcluded = options.babysitterExcluded ?? true;
-
             const position = await tx.virtualPosition.create({
                 data: {
                     subAccountId, symbol, side,
@@ -1070,7 +900,6 @@ export class TradeExecutor {
                     leverage,
                     margin: fillMargin,
                     liquidationPrice: liqPrice,
-                    babysitterExcluded: flipBabysitterExcluded,
                     status: 'OPEN',
                 },
             });
@@ -1135,11 +964,10 @@ export class TradeExecutor {
                 leverage: result.position.leverage,
                 margin: result.position.margin,
                 liquidationPrice: result.position.liquidationPrice,
-                babysitterExcluded: result.position.babysitterExcluded ?? false,
             });
         }
 
-        this._refreshBabysitter(subAccountId, 'flip_trade');
+
 
         console.log(`[Risk] Position FLIPPED: closed ${oppositeSide} (PnL: $${result.closePnl.toFixed(4)}) → opened ${side} ${quantity} ${symbol} @ ${fillPrice} | Margin: $${fillMargin.toFixed(2)}`);
 
@@ -1239,15 +1067,6 @@ export class TradeExecutor {
                     },
                 });
                 tradeAction = 'ADD';
-            } else {
-                const cfg = await tx.botConfig.findUnique({
-                    where: { subAccountId },
-                    select: { babysitterEnabled: true },
-                });
-                // Prefer client-provided babysitterExcluded (from order form toggle).
-                // Default: excluded (babysitter OFF) unless explicitly enabled by the checkbox.
-                const babysitterExcluded = options.babysitterExcluded ?? true;
-
                 position = await tx.virtualPosition.create({
                     data: {
                         subAccountId, symbol, side,
@@ -1257,7 +1076,6 @@ export class TradeExecutor {
                         leverage,
                         margin: fillMargin,
                         liquidationPrice: liqPrice,
-                        babysitterExcluded,
                         status: 'OPEN',
                     },
                 });
@@ -1298,7 +1116,7 @@ export class TradeExecutor {
         // Recompute dynamic liq prices for all open positions out-of-band.
         this._scheduleDynamicLiqRefresh(subAccountId, account, liqThreshold, 'normal');
 
-        this._refreshBabysitter(subAccountId, 'execute_trade');
+
 
         // Emit position_updated for real-time frontend push
         if (this._wsEmitter) {
@@ -1313,7 +1131,6 @@ export class TradeExecutor {
                 leverage: result.position.leverage,
                 margin: result.position.margin,
                 liquidationPrice: result.position.liquidationPrice,
-                babysitterExcluded: result.position.babysitterExcluded ?? false,
             });
         }
 

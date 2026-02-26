@@ -78,7 +78,6 @@ model VirtualPosition {
   liquidationPrice Float  @map("liquidation_price")
   status         String   @default("OPEN") // OPEN, CLOSED, LIQUIDATED, TAKEN_OVER
   realizedPnl    Float?   @map("realized_pnl")
-  babysitterExcluded Boolean @default(false) @map("babysitter_excluded") // User can exclude from babysitter
   takenOver      Boolean  @default(false) @map("taken_over")
   takenOverBy    String?  @map("taken_over_by")
   takenOverAt    DateTime? @map("taken_over_at")
@@ -167,7 +166,6 @@ model BotConfig {
   id              String   @id @default(uuid())
   subAccountId    String   @unique @map("sub_account_id")
   enabled         Boolean  @default(false)
-  babysitterEnabled Boolean @default(false) @map("babysitter_enabled") // Simple on/off v7 babysitter
   tpMode          String   @default("auto")     @map("tp_mode")  // auto, fast, vol, long_short
 
   // Strategy
@@ -206,7 +204,6 @@ model BotConfig {
 
   subAccount SubAccount @relation(fields: [subAccountId], references: [id])
 
-  @@index([babysitterEnabled])
   @@map("bot_configs")
 }
 

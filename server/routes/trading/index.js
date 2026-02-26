@@ -12,7 +12,6 @@ import basketRouter from './basket.js';
 import twapRouter from './twap.js';
 import trailStopRouter from './trail-stop.js';
 import chaseLimitRouter from './chase-limit.js';
-import pumpChaserRouter from './pump-chaser.js';
 import scalperRouter from './scalper.js';
 import analyticsRouter from './analytics.js';
 
@@ -26,7 +25,6 @@ router.use(basketRouter);
 router.use(twapRouter);
 router.use(trailStopRouter);
 router.use(chaseLimitRouter);
-router.use(pumpChaserRouter);
 router.use(scalperRouter);
 router.use(analyticsRouter);
 

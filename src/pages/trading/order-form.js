@@ -19,13 +19,7 @@ export function setSide(side) {
     document.getElementById('btn-short').className = side === 'SHORT' ? 'active-short' : '';
     const btn = document.getElementById('submit-trade');
     if (btn) {
-        if (S.orderType === 'SURF') {
-            const surfSide = side === 'LONG' ? 'Long' : 'Short';
-            btn.textContent = `🏄 Surf ${surfSide}`;
-            btn.className = 'btn-submit';
-            btn.style.background = side === 'LONG' ? '#22c55e' : '#f97316';
-            btn.style.color = '#000';
-        } else if (S.orderType === 'TRAIL') {
+        if (S.orderType === 'TRAIL') {
             // Don't change trail button on side toggle
         } else if (S.orderType === 'CHASE') {
             // Don't change chase button on side toggle
@@ -176,7 +170,6 @@ export async function submitTrade() {
 
     try {
         markOrderSent(latencyId);
-        const babysitterChecked = document.getElementById('babysitter-toggle')?.checked ?? false;
         const reduceOnly = document.getElementById('reduce-only-toggle')?.checked ?? false;
         const result = await api('/trade', {
             method: 'POST',
@@ -188,7 +181,6 @@ export async function submitTrade() {
                 leverage: S.leverage,
                 fastExecution: true,
                 fallbackPrice: S.currentPrice,
-                babysitterExcluded: !babysitterChecked,
                 ...(reduceOnly ? { reduceOnly: true } : {}),
             },
         });
@@ -246,11 +238,10 @@ export async function submitLimitOrder() {
 
     try {
         markOrderSent(latencyId);
-        const babysitterChecked = document.getElementById('babysitter-toggle')?.checked ?? false;
         const reduceOnly = document.getElementById('reduce-only-toggle')?.checked ?? false;
         const result = await api('/trade/limit', {
             method: 'POST',
-            body: { subAccountId: state.currentAccount, symbol: S.selectedSymbol, side: S.selectedSide, quantity, price: limitPrice, leverage: S.leverage, babysitterExcluded: !babysitterChecked, ...(reduceOnly ? { reduceOnly: true } : {}) },
+            body: { subAccountId: state.currentAccount, symbol: S.selectedSymbol, side: S.selectedSide, quantity, price: limitPrice, leverage: S.leverage, ...(reduceOnly ? { reduceOnly: true } : {}) },
         });
         markOrderAck(latencyId);
         requestAnimationFrame(() => markOrderPaint(latencyId));
@@ -289,8 +280,8 @@ export function setOrderType(type) {
     localStorage.setItem('pms_trade_order_type', type);
 
     // Sync the custom dropdown trigger
-    const LABELS = { MARKET: 'Market', LIMIT: 'Limit', SCALE: 'Scale', TWAP: 'TWAP', TRAIL: 'Trail Stop', CHASE: 'Chase', SURF: 'Surf', SCALPER: 'Scalper' };
-    const ICONS = { MARKET: '⚡', LIMIT: '📌', SCALE: '📊', TWAP: '⏱️', TRAIL: '🛡️', CHASE: '🎯', SURF: '🏄', SCALPER: '⚔️' };
+    const LABELS = { MARKET: 'Market', LIMIT: 'Limit', SCALE: 'Scale', TWAP: 'TWAP', TRAIL: 'Trail Stop', CHASE: 'Chase', SCALPER: 'Scalper' };
+    const ICONS = { MARKET: '⚡', LIMIT: '📌', SCALE: '📊', TWAP: '⏱️', TRAIL: '🛡️', CHASE: '🎯', SCALPER: '⚔️' };
     const labelEl = document.getElementById('ot-selected-label');
     const iconEl = document.getElementById('ot-selected-icon');
     if (labelEl) labelEl.textContent = LABELS[type] || type;
@@ -304,7 +295,6 @@ export function setOrderType(type) {
     const twapControls = document.getElementById('twap-controls');
     const trailControls = document.getElementById('trail-stop-controls');
     const chaseControls = document.getElementById('chase-controls');
-    const surfControls = document.getElementById('surf-controls');
     const scalperControls = document.getElementById('scalper-controls');
 
     if (priceGroup) priceGroup.style.display = type === 'LIMIT' ? '' : 'none';
@@ -328,23 +318,18 @@ export function setOrderType(type) {
 
     if (trailControls) trailControls.style.display = type === 'TRAIL' ? '' : 'none';
     if (chaseControls) chaseControls.style.display = type === 'CHASE' ? '' : 'none';
-    if (surfControls) surfControls.style.display = type === 'SURF' ? '' : 'none';
     if (scalperControls) scalperControls.style.display = type === 'SCALPER' ? '' : 'none';
 
-    // SURF uses its own budget — hide size/babysitter (but keep side toggle!). TRAIL hides everything.
-    // SCALPER keeps size input visible (total budget) but hides babysitter.
+    // TRAIL hides everything.
     const hideControls = type === 'TRAIL';
-    const hideSizeOnly = type === 'SURF';
-    const hideOnlyBabysitter = type === 'SCALPER';
-    const babysitterGroup = document.getElementById('babysitter-toggle-group');
+    const hideSizeOnly = false;
     const sideToggle = document.querySelector('.side-toggle-mini');
     const sizeGroup = document.getElementById('size-slider-track')?.parentElement;
     const tradeSizeInput = document.getElementById('trade-size')?.parentElement;
     const orderPreview = document.getElementById('order-preview');
     const submitBtn = document.getElementById('submit-trade');
-    if (babysitterGroup) babysitterGroup.style.display = (hideControls || hideSizeOnly || hideOnlyBabysitter) ? 'none' : '';
     const reduceOnlyGroup = document.getElementById('reduce-only-toggle-group');
-    if (reduceOnlyGroup) reduceOnlyGroup.style.display = (hideControls || hideSizeOnly || hideOnlyBabysitter) ? 'none' : '';
+    if (reduceOnlyGroup) reduceOnlyGroup.style.display = (hideControls || hideSizeOnly || type === 'SCALPER') ? 'none' : '';
     if (sideToggle) sideToggle.style.display = hideControls ? 'none' : '';
     if (sizeGroup) sizeGroup.style.display = (hideControls || hideSizeOnly) ? 'none' : '';
     if (tradeSizeInput) tradeSizeInput.style.display = (hideControls || hideSizeOnly) ? 'none' : '';
@@ -359,12 +344,6 @@ export function setOrderType(type) {
             submitBtn.textContent = '🎯 Start Chase';
             submitBtn.className = 'btn-submit';
             submitBtn.style.background = '#06b6d4';
-            submitBtn.style.color = '#000';
-        } else if (type === 'SURF') {
-            const surfSide = S.selectedSide === 'LONG' ? 'Long' : 'Short';
-            submitBtn.textContent = `🏄 Surf ${surfSide}`;
-            submitBtn.className = 'btn-submit';
-            submitBtn.style.background = S.selectedSide === 'LONG' ? '#22c55e' : '#f97316';
             submitBtn.style.color = '#000';
         } else if (type === 'SCALPER') {
             submitBtn.textContent = '⚔️ Start Scalper';
@@ -392,11 +371,6 @@ export function setOrderType(type) {
         });
     }
 
-    if (type === 'SURF') {
-        import('./pump-chaser.js').then(m => {
-            m.updatePumpChaserPreview();
-        });
-    }
 
     if (type === 'SCALPER') {
         import('./scalper.js').then(m => {
@@ -425,12 +399,6 @@ export function setOrderType(type) {
         import('./chase-limit.js').then(m => m.clearAllChaseLines()).catch(() => { });
     }
 
-    if (type !== 'SURF') {
-        import('./pump-chaser.js').then(m => {
-            m.clearAllPumpChaserLines();
-            m.clearContinuousMode();
-        }).catch(() => { });
-    }
 }
 
 // ── Symbol Picker ───────────────────────────────
@@ -606,11 +574,6 @@ export function switchSymbol(symbol) {
     // Re-apply bottom panel filter for the new symbol
     import('./positions-panel.js').then(m => m.applySymbolFilter());
 
-    // Clear stale SURF chart lines from previous symbol
-    import('./pump-chaser.js').then(m => {
-        m.clearAllPumpChaserLines();
-        m.clearContinuousMode();
-    }).catch(() => { });
 
 
     // Use the orchestrator's lightweight re-init (teardown streams + chart only)

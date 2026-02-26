@@ -53,12 +53,11 @@ export async function loadOpenOrders() {
     if (!list) return;
 
     try {
-        const [orders, twaps, trailStops, chaseOrders, pumpChasers, scalpers] = await Promise.all([
+        const [orders, twaps, trailStops, chaseOrders, scalpers] = await Promise.all([
             api(`/trade/orders/${state.currentAccount}`),
             api(`/trade/twap/active/${state.currentAccount}`).catch(() => []),
             api(`/trade/trail-stop/active/${state.currentAccount}`).catch(() => []),
             api(`/trade/chase-limit/active/${state.currentAccount}`).catch(() => []),
-            api(`/trade/pump-chaser/active/${state.currentAccount}`).catch(() => []),
             api(`/trade/scalper/active/${state.currentAccount}`).catch(() => []),
         ]);
 
@@ -74,7 +73,7 @@ export async function loadOpenOrders() {
             }
         }
 
-        const totalCount = orders.length + twaps.length + trailStops.length + standaloneChases.length + pumpChasers.length + scalpers.length;
+        const totalCount = orders.length + twaps.length + trailStops.length + standaloneChases.length + scalpers.length;
         if (countEl) countEl.textContent = totalCount;
         if (cancelAllBtn) {
             cancelAllBtn.dataset.hasOrders = orders.length > 0 ? '1' : '0';
@@ -242,63 +241,9 @@ export async function loadOpenOrders() {
       `;
         }
 
-        for (const pc of pumpChasers) {
-            const pnlColor = (pc.netPnl || 0) >= 0 ? 'var(--green)' : 'var(--red)';
-            const posPct = pc.maxNotional > 0 ? Math.round(((pc.positionNotional || 0) / pc.maxNotional) * 100) : 0;
-            const isLong = pc.side === 'LONG';
-            const sideColor = isLong ? '#22c55e' : '#f97316';
-            const isDeleveraging = pc.state === 'DELEVERAGING';
-            const surfEdit = JSON.stringify({ type: 'SURF', orderId: pc.pumpChaserId, symbol: pc.symbol, side: pc.side, maxNotional: pc.maxNotional || 500, scalpRatioPct: Math.round((pc.scalpRatio || 0.6) * 100), volOffsetBps: pc.volOffsetBps || 0.3 });
-            html += `
-        <div class="oo-row" data-pc-id="${pc.pumpChaserId}" style="border-left:3px solid ${sideColor}; background:${isLong ? 'rgba(34,197,94,0.05)' : 'rgba(249,115,22,0.05)'};">
-          <span class="oor-sym">
-            <span class="oor-name" data-oo-symbol="${pc.symbol}">${pc.symbol.split('/')[0]}</span>
-            <span class="oor-badge ${isLong ? 'cpr-long' : 'cpr-short'}">${isLong ? 'L' : 'S'}</span>
-            <span data-edit-type="SURF" data-edit='${surfEdit.replace(/'/g, "&#39;")}' style="font-size:9px; color:${sideColor}; font-weight:600; margin-left:2px; cursor:pointer; text-decoration:underline dotted; text-underline-offset:2px;" title="Click to edit">SURF</span>
-          </span>
-          <span class="oor-price" style="display:flex; flex-direction:column; align-items:flex-end; gap:1px;">
-            <span style="font-size:10px; font-weight:600; ${isDeleveraging ? 'color:#f43f5e;' : ''}">${pc.state || '\u2014'}</span>
-            <span style="font-size:9px; color:var(--text-muted);">${pc.fillCount || 0} fills \u00b7 ${(pc.amplitude || 0).toFixed(1)}%</span>
-          </span>
-          <span class="oor-qty" style="min-width:60px;">
-            <div style="background:var(--surface-2); border-radius:3px; height:6px; overflow:hidden; width:100%;">
-              <div style="width:${posPct}%; height:100%; background:${isDeleveraging ? '#f43f5e' : sideColor}; border-radius:3px; transition:width 0.3s;"></div>
-            </div>
-            <span style="font-size:9px; color:var(--text-muted);">${posPct}% of max</span>
-          </span>
-          <span class="oor-notional" style="font-size:10px; color:${pnlColor}; font-weight:600;">
-            ${(pc.netPnl || 0) >= 0 ? '+' : ''}$${(pc.netPnl || 0).toFixed(2)}
-          </span>
-          <span class="oor-age">${formatRelativeTime(pc.startedAt ? new Date(pc.startedAt).toISOString() : new Date().toISOString())}</span>
-          <span class="oor-cancel" data-cancel-pc="${pc.pumpChaserId}" title="Stop SURF">\u2715</span>
-        </div>
-      `;
-
-            // Draw initial chart lines for SURFs on current symbol
-            if (pc.symbol === S.selectedSymbol) {
-                import('./pump-chaser.js').then(m => m.drawLivePumpChaser({
-                    pumpChaserId: pc.pumpChaserId,
-                    symbol: pc.symbol,
-                    side: pc.side,
-                    state: pc.state,
-                    extreme: pc.extreme,
-                    gate: pc.gate,
-                    startPrice: pc.startPrice,
-                    lastFillPrice: null,
-                    amplitude: pc.amplitude,
-                    fillCount: pc.fillCount,
-                    positionNotional: pc.positionNotional,
-                    maxNotional: pc.maxNotional,
-                    core: pc.core,
-                    scalp: pc.scalp,
-                    deleverage: pc.deleverage,
-                    netPnl: pc.netPnl,
-                }));
-            }
-        }
 
         for (const o of orders) {
-            if (['SURF_LIMIT', 'SURF_DELEVERAGE', 'SURF_SCALP', 'TWAP', 'TWAP_SLICE', 'CHASE_LIMIT', 'SCALPER_LIMIT'].includes(o.type)) continue;
+            if (['TWAP', 'TWAP_SLICE', 'CHASE_LIMIT', 'SCALPER_LIMIT'].includes(o.type)) continue;
 
             const notional = (o.price * o.quantity).toFixed(2);
             const isLong = o.side === 'LONG';
@@ -335,11 +280,6 @@ export async function loadOpenOrders() {
         list.querySelectorAll('[data-cancel-chase]').forEach(btn => {
             btn.addEventListener('click', () => {
                 import('./chase-limit.js').then(m => m.cancelChase(btn.dataset.cancelChase));
-            });
-        });
-        list.querySelectorAll('[data-cancel-pc]').forEach(btn => {
-            btn.addEventListener('click', () => {
-                import('./pump-chaser.js').then(m => m.cancelPumpChaser(btn.dataset.cancelPc));
             });
         });
         list.querySelectorAll('[data-cancel-scalper]').forEach(btn => {
@@ -530,11 +470,6 @@ export async function prefillOrderForm(params) {
         setInput('scalper-min-refill-delay', Math.round((params.minRefillDelayMs || 0) / 1000));
         setChecked('scalper-allow-loss', params.allowLoss ?? false);
         import('./scalper.js').then(m => m.updateScalperPreview?.());
-    } else if (type === 'SURF') {
-        setInput('surf-max-pos', params.maxNotional ?? 500);
-        setInput('surf-max-pos-slider', params.maxNotional ?? 500);
-        setInput('surf-scalp-ratio', params.scalpRatioPct ?? 60);
-        setInput('surf-offset-bps', params.volOffsetBps ?? 0.3);
     }
 
     // ── Set edit mode ──────────────────────────────────────────────
@@ -546,7 +481,7 @@ export async function prefillOrderForm(params) {
         if (btn) {
             btn.dataset.origLabel = btn.textContent;
             btn.dataset.editModeLabel = '1';
-            const labels = { TWAP: 'Update TWAP', TRAIL: 'Update Trail', CHASE: 'Update Chase', SCALPER: 'Update Scalper', SURF: 'Update SURF' };
+            const labels = { TWAP: 'Update TWAP', TRAIL: 'Update Trail', CHASE: 'Update Chase', SCALPER: 'Update Scalper' };
             btn.textContent = `✏️ ${labels[type] || 'Update'}`;
         }
 
@@ -610,7 +545,6 @@ export async function loadTradingPositions() {
             }
             const pnlPct = pos.margin > 0 ? (pnl / pos.margin) * 100 : 0;
             const isLong = pos.side === 'LONG';
-            const babysitterOn = !pos.babysitterExcluded;
 
             return `
         <div class="compact-pos-row" data-cp-symbol="${pos.symbol}" data-cp-side="${pos.side}"
@@ -627,12 +561,6 @@ export async function loadTradingPositions() {
           <span class="cpr-pnl ${pnl >= 0 ? 'pnl-up' : 'pnl-down'}" data-cppnl-id="${pos.id}" data-cp-prev-pnl="${pnl}">
             ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} <small>(${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)</small>
           </span>
-          <button class="cpr-bbs ${babysitterOn ? 'on' : 'off'}"
-                  data-cp-bbs="${pos.id}"
-                  data-cp-bbs-excluded="${pos.babysitterExcluded ? '1' : '0'}"
-                  title="Toggle babysitter for this position">
-            ${babysitterOn ? 'On' : 'Off'}
-          </button>
           <span class="cpr-close" data-cp-close="${pos.id}" data-cp-close-sym="${pos.symbol}" title="Market Close">✕</span>
         </div>
       `;
@@ -647,44 +575,7 @@ export async function loadTradingPositions() {
             });
         });
 
-        list.querySelectorAll('[data-cp-bbs]').forEach(btn => {
-            btn.addEventListener('click', async (e) => {
-                e.stopPropagation();
-                const positionId = btn.dataset.cpBbs;
-                const currentlyExcluded = btn.dataset.cpBbsExcluded === '1';
-                if (!positionId || S._compactBabysitterBusy.has(positionId)) return;
-                S._compactBabysitterBusy.add(positionId);
 
-                // Optimistic UI: flip button immediately and disable
-                const newExcluded = !currentlyExcluded;
-                const newOn = !newExcluded;
-                btn.disabled = true;
-                btn.textContent = newOn ? 'On' : 'Off';
-                btn.className = `cpr-bbs ${newOn ? 'on' : 'off'}`;
-                btn.dataset.cpBbsExcluded = newExcluded ? '1' : '0';
-                btn.style.opacity = '0.5';
-                showToast(newOn ? 'Enabling babysitter…' : 'Disabling babysitter…', 'info');
-
-                try {
-                    const route = currentlyExcluded
-                        ? `/bot/babysitter/position/${positionId}/include`
-                        : `/bot/babysitter/position/${positionId}/exclude`;
-                    await api(route, { method: 'POST' });
-                    showToast(newOn ? 'Babysitter enabled for position' : 'Babysitter disabled for position', 'success');
-                } catch (err) {
-                    // Revert on error
-                    const revertOn = !newOn;
-                    btn.textContent = revertOn ? 'On' : 'Off';
-                    btn.className = `cpr-bbs ${revertOn ? 'on' : 'off'}`;
-                    btn.dataset.cpBbsExcluded = currentlyExcluded ? '1' : '0';
-                    showToast(`${err.message}`, 'error');
-                } finally {
-                    btn.disabled = false;
-                    btn.style.opacity = '';
-                    S._compactBabysitterBusy.delete(positionId);
-                }
-            });
-        });
 
         // Click symbol name → switch trading symbol
         list.querySelectorAll('.cpr-name').forEach(el => {

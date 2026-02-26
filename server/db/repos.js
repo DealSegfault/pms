@@ -49,17 +49,6 @@ export const VirtualPositionRepo = {
             where: { id },
             select: { subAccount: { select: { userId: true } } },
         }),
-
-    updateExclusion: (id, excluded) =>
-        prisma.virtualPosition.update({
-            where: { id },
-            data: { babysitterExcluded: excluded },
-        }),
-
-    countIncluded: (subAccountId) =>
-        prisma.virtualPosition.count({
-            where: { subAccountId, status: 'OPEN', babysitterExcluded: false },
-        }),
 };
 
 // ──────────────────────────────────────────────────

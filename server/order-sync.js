@@ -248,7 +248,7 @@ async function handleOrderFilled(order, exchangeOrder) {
             price: fillPrice,
             quantity: fillQty,
             exchangeOrderId: order.exchangeOrderId,
-            ...(['CHASE_LIMIT', 'SURF_LIMIT', 'TWAP_SLICE'].includes(order.type) ? { suppressToast: true } : {}),
+            ...(['CHASE_LIMIT', 'TWAP_SLICE'].includes(order.type) ? { suppressToast: true } : {}),
         });
 
         console.log(`[OrderSync] ✅ Order FILLED: ${order.side} ${order.symbol} @ $${fillPrice} (${order.subAccountId})`);
@@ -325,11 +325,6 @@ async function recordFilledOrder(order, fillPrice, fillQty) {
                     margin,
                     liquidationPrice: liqPrice,
                     status: 'OPEN',
-                    // Algo-managed positions: exclude from babysitter
-                    // SURF, SCALPER_LIMIT, and CHASE_LIMIT manage their own lifecycle
-                    ...(['SURF_LIMIT', 'SURF_DELEVERAGE', 'SURF_SCALP', 'SCALPER_LIMIT', 'CHASE_LIMIT'].some(t => order.type?.startsWith(t) || order.type === t)
-                        ? { babysitterExcluded: true }
-                        : {}),
                 },
             });
             tradeAction = 'OPEN';

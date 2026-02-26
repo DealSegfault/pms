@@ -17,74 +17,7 @@ let _cachedMarginUsed = 0;    // cached margin used for live available calc
 
 // Stored listener references for cleanup
 const _listeners = {};
-const babysitterPositionBusy = new Set();
 
-// ── Babysitter Feature Stream Handler ──────────────
-
-const _gateLabels = {
-  ready: '✅ Ready',
-  below_target: '📊 Below Target',
-  cooldown: '⏳ Cooldown',
-  pending_close: '🔄 Pending Close',
-  excluded: '🚫 Excluded',
-  no_mark_price: '❓ No Price',
-};
-
-function handleBabysitterFeatures(e) {
-  const data = e.detail;
-  if (!data || !data.positions) return;
-
-  const positions = data.positions;
-  let hasAnyFeatures = false;
-
-  for (const f of positions) {
-    const row = document.getElementById(`bbs-feat-${f.positionId}`);
-    if (!row) continue;
-
-    hasAnyFeatures = true;
-
-    // Calculate progress percentage (pnlBps / targetBps)
-    const progress = f.targetBps > 0 ? Math.min(100, Math.max(0, (f.pnlBps / f.targetBps) * 100)) : 0;
-    const progressColor = f.shouldClose ? 'var(--green)' : (progress > 60 ? '#eab308' : 'var(--accent)');
-
-    row.classList.add('active');
-    row.innerHTML = `
-      <span class="bbs-feat-chip" title="TP Model">${f.tpModel || '—'}</span>
-      <span class="bbs-feat-chip" title="PnL bps / Target bps">
-        ${f.pnlBps}/${f.targetBps}bp
-        <span class="bbs-progress-bar">
-          <span class="bbs-progress-fill" style="width:${progress}%;background:${progressColor}"></span>
-        </span>
-      </span>
-      <span class="bbs-feat-chip gate-${f.gate}" title="Gate status">${_gateLabels[f.gate] || f.gate}</span>
-      <span class="bbs-feat-chip" title="Signal bias">${f.bias === 'LONG' ? '🟢' : f.bias === 'SHORT' ? '🔴' : '⚪'} ${f.bias}</span>
-    `;
-  }
-
-  // Show console if we have features
-  const console_ = document.getElementById('bbs-log-console');
-  if (console_ && hasAnyFeatures) console_.style.display = '';
-
-  // Append gate-blocking log entries
-  const logBody = document.getElementById('bbs-log-body');
-  if (logBody) {
-    const now = new Date().toLocaleTimeString();
-    for (const f of positions) {
-      if (f.gate === 'ready' || f.gate === 'excluded') continue; // Only log blocking gates
-      const sym = f.symbol?.split('/')[0] || f.symbol;
-      const line = document.createElement('div');
-      line.className = 'bbs-log-line';
-      line.innerHTML = `<span style="color:var(--text-muted)">${now}</span> <b>${sym}</b> <span class="gate-tag" style="color:${f.gate === 'below_target' ? '#eab308' : f.gate === 'cooldown' ? '#3b82f6' : '#a855f7'}">[${f.gate}]</span> pnl=${f.pnlBps}bp target=${f.targetBps}bp model=${f.tpModel}`;
-      logBody.appendChild(line);
-    }
-    // Cap lines at 50
-    while (logBody.children.length > 50) logBody.removeChild(logBody.firstChild);
-    // Auto-scroll if open
-    if (logBody.classList.contains('open')) {
-      logBody.scrollTop = logBody.scrollHeight;
-    }
-  }
-}
 
 export function renderPositionsPage(container) {
 
@@ -149,13 +82,6 @@ export function renderPositionsPage(container) {
         ${cuteSpinner()}
       </div>
 
-      <div class="bbs-log-console" id="bbs-log-console" style="display:none;">
-        <div class="bbs-log-header" id="bbs-log-toggle">
-          <span>🤖 Babysitter Log</span>
-          <span id="bbs-log-arrow">▸</span>
-        </div>
-        <div class="bbs-log-body" id="bbs-log-body"></div>
-      </div>
     </div>
 
     <style>
@@ -168,113 +94,6 @@ export function renderPositionsPage(container) {
       .limit-close-form button { white-space: nowrap; }
       .pos-action-row { display: flex; gap: 6px; margin-top: 8px; }
       .pos-action-row .btn { flex: 1; font-size: 11px; padding: 6px 0; }
-      .bbs-symbol-toggle {
-        border: 1px solid var(--border);
-        background: var(--bg-input);
-        color: var(--text-secondary);
-        border-radius: 999px;
-        font-size: 10px;
-        font-weight: 600;
-        padding: 2px 8px;
-        cursor: pointer;
-        margin-left: 2px;
-      }
-      .bbs-symbol-toggle.on {
-        border-color: rgba(34, 197, 94, 0.45);
-        color: var(--green);
-        background: rgba(34, 197, 94, 0.10);
-      }
-      .bbs-symbol-toggle.off {
-        border-color: rgba(239, 68, 68, 0.45);
-        color: var(--red);
-        background: rgba(239, 68, 68, 0.08);
-      }
-      .bbs-symbol-toggle:disabled {
-        opacity: 0.45;
-        cursor: not-allowed;
-      }
-      .bbs-features-row {
-        display: none;
-        margin-top: 6px;
-        padding: 6px 8px;
-        background: rgba(139, 92, 246, 0.06);
-        border: 1px solid rgba(139, 92, 246, 0.15);
-        border-radius: 8px;
-        font-size: 11px;
-        gap: 6px;
-        flex-wrap: wrap;
-        align-items: center;
-      }
-      .bbs-features-row.active { display: flex; }
-      .bbs-feat-chip {
-        display: inline-flex;
-        align-items: center;
-        gap: 3px;
-        padding: 2px 7px;
-        border-radius: 999px;
-        background: var(--surface-2);
-        color: var(--text-secondary);
-        font-size: 10px;
-        font-weight: 600;
-        white-space: nowrap;
-      }
-      .bbs-feat-chip.gate-ready { background: rgba(34,197,94,0.12); color: var(--green); }
-      .bbs-feat-chip.gate-below_target { background: rgba(250,204,21,0.12); color: #eab308; }
-      .bbs-feat-chip.gate-cooldown { background: rgba(59,130,246,0.12); color: #3b82f6; }
-      .bbs-feat-chip.gate-pending_close { background: rgba(168,85,247,0.12); color: #a855f7; }
-      .bbs-feat-chip.gate-excluded { background: rgba(239,68,68,0.08); color: var(--red); }
-      .bbs-feat-chip.gate-no_mark_price { background: rgba(107,114,128,0.12); color: #6b7280; }
-      .bbs-progress-bar {
-        width: 60px;
-        height: 5px;
-        background: var(--surface-3);
-        border-radius: 3px;
-        overflow: hidden;
-        display: inline-block;
-        vertical-align: middle;
-      }
-      .bbs-progress-fill {
-        height: 100%;
-        border-radius: 3px;
-        transition: width 0.3s ease;
-        background: var(--accent);
-      }
-      .bbs-log-console {
-        margin-top: 16px;
-        border: 1px solid var(--border);
-        border-radius: 10px;
-        overflow: hidden;
-      }
-      .bbs-log-header {
-        padding: 8px 12px;
-        background: var(--surface-1);
-        font-size: 12px;
-        font-weight: 700;
-        color: var(--text-secondary);
-        cursor: pointer;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        user-select: none;
-      }
-      .bbs-log-body {
-        max-height: 0;
-        overflow: hidden;
-        transition: max-height 0.3s ease;
-        background: var(--surface-0);
-      }
-      .bbs-log-body.open { max-height: 250px; overflow-y: auto; }
-      .bbs-log-line {
-        padding: 3px 12px;
-        font-size: 10px;
-        font-family: var(--font-mono);
-        color: var(--text-muted);
-        border-bottom: 1px solid var(--border);
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      .bbs-log-line .gate-tag { font-weight: 700; }
     </style>
   `;
 
@@ -331,7 +150,6 @@ export function renderPositionsPage(container) {
   _listeners.reduced = () => loadPositions();
   _listeners.filled = () => setTimeout(loadPositions, 2000);
   _listeners.positionUpdated = handlePositionUpdated;
-  _listeners.babysitterFeatures = handleBabysitterFeatures;
 
   window.addEventListener('pnl_update', _listeners.pnl);
   window.addEventListener('margin_update', _listeners.margin);
@@ -340,15 +158,6 @@ export function renderPositionsPage(container) {
   window.addEventListener('position_reduced', _listeners.reduced);
   window.addEventListener('order_filled', _listeners.filled);
   window.addEventListener('position_updated', _listeners.positionUpdated);
-  window.addEventListener('babysitter_features', _listeners.babysitterFeatures);
-
-  // Babysitter log toggle
-  document.getElementById('bbs-log-toggle')?.addEventListener('click', () => {
-    const body = document.getElementById('bbs-log-body');
-    const arrow = document.getElementById('bbs-log-arrow');
-    if (body) body.classList.toggle('open');
-    if (arrow) arrow.textContent = body?.classList.contains('open') ? '▾' : '▸';
-  });
 
   // REST polling fallback — only if WS hasn't delivered data in 15s
   pollInterval = setInterval(() => {
@@ -364,49 +173,6 @@ export function renderPositionsPage(container) {
   }, 30000);
 }
 
-async function toggleBabysitterForPosition(positionId, currentlyExcluded) {
-  if (!positionId) return;
-  if (babysitterPositionBusy.has(positionId)) return;
-  babysitterPositionBusy.add(positionId);
-
-  // Find the toggle button
-  const btn = document.querySelector(`[data-bbs-toggle-pos="${positionId}"]`);
-
-  // Optimistic UI: flip button immediately and disable
-  const newExcluded = !currentlyExcluded;
-  const newOn = !newExcluded;
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = newOn ? 'Babysitter On' : 'Babysitter Off';
-    btn.className = `bbs-symbol-toggle ${newOn ? 'on' : 'off'}`;
-    btn.dataset.bbsExcluded = newExcluded ? '1' : '0';
-    btn.style.opacity = '0.5';
-  }
-  showToast(newOn ? 'Enabling babysitter…' : 'Disabling babysitter…', 'info');
-
-  const route = currentlyExcluded
-    ? `/bot/babysitter/position/${positionId}/include`
-    : `/bot/babysitter/position/${positionId}/exclude`;
-  try {
-    await api(route, { method: 'POST' });
-    showToast(newOn ? 'Babysitter enabled for position' : 'Babysitter disabled for position', 'success');
-  } catch (err) {
-    // Revert on error
-    if (btn) {
-      const revertOn = !newOn;
-      btn.textContent = revertOn ? 'Babysitter On' : 'Babysitter Off';
-      btn.className = `bbs-symbol-toggle ${revertOn ? 'on' : 'off'}`;
-      btn.dataset.bbsExcluded = currentlyExcluded ? '1' : '0';
-    }
-    showToast(`${err.message}`, 'error');
-  } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.style.opacity = '';
-    }
-    babysitterPositionBusy.delete(positionId);
-  }
-}
 
 async function loadPositions() {
   if (!state.currentAccount) {
@@ -508,9 +274,6 @@ function renderPositionsList(positions) {
 
     // Mark price to display
     const displayMarkPrice = liveMarkPrice || pos.markPrice || pos.entryPrice;
-    const babysitterOn = !pos.babysitterExcluded;
-    const babysitterLabel = babysitterOn ? 'Babysitter On' : 'Babysitter Off';
-    const babysitterClass = babysitterOn ? 'on' : 'off';
 
     return `
       <div class="position-card" data-id="${pos.id}"
@@ -522,14 +285,6 @@ function renderPositionsList(positions) {
             <span class="pos-sym-link" data-nav-symbol="${pos.symbol}" style="cursor:pointer;">${pos.symbol.split('/')[0]}</span>
             <span class="badge badge-${pos.side.toLowerCase()}">${pos.side}</span>
             <span style="font-size: 11px; color: var(--text-muted);">${pos.leverage}x</span>
-            <button
-              class="bbs-symbol-toggle ${babysitterClass}"
-              data-bbs-toggle-pos="${pos.id}"
-              data-bbs-excluded="${pos.babysitterExcluded ? '1' : '0'}"
-              title="Toggle babysitter for this position"
-            >
-              ${babysitterLabel}
-            </button>
             <span data-opened-at="${pos.openedAt || ''}" style="font-size: 10px; color: var(--text-muted); margin-left: 4px;">⏱ ${elapsed}</span>
           </div>
           <div class="position-pnl ${pnlClass}">
@@ -571,7 +326,6 @@ function renderPositionsList(positions) {
           <input type="number" id="limit-price-${pos.id}" placeholder="Limit price" step="0.01" value="${formatPrice(pos.markPrice || pos.entryPrice)}" />
           <button class="btn btn-outline btn-sm" data-submit-limit="${pos.id}" style="border-color: var(--accent); color: var(--accent);">Set</button>
         </div>
-        <div class="bbs-features-row" id="bbs-feat-${pos.id}"></div>
       </div>
     `;
   }).join('');
@@ -592,12 +346,6 @@ function renderPositionsList(positions) {
     btn.addEventListener('click', () => submitLimitClose(btn.dataset.submitLimit));
   });
 
-  list.querySelectorAll('[data-bbs-toggle-pos]').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      toggleBabysitterForPosition(btn.dataset.bbsTogglePos, btn.dataset.bbsExcluded === '1');
-    });
-  });
 
   // Click symbol name → navigate to trade page with that symbol
   list.querySelectorAll('.pos-sym-link[data-nav-symbol]').forEach(el => {
@@ -837,7 +585,7 @@ function handlePositionUpdated(event) {
         margin: d.margin || 0, notional: d.notional || 0,
         leverage: d.leverage || 1, liquidationPrice: d.liquidationPrice || 0,
         markPrice: d.entryPrice, unrealizedPnl: 0, pnlPercent: 0,
-        openedAt: new Date().toISOString(), babysitterExcluded: d.babysitterExcluded ?? false,
+        openedAt: new Date().toISOString(),
       };
       positionsData.push(cached);
     }
@@ -853,9 +601,7 @@ function handlePositionUpdated(event) {
     const pnlClass = formatPnlClass(pnl);
     const elapsed = pos.openedAt ? getTimeHeld(pos.openedAt) : '—';
     const displayMarkPrice = pos.markPrice || pos.entryPrice;
-    const babysitterOn = !pos.babysitterExcluded;
-    const babysitterLabel = babysitterOn ? 'Babysitter On' : 'Babysitter Off';
-    const babysitterClass = babysitterOn ? 'on' : 'off';
+
 
     const tmp = document.createElement('div');
     tmp.innerHTML = `
@@ -868,14 +614,6 @@ function handlePositionUpdated(event) {
             <span class="pos-sym-link" data-nav-symbol="${pos.symbol}" style="cursor:pointer;">${pos.symbol.split('/')[0]}</span>
             <span class="badge badge-${pos.side.toLowerCase()}">${pos.side}</span>
             <span style="font-size: 11px; color: var(--text-muted);">${pos.leverage}x</span>
-            <button
-              class="bbs-symbol-toggle ${babysitterClass}"
-              data-bbs-toggle-pos="${pos.id}"
-              data-bbs-excluded="${pos.babysitterExcluded ? '1' : '0'}"
-              title="Toggle babysitter for this position"
-            >
-              ${babysitterLabel}
-            </button>
             <span data-opened-at="${pos.openedAt || ''}" style="font-size: 10px; color: var(--text-muted); margin-left: 4px;">⏱ ${elapsed}</span>
           </div>
           <div class="position-pnl ${pnlClass}">
@@ -917,7 +655,6 @@ function handlePositionUpdated(event) {
           <input type="number" id="limit-price-${pos.id}" placeholder="Limit price" step="0.01" value="${formatPrice(pos.entryPrice)}" />
           <button class="btn btn-outline btn-sm" data-submit-limit="${pos.id}" style="border-color: var(--accent); color: var(--accent);">Set</button>
         </div>
-        <div class="bbs-features-row" id="bbs-feat-${pos.id}"></div>
       </div>
     `;
 
@@ -933,10 +670,7 @@ function handlePositionUpdated(event) {
     });
     newCard.querySelector('[data-submit-limit]')?.addEventListener('click', () =>
       submitLimitClose(pos.id));
-    newCard.querySelector('[data-bbs-toggle-pos]')?.addEventListener('click', (e) => {
-      e.stopPropagation();
-      toggleBabysitterForPosition(pos.id, !babysitterOn);
-    });
+
     newCard.querySelector('.pos-sym-link[data-nav-symbol]')?.addEventListener('click', (e) => {
       e.stopPropagation();
       localStorage.setItem('pms_last_symbol', pos.symbol);
@@ -1109,7 +843,7 @@ function cleanupListeners() {
   if (_listeners.reduced) window.removeEventListener('position_reduced', _listeners.reduced);
   if (_listeners.filled) window.removeEventListener('order_filled', _listeners.filled);
   if (_listeners.positionUpdated) window.removeEventListener('position_updated', _listeners.positionUpdated);
-  if (_listeners.babysitterFeatures) window.removeEventListener('babysitter_features', _listeners.babysitterFeatures);
+
 }
 
 export function cleanup() {

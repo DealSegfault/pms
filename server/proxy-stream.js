@@ -275,26 +275,6 @@ async function routeEvent(event) {
                 const base = rawSymbol.replace('USDT', '');
                 const ccxtSymbol = `${base}/USDT:USDT`;
 
-                // Skip if ALL open virtual positions for this symbol belong to
-                // babysitter-managed accounts — use in-memory book (no DB query)
-                const accountIds = riskEngine.book.getAccountsForSymbol(ccxtSymbol);
-                if (accountIds && accountIds.size > 0) {
-                    let allBabysitter = true;
-                    for (const aid of accountIds) {
-                        const entry = riskEngine.book.getEntry(aid);
-                        if (entry) {
-                            for (const pos of entry.positions.values()) {
-                                if (pos.symbol === ccxtSymbol && pos.babysitterExcluded) {
-                                    allBabysitter = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if (!allBabysitter) break;
-                    }
-                    if (allBabysitter) continue;
-                }
-
                 // Get close price from recent fills or mark price
                 let closePrice = recentFills.get(ccxtSymbol)?.price;
                 if (!closePrice && exchangeRef) {
@@ -302,7 +282,7 @@ async function routeEvent(event) {
                 }
 
                 if (closePrice) {
-                    // Skip if another path (closePosition, babysitter) already closed this symbol
+                    // Skip if another path already closed this symbol
                     if (isRecentlyClosed(ccxtSymbol)) {
                         console.log(`[ProxyStream] Skipping reconcile for ${ccxtSymbol} — recently closed by another path`);
                         continue;

@@ -152,7 +152,6 @@ export class PositionBook {
             entryPrice: p.entryPrice, quantity: p.quantity,
             notional: p.notional, leverage: p.leverage,
             margin: p.margin, liquidationPrice: p.liquidationPrice,
-            babysitterExcluded: p.babysitterExcluded ?? false,
             openedAt: p.openedAt || null,
         };
     }

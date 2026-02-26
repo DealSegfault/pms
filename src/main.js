@@ -65,7 +65,7 @@ function handleBotStatusCloseTransitions(botStatus) {
         const pnlText = pnlDelta == null ? '' : ` PnL: $${pnlDelta.toFixed(2)}`;
 
         showToast(
-            `📊 Babysitter closed: ${base}${pnlText}`,
+            `📊 Position closed: ${base}${pnlText}`,
             pnlDelta == null ? 'warning' : (pnlDelta >= 0 ? 'success' : 'warning'),
         );
 
@@ -73,7 +73,7 @@ function handleBotStatusCloseTransitions(botStatus) {
             subAccountId,
             symbol,
             realizedPnl: pnlDelta,
-            reason: 'BABYSITTER',
+            reason: 'AUTO_CLOSE',
         };
 
         trackCloseEvent(subAccountId, symbol);

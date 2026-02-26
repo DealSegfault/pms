@@ -316,7 +316,7 @@ async function executeTwapTick(twap) {
                 quantity,
                 twap.leverage,
                 'MARKET',
-                { silentFillBroadcast: true, origin: 'TWAP', babysitterExcluded: twap.babysitterExcluded },
+                { silentFillBroadcast: true, origin: 'TWAP' },
             );
 
             twap.filledLots++;
@@ -346,7 +346,6 @@ async function executeTwapTick(twap) {
                     fillFee: fillResult.fee,
                     silentFillBroadcast: true,
                     origin: 'TWAP',
-                    babysitterExcluded: twap.babysitterExcluded,
                 },
             );
 
@@ -419,7 +418,7 @@ function finishTwap(twap, reason) {
 // POST /api/trade/twap - Start a TWAP order
 router.post('/twap', requireOwnership('body'), async (req, res) => {
     try {
-        const { subAccountId, symbol, side, totalSize, lots, durationMinutes, leverage, jitter, irregular, babysitterExcluded, priceLimit } = req.body;
+        const { subAccountId, symbol, side, totalSize, lots, durationMinutes, leverage, jitter, irregular, priceLimit } = req.body;
         if (!subAccountId || !symbol || !side || !totalSize || !lots || !durationMinutes || !leverage) {
             return res.status(400).json({ error: 'Missing required fields: subAccountId, symbol, side, totalSize, lots, durationMinutes, leverage' });
         }
@@ -490,7 +489,6 @@ router.post('/twap', requireOwnership('body'), async (req, res) => {
             timerId: null,
             results: [],
             errors: [],
-            babysitterExcluded: babysitterExcluded ?? undefined,
             priceLimit: parsedPriceLimit,
             skippedTicks: 0,
         };
@@ -748,13 +746,13 @@ async function executeTwapBasketTick(basket) {
             // Market fallback or record limit fill
             let success = false;
             if (!filled) {
-                const result = await riskEngine.executeTrade(basket.subAccountId, leg.symbol, leg.side, quantity, leg.leverage, 'MARKET', { babysitterExcluded: basket.babysitterExcluded });
+                const result = await riskEngine.executeTrade(basket.subAccountId, leg.symbol, leg.side, quantity, leg.leverage, 'MARKET', {});
                 success = result.success;
                 if (!success) console.warn(`[TWAP-Basket ${basket.id}] ${leg.symbol} market failed:`, result.errors);
             } else {
                 const result = await riskEngine.executeTrade(
                     basket.subAccountId, leg.symbol, leg.side, fillResult.quantity, leg.leverage,
-                    'MARKET', { skipExchange: true, fillPrice: fillResult.price, fillFee: fillResult.fee, babysitterExcluded: basket.babysitterExcluded },
+                    'MARKET', { skipExchange: true, fillPrice: fillResult.price, fillFee: fillResult.fee },
                 );
                 success = true; // exchange already filled
             }
@@ -813,7 +811,7 @@ function finishTwapBasket(basket, reason) {
 // POST /api/trade/twap-basket - Start a TWAP basket (index TWAP)
 router.post('/twap-basket', requireOwnership('body'), async (req, res) => {
     try {
-        const { subAccountId, legs, basketName, lots, durationMinutes, jitter, irregular, babysitterExcluded } = req.body;
+        const { subAccountId, legs, basketName, lots, durationMinutes, jitter, irregular } = req.body;
         if (!subAccountId || !Array.isArray(legs) || legs.length === 0 || !lots || !durationMinutes) {
             return res.status(400).json({ error: 'Missing required fields: subAccountId, legs[], lots, durationMinutes' });
         }
@@ -893,7 +891,6 @@ router.post('/twap-basket', requireOwnership('body'), async (req, res) => {
             nextOrderAt: Date.now(),
             timerId: null,
             results: [],
-            babysitterExcluded: babysitterExcluded ?? undefined,
         };
 
         if (activeTwapBaskets.size >= MAX_ACTIVE_TWAP_BASKETS) {

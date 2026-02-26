@@ -5,14 +5,12 @@ import { cuteSeedling, cuteCrystalBall } from '../lib/cute-empty.js';
 let _botStatusInterval = null;
 let _botStatusListener = null;
 let _botEventListener = null;
-let _babysitterStatusListener = null;
 
 export function renderAccountPage(container) {
   // Clear any previous bot polling & WS listeners
   if (_botStatusInterval) { clearInterval(_botStatusInterval); _botStatusInterval = null; }
   if (_botStatusListener) { window.removeEventListener('bot_status', _botStatusListener); _botStatusListener = null; }
   if (_botEventListener) { window.removeEventListener('bot_event', _botEventListener); _botEventListener = null; }
-  if (_babysitterStatusListener) { window.removeEventListener('bot_status', _babysitterStatusListener); _babysitterStatusListener = null; }
 
   const currentTheme = getTheme();
 
@@ -183,61 +181,10 @@ export function renderAccountPage(container) {
       </div>
 
 
-
-      <!-- ═══════════════════════════════════ -->
-      <!-- V7 BABYSITTER SECTION              -->
-      <!-- ═══════════════════════════════════ -->
-      <div class="glass-card bot-section" id="babysitter-section">
-        <div class="bot-header">
-          <div class="bot-header-left">
-            <div class="bot-icon">🐍</div>
-            <div>
-              <div class="card-title" style="margin:0;">V7 Babysitter</div>
-              <div class="bot-subtitle" id="babysitter-status-text">Per-position control from Trade/Positions list. TP mode below is saved per account.</div>
-            </div>
-          </div>
-        </div>
-
-        <!-- TP Mode Selector (always visible) -->
-        <div class="bot-settings-group" style="margin-top:12px;">
-          <div class="bot-settings-group-title" style="font-size:11px; color:var(--text-muted); margin-bottom:6px;">TP Strategy</div>
-          <select id="babysitter-tp-mode" style="width:100%; padding:8px 12px; background:var(--card-bg); color:var(--text-primary); border:1px solid var(--border); border-radius:8px; font-size:13px; cursor:pointer;">
-            <option value="auto">Auto (vol mode &gt; $50)</option>
-            <option value="fast">Fast TP (aggressive exits)</option>
-            <option value="vol">Vol TP (wider targets)</option>
-            <option value="long_short">Long/Short TP (signal-biased exits)</option>
-          </select>
-          <div style="font-size:10px; color:var(--text-muted); margin-top:4px;">This setting is saved per account and applied to new and active babysitter-managed positions.</div>
-          <div id="tp-mode-save-status" style="font-size:10px; margin-top:4px;"></div>
-        </div>
-
-        <!-- Babysitter Info (visible when active) -->
-        <div id="babysitter-info-panel" style="display:none; margin-top:12px;">
-          <div class="stat-grid">
-            <div class="stat-item">
-              <div class="stat-label">Active Grids</div>
-              <div class="stat-value" id="babysitter-active-grids">0</div>
-            </div>
-            <div class="stat-item">
-              <div class="stat-label">Total PnL</div>
-              <div class="stat-value" id="babysitter-total-pnl">$0.00</div>
-            </div>
-            <div class="stat-item">
-              <div class="stat-label">Trades</div>
-              <div class="stat-value" id="babysitter-trade-count">0</div>
-            </div>
-            <div class="stat-item">
-              <div class="stat-label">Exposure</div>
-              <div class="stat-value" id="babysitter-exposure">$0</div>
-            </div>
-          </div>
-        </div>
-      </div>
     </div>
   `;
 
   loadAccountStats();
-  initBabysitterSection();
   initApiKeySection();
   initWebAuthnSection();
 
@@ -1089,103 +1036,4 @@ async function pollBotStatus() {
   } catch (err) {
     // Silent fail — status polling is best-effort
   }
-}
-
-// ═══════════════════════════════════════════════════════
-// BABYSITTER SECTION — TP mode + live status (per-position control lives in Trade/Positions)
-// ═══════════════════════════════════════════════════════
-
-async function initBabysitterSection() {
-  if (!state.currentAccount) return;
-
-  const infoPanel = document.getElementById('babysitter-info-panel');
-  const statusText = document.getElementById('babysitter-status-text');
-
-  // Load account config for TP mode persistence.
-  try {
-    const config = await api(`/bot/config/${state.currentAccount}`);
-
-    // Load TP mode from config
-    const tpSelect = document.getElementById('babysitter-tp-mode');
-    if (tpSelect && config?.tpMode) {
-      tpSelect.value = config.tpMode;
-    }
-    // Auto-save on change
-    if (tpSelect) {
-      tpSelect.addEventListener('change', async () => {
-        try {
-          const statusEl = document.getElementById('tp-mode-save-status');
-          await api(`/bot/config/${state.currentAccount}`, {
-            method: 'PUT',
-            body: { tpMode: tpSelect.value },
-          });
-          console.log(`[Babysitter] TP mode saved: ${tpSelect.value}`);
-          if (statusEl) {
-            statusEl.textContent = '✅ Saved';
-            statusEl.style.color = 'var(--green)';
-            setTimeout(() => { statusEl.textContent = ''; }, 2000);
-          }
-        } catch (err) {
-          console.error('Failed to save TP mode:', err);
-        }
-      });
-    }
-  } catch (err) {
-    console.warn('Babysitter init error:', err);
-  }
-
-  // Listen for babysitter status in bot_status WS events
-  _babysitterStatusListener = (e) => {
-    const data = e.detail;
-    if (data?.source !== 'v7' || data?.subAccountId !== state.currentAccount) return;
-
-    const v7 = data.v7 || {};
-    const engines = data.engines || [];
-    const gridsEl = document.getElementById('babysitter-active-grids');
-    const pnlEl = document.getElementById('babysitter-total-pnl');
-    const tradesEl = document.getElementById('babysitter-trade-count');
-    const exposureEl = document.getElementById('babysitter-exposure');
-
-    if (gridsEl) gridsEl.textContent = v7.activeGrids || 0;
-    if (pnlEl) {
-      pnlEl.textContent = formatUsd(v7.totalPnlUsd || 0, 4);
-      pnlEl.className = `stat-value ${formatPnlClass(v7.totalPnlUsd || 0)}`;
-    }
-    if (tradesEl) tradesEl.textContent = v7.totalTrades || 0;
-    if (exposureEl) exposureEl.textContent = `$${(v7.portfolioNotional || 0).toFixed(0)}`;
-    if (statusText) statusText.textContent = 'Active — managed per position (adjust per-position in Trade/Positions)';
-    if (infoPanel) infoPanel.style.display = '';
-
-    // Show resting stealth TP orders
-    let tpContainer = document.getElementById('babysitter-tp-orders');
-    if (!tpContainer) {
-      const infoPanel = document.getElementById('babysitter-info-panel');
-      if (infoPanel) {
-        const div = document.createElement('div');
-        div.id = 'babysitter-tp-orders';
-        div.style.marginTop = '10px';
-        infoPanel.appendChild(div);
-        tpContainer = div;
-      }
-    }
-    if (tpContainer) {
-      const tpEngines = engines.filter(eng => eng.restingTpPrice > 0);
-      if (tpEngines.length > 0) {
-        tpContainer.innerHTML = `
-          <div class="card-title" style="font-size:12px; margin-bottom:6px;">🎯 Resting TP Orders</div>
-          ${tpEngines.map(eng => {
-          const sym = (eng.symbol || '').replace('USDT', '').replace('/USDT:USDT', '');
-          const slices = eng.restingTpSlices > 1 ? ` (${eng.restingTpSlices} slices)` : '';
-          return `<div style="display:flex; justify-content:space-between; font-size:11px; padding:3px 0; color:var(--text-secondary);">
-              <span style="color:var(--green); font-weight:600;">BUY ${sym}</span>
-              <span style="font-family:var(--font-mono);">${formatPrice(eng.restingTpPrice)} × ${eng.restingTpQty.toFixed(2)}${slices}</span>
-            </div>`;
-        }).join('')}
-        `;
-      } else {
-        tpContainer.innerHTML = '';
-      }
-    }
-  };
-  window.addEventListener('bot_status', _babysitterStatusListener);
 }

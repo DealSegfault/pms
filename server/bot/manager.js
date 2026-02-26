@@ -11,7 +11,6 @@ import BotEngine from './engine.js';
 import riskEngine from '../risk/index.js';
 import exchange from '../exchange.js';
 import hotScanner from './hot-scanner.js';
-import babysitterManager from './babysitter-manager.js';
 
 
 
@@ -71,12 +70,7 @@ class BotManager {
         // Start the hot pair scanner (runs independently of bots)
         hotScanner.start();
 
-        if (this._wsEmitter) {
-            // Start babysitter manager (Redis command/status bridge)
-            babysitterManager.initialize(this._wsEmitter).catch(err => {
-                console.warn('[BotManager] Babysitter init error (non-fatal):', err.message);
-            });
-        }
+
 
         try {
             const activeBots = await prisma.botConfig.findMany({
@@ -443,20 +437,9 @@ class BotManager {
             // Include recent event log + hot pairs
             const events = this._eventLogs.get(subAccountId) || [];
             const hotPairs = hotScanner.getHotPairs();
-            const bbsStatus = babysitterManager.getStatus() || {};
-            const bbsUser = bbsStatus?.users?.[subAccountId] || null;
 
             this._wsEmitter('bot_status', {
                 subAccountId, ...status, events, hotPairs,
-                v7: bbsUser ? {
-                    connected: true,
-                    sessionId: bbsUser.session_id || '',
-                    activeGrids: (bbsUser.engines || []).filter(e => (e.layers || 0) > 0).length,
-                    portfolioNotional: bbsUser.portfolio_notional || 0,
-                    totalPnlUsd: bbsUser.total_pnl_usd || 0,
-                    totalTrades: bbsUser.total_trades || 0,
-                    engines: (bbsUser.engines || []).length,
-                } : { connected: false },
             });
         }
     }
@@ -549,7 +532,6 @@ class BotManager {
             this._scannerBroadcastTimer = null;
         }
         hotScanner.stop();
-        await babysitterManager.stop();
         for (const [accountId] of this._bots) {
             await this.stopBot(accountId, false);
         }

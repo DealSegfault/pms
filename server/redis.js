@@ -4,14 +4,7 @@ let redis = null;
 const RISK_SNAPSHOT_TTL_SEC = parseInt(process.env.RISK_SNAPSHOT_TTL_SEC || '120', 10);
 const STREAM_MAXLEN = parseInt(process.env.REDIS_STREAM_MAXLEN || '20000', 10);
 
-// ── Babysitter Redis Streams ──────────────────────
-export const BBS_COMMAND_STREAM = process.env.BBS_COMMAND_STREAM || 'pms:babysitter:commands';
-export const BBS_ACTION_STREAM = process.env.BBS_ACTION_STREAM || 'pms:babysitter:actions';
-export const BBS_STATUS_STREAM = process.env.BBS_STATUS_STREAM || 'pms:babysitter:status';
-export const BBS_STATUS_KEY = process.env.BBS_STATUS_KEY || 'pms:babysitter:status:last';
-export const BBS_HEARTBEAT_KEY = process.env.BBS_HEARTBEAT_KEY || 'pms:babysitter:heartbeat';
-export const BBS_ACTION_GROUP = process.env.BBS_ACTION_GROUP || 'pms-babysitter-actions';
-export const BBS_FEATURES_STREAM = process.env.BBS_FEATURES_STREAM || 'pms:babysitter:features';
+
 
 export function getRedis() {
     if (!redis) {
@@ -166,60 +159,7 @@ export async function streamReadFrom(stream, lastId = '$', { count = 10, blockMs
     }));
 }
 
-export async function publishBabysitterCommand(command, payload = {}) {
-    if (!redis) return null;
-    return streamAdd(BBS_COMMAND_STREAM, {
-        command: String(command || ''),
-        payload: _serializePayload(payload),
-        ts: String(Date.now()),
-    });
-}
 
-export async function publishBabysitterAction(action, payload = {}) {
-    if (!redis) return null;
-    return streamAdd(BBS_ACTION_STREAM, {
-        action: String(action || ''),
-        payload: _serializePayload(payload),
-        ts: String(Date.now()),
-    });
-}
-
-export async function publishBabysitterStatus(status = {}) {
-    if (!redis) return null;
-    const payload = _serializePayload(status);
-    await redis.set(BBS_STATUS_KEY, payload, 'EX', 30);
-    return streamAdd(BBS_STATUS_STREAM, {
-        payload,
-        ts: String(Date.now()),
-    });
-}
-
-export async function getBabysitterStatus() {
-    if (!redis) return null;
-    try {
-        const raw = await redis.get(BBS_STATUS_KEY);
-        return raw ? JSON.parse(raw) : null;
-    } catch {
-        return null;
-    }
-}
-
-export async function setBabysitterHeartbeat(meta = {}) {
-    if (!redis) return false;
-    const payload = _serializePayload({ ...meta, ts: Date.now() });
-    await redis.set(BBS_HEARTBEAT_KEY, payload, 'EX', 15);
-    return true;
-}
-
-export async function getBabysitterHeartbeat() {
-    if (!redis) return null;
-    try {
-        const raw = await redis.get(BBS_HEARTBEAT_KEY);
-        return raw ? JSON.parse(raw) : null;
-    } catch {
-        return null;
-    }
-}
 
 // ── Order Mapping ────────────────────────────────
 // Maps exchange order IDs to sub-account ownership

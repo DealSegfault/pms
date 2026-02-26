@@ -162,10 +162,6 @@ export function createWsClient({
                     return;
                 }
 
-                if (msg.type === 'babysitter_features') {
-                    dispatchEvent('babysitter_features', msg.data);
-                    return;
-                }
 
                 if (msg.type === 'twap_progress') {
                     if (isMyEvent) dispatchEvent('twap_progress', msg.data);
@@ -220,32 +216,6 @@ export function createWsClient({
 
                 if (msg.type === 'chase_cancelled') {
                     if (isMyEvent) dispatchEvent('chase_cancelled', msg.data);
-                    return;
-                }
-
-                // ── SURF (Pump Chaser) events ──
-                if (msg.type === 'pump_chaser_progress') {
-                    if (isMyEvent) dispatchEvent('pump_chaser_progress', msg.data);
-                    return;
-                }
-
-                if (msg.type === 'pump_chaser_fill') {
-                    if (isMyEvent) dispatchEvent('pump_chaser_fill', msg.data);
-                    return;
-                }
-
-                if (msg.type === 'pump_chaser_scalp') {
-                    if (isMyEvent) dispatchEvent('pump_chaser_scalp', msg.data);
-                    return;
-                }
-
-                if (msg.type === 'pump_chaser_stopped') {
-                    if (isMyEvent) dispatchEvent('pump_chaser_stopped', msg.data);
-                    return;
-                }
-
-                if (msg.type === 'pump_chaser_deleverage') {
-                    if (isMyEvent) dispatchEvent('pump_chaser_deleverage', msg.data);
                     return;
                 }
 

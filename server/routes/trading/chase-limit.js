@@ -280,7 +280,7 @@ async function handlePriceTick(ch, price) {
 }
 
 function broadcastProgress(ch, bid, ask) {
-    // Internal chases (spawned by SURF etc.) don't broadcast their own progress
+    // Internal chases (spawned by scalper etc.) don't broadcast their own progress
     if (ch._internal) return;
     broadcast('chase_progress', {
         chaseId: ch.id,
@@ -310,7 +310,7 @@ async function handleChaseFilled(ch, orderStatus) {
         ch._unsubPrice = null;
     }
 
-    // Internal-only chases (pure algorithmic, no position tracking needed e.g. SURF)
+    // Internal-only chases (pure algorithmic, no position tracking needed e.g. scalper)
     if (ch._internal && !ch.parentScalperId && ch._onFill) {
         try {
             await ch._onFill(ch.fillPrice, ch.quantity, ch.id);
@@ -448,11 +448,11 @@ function startFillChecker() {
 // Start the fill checker once at module load
 startFillChecker();
 
-// ── Internal API (for SURF and other algos) ───────
+// ── Internal API (for Scalper and other algos) ───────
 
 /**
  * Start a chase order programmatically (no HTTP).
- * Used by SURF engine to spawn child orders for fills, scalps, and deleverages.
+ * Used by Scalper engine to spawn child orders.
  *
  * @param {Object} opts
  * @param {string} opts.subAccountId
@@ -463,7 +463,7 @@ startFillChecker();
  * @param {number} [opts.stalkOffsetPct=0]
  * @param {string} [opts.stalkMode='trail']
  * @param {number} [opts.maxDistancePct=0] — 0 = infinite
- * @param {string} [opts.orderType='CHASE_LIMIT'] — DB type: 'SURF_LIMIT', 'SURF_DELEVERAGE', 'SURF_SCALP'
+ * @param {string} [opts.orderType='CHASE_LIMIT'] — DB order type
  * @param {boolean} [opts.reduceOnly=false]
  * @param {Function} [opts.onFill] — (fillPrice, fillQty, chaseId) => void
  * @param {Function} [opts.onCancel] — (reason, chaseId) => void
@@ -476,7 +476,7 @@ export async function startChaseInternal(opts) {
         orderType = 'CHASE_LIMIT', reduceOnly = false,
         onFill, onCancel,
         parentScalperId = null,  // non-null → child of a scalper, stays visible in active list
-        internal = false,        // true → pure algorithmic, hidden from active list (SURF etc.)
+        internal = false,        // true → pure algorithmic, hidden from active list
     } = opts;
 
     if (!subAccountId || !symbol || !side || !quantity || !leverage) {

@@ -6,20 +6,12 @@
  *   PUT    /api/bot/config/:subAccountId  — Update bot config
  *   POST   /api/bot/toggle/:subAccountId  — Toggle bot on/off
  *   GET    /api/bot/status/:subAccountId  — Live bot status
- *
- * Babysitter (v7):
- *   POST   /api/bot/babysitter/enable     — Enable babysitter for sub-account
- *   POST   /api/bot/babysitter/disable    — Disable babysitter
- *   POST   /api/bot/babysitter/position/:posId/exclude  — Exclude position
- *   POST   /api/bot/babysitter/position/:posId/include  — Include position
- *   GET    /api/bot/babysitter/status      — Babysitter status
  */
 
 import { Router } from 'express';
 import prisma from '../db/prisma.js';
 import botManager from '../bot/manager.js';
-import babysitterManager from '../bot/babysitter-manager.js';
-import { requireOwnership, requirePositionOwnership } from '../ownership.js';
+import { requireOwnership } from '../ownership.js';
 import riskEngine from '../risk/index.js';
 const router = Router();
 
@@ -140,10 +132,7 @@ router.put('/config/:subAccountId', requireOwnership(), async (req, res) => {
             await botManager.reconfigure(subAccountId);
         }
 
-        // If tpMode changed, refresh babysitter so Python picks it up
-        if (cleaned.tpMode) {
-            await babysitterManager.refreshForSubAccount(subAccountId, 'tpMode_change');
-        }
+
 
         res.json(config);
     } catch (err) {
@@ -226,126 +215,6 @@ router.get('/status/:subAccountId', requireOwnership(), async (req, res) => {
         });
     } catch (err) {
         console.error('[BotAPI] Status error:', err.message);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ═══════════════════════════════════════════════════
-// BABYSITTER (V7) ROUTES
-// ═══════════════════════════════════════════════════
-
-// POST /babysitter/enable — Enable babysitter for a sub-account
-// Body: { subAccountId }
-router.post('/babysitter/enable', requireOwnership('body'), async (req, res) => {
-    try {
-        const { subAccountId } = req.body;
-        if (!subAccountId) {
-            return res.status(400).json({ error: 'subAccountId is required' });
-        }
-
-        const account = await prisma.subAccount.findUnique({
-            where: { id: subAccountId },
-        });
-        if (!account) return res.status(404).json({ error: 'Account not found' });
-
-        await babysitterManager.enableUser(subAccountId);
-
-        res.json({
-            enabled: true,
-            message: 'Babysitter enabled — v7 grid strategy is now managing this account',
-        });
-    } catch (err) {
-        console.error('[BotAPI] Babysitter enable error:', err.message);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// POST /babysitter/disable — Disable babysitter for a sub-account
-// Body: { subAccountId }
-router.post('/babysitter/disable', requireOwnership('body'), async (req, res) => {
-    try {
-        const { subAccountId } = req.body;
-        if (!subAccountId) {
-            return res.status(400).json({ error: 'subAccountId is required' });
-        }
-
-        await babysitterManager.disableUser(subAccountId);
-
-        res.json({
-            enabled: false,
-            message: 'Babysitter disabled',
-        });
-    } catch (err) {
-        console.error('[BotAPI] Babysitter disable error:', err.message);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// POST /babysitter/position/:posId/exclude — Exclude position from babysitter
-router.post('/babysitter/position/:posId/exclude', requirePositionOwnership('posId'), async (req, res) => {
-    try {
-        const { posId } = req.params;
-        const pos = await prisma.virtualPosition.findUnique({
-            where: { id: posId },
-        });
-        if (!pos) return res.status(404).json({ error: 'Position not found' });
-
-        await babysitterManager.excludePosition(pos.subAccountId, posId);
-
-        res.json({ excluded: true, positionId: posId });
-    } catch (err) {
-        console.error('[BotAPI] Position exclude error:', err.message);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// POST /babysitter/position/:posId/include — Re-include position in babysitter
-router.post('/babysitter/position/:posId/include', requirePositionOwnership('posId'), async (req, res) => {
-    try {
-        const { posId } = req.params;
-        const pos = await prisma.virtualPosition.findUnique({
-            where: { id: posId },
-        });
-        if (!pos) return res.status(404).json({ error: 'Position not found' });
-
-        await babysitterManager.includePosition(pos.subAccountId, posId);
-
-        res.json({ excluded: false, positionId: posId });
-    } catch (err) {
-        console.error('[BotAPI] Position include error:', err.message);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// POST /babysitter/close-position — Python babysitter callback to close a position (exchange-first)
-router.post('/babysitter/close-position', async (req, res) => {
-    try {
-        const { positionId, closePrice, reason } = req.body;
-        if (!positionId || !closePrice) {
-            return res.status(400).json({ error: 'positionId and closePrice are required' });
-        }
-        const result = await riskEngine.closeVirtualPositionByPrice(
-            positionId, parseFloat(closePrice), reason || 'BABYSITTER_TP'
-        );
-        console.log(`[BotAPI] Babysitter close-position: ${positionId} @ ${closePrice} → ${result.success ? 'OK' : result.error}`);
-        res.json(result);
-    } catch (err) {
-        console.error('[BotAPI] Babysitter close-position error:', err.message);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// GET /babysitter/status — Get babysitter process + per-user status
-router.get('/babysitter/status', async (req, res) => {
-    try {
-        const connected = await babysitterManager.isConnected();
-        res.json({
-            running: babysitterManager.isRunning(),
-            connected,
-            status: babysitterManager.getStatus() || {},
-        });
-    } catch (err) {
-        console.error('[BotAPI] Babysitter status error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });

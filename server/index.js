@@ -26,12 +26,11 @@ import historyRouter, { initHistory } from './routes/history.js';
 import botRouter from './routes/bot.js';
 import webauthnRouter from './routes/webauthn.js';
 import botManager from './bot/manager.js';
-import babysitterActionConsumer from './bot/babysitter-action-consumer.js';
-import babysitterProcess from './bot/babysitter-process.js';
+
 import { resumeActiveTwaps } from './routes/trading/twap.js';
 import { resumeActiveTrailStops, initTrailStopCleanup } from './routes/trading/trail-stop.js';
 import { resumeActiveChaseOrders, initChaseCleanup } from './routes/trading/chase-limit.js';
-import { resumeActivePumpChasers, initPumpChaserCleanup } from './routes/trading/pump-chaser.js';
+
 
 dotenv.config();
 
@@ -111,31 +110,7 @@ app.get('/api/health', async (req, res) => {
     });
 });
 
-// ── Internal bot callbacks (localhost-only Python babysitter) ──
-// Restricted to loopback addresses only
-app.post('/api/bot/babysitter/close-position', async (req, res) => {
-    // Enforce localhost-only access
-    const ip = req.ip || req.connection?.remoteAddress || '';
-    const isLocal = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
-    if (!isLocal) {
-        console.warn(`[BotAPI] Blocked babysitter call from non-local IP: ${ip}`);
-        return res.status(403).json({ error: 'Forbidden — localhost only' });
-    }
-    try {
-        const { positionId, closePrice, reason } = req.body;
-        if (!positionId || !closePrice) {
-            return res.status(400).json({ error: 'positionId and closePrice are required' });
-        }
-        const result = await riskEngine.closeVirtualPositionByPrice(
-            positionId, parseFloat(closePrice), reason || 'BABYSITTER_TP'
-        );
-        console.log(`[BotAPI] Babysitter close-position: ${positionId} @ ${closePrice} → ${result.success ? 'OK' : result.error}`);
-        res.json(result);
-    } catch (err) {
-        console.error('[BotAPI] Babysitter close-position error:', err.message);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
+
 
 // ── Protected routes (require auth) ──────────────
 const auth = flexAuthMiddleware();
@@ -200,10 +175,7 @@ async function start() {
     try {
         // Try Redis (optional)
         const redisReady = await initRedis();
-        if (redisReady) {
-            await babysitterActionConsumer.start();
-            babysitterProcess.start();
-        }
+
 
         // Connect to Binance
         const exchangeReady = await exchange.initialize({ allowDegraded: true });
@@ -249,10 +221,6 @@ async function start() {
                 console.warn('[Server] Chase resume failed:', err.message);
             }
             initChaseCleanup();
-            try { await resumeActivePumpChasers(); } catch (err) {
-                console.warn('[Server] Pump chaser resume failed:', err.message);
-            }
-            initPumpChaserCleanup();
         }
 
         // Kill any stale process holding the port before we try to listen (dev only)
@@ -280,9 +248,7 @@ start();
 async function gracefulShutdown(signal) {
     console.log(`\n[Shutdown] Received ${signal}, cleaning up...`);
     try {
-        // Stop babysitter first and WAIT for child process to die
-        await babysitterProcess.stop();
-        await babysitterActionConsumer.stop();
+
         riskEngine.stopMonitoring();
         stopPositionSync();
         stopOrderSync();

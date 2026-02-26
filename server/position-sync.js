@@ -67,13 +67,6 @@ async function reconcile() {
 
         if (virtualPositions.length === 0) return;
 
-        // Babysitter-managed positions use separate sub-account API keys and must
-        // not be reconciled against the parent exchange stream.
-        // Per-position control: babysitterExcluded=true means manual/reconcilable.
-        const reconcilablePositions = virtualPositions.filter((vp) => vp.babysitterExcluded);
-
-        if (reconcilablePositions.length === 0) return;
-
         // Get real exchange positions
         let realPositions;
         try {
@@ -88,7 +81,7 @@ async function reconcile() {
 
         // Find virtual positions whose symbol has NO real exchange position
         const orphanedSymbols = new Set();
-        for (const vp of reconcilablePositions) {
+        for (const vp of virtualPositions) {
             if (!realSymbols.has(vp.symbol)) {
                 orphanedSymbols.add(vp.symbol);
             }

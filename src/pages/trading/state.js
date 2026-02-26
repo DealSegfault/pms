@@ -51,7 +51,7 @@ export let _compactPollInterval = null;
 export let _chartRiskRefreshTimer = null;
 export let _chartAnnotationFingerprint = null;
 export let _chartAnnotationForceNext = false;
-export const _compactBabysitterBusy = new Set();
+
 
 // ── Live Equity / UPNL ──────────────────────────────────
 export let _cachedBalance = 0;
@@ -97,7 +97,7 @@ export let _marginUpdateHandler = null;
 export let _pnlUpdateHandler = null;
 
 // ── Edit Mode (prefill-and-update complex orders) ─────────────
-// { type: 'TWAP'|'TRAIL'|'CHASE'|'SCALPER'|'SURF', orderId: string }
+// { type: 'TWAP'|'TRAIL'|'CHASE'|'SCALPER', orderId: string }
 export let _editState = null;
 
 // ── LocalStorage Helpers ─────────────────────────────────

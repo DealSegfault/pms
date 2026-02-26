@@ -52,7 +52,6 @@ export async function submitTwapOrder() {
 
     try {
         markOrderSent(latencyId);
-        const babysitterChecked = document.getElementById('babysitter-toggle')?.checked ?? false;
         const result = await api('/trade/twap', {
             method: 'POST',
             body: {
@@ -65,7 +64,6 @@ export async function submitTwapOrder() {
                 leverage: S.leverage,
                 jitter,
                 irregular,
-                babysitterExcluded: !babysitterChecked,
                 ...(priceLimit ? { priceLimit } : {}),
             },
         });

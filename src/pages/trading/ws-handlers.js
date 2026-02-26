@@ -413,8 +413,6 @@ export function setupAppEventListeners() {
                 const lev = d.leverage || 1;
                 const margin = d.margin || 0;
                 const liqPrice = d.liquidationPrice || 0;
-                const babysitterExcluded = d.babysitterExcluded ?? false;
-                const babysitterOn = !babysitterExcluded;
 
                 const tmp = document.createElement('div');
                 tmp.innerHTML = `
@@ -432,7 +430,6 @@ export function setupAppEventListeners() {
                     <span class="cpr-pnl pnl-up" data-cppnl-id="${d.positionId}" data-cp-prev-pnl="0">
                       +0.00 <small>(+0.0%)</small>
                     </span>
-                    <button class="cpr-bbs ${babysitterOn ? 'on' : 'off'}" data-cp-bbs="${d.positionId}" data-cp-bbs-excluded="${babysitterExcluded ? '1' : '0'}" title="Toggle babysitter for this position">${babysitterOn ? 'On' : 'Off'}</button>
                     <span class="cpr-close" data-cp-close="${d.positionId}" data-cp-close-sym="${d.symbol}" title="Market Close">✕</span>
                   </div>
                 `;
@@ -656,197 +653,103 @@ export function setupAppEventListeners() {
         scheduleTradingRefresh({ account: true }, 500);
     });
 
-    // SURF events — live chart visualization + status updates
-    mkHandler('pump_chaser_progress', (e) => {
-        if (!S._tradingMounted) return;
-        const data = e.detail;
-        // Update chart lines
-        import('./pump-chaser.js').then(m => m.drawLivePumpChaser(data));
 
-        // Live-update the open orders row for this SURF (no full refresh needed)
-        const row = document.querySelector(`[data-pc-id="${data.pumpChaserId}"]`);
-        if (row) {
-            const stateEl = row.querySelector('.oor-price span:first-child');
-            if (stateEl) stateEl.textContent = data.state || '\u2014';
-            const detailEl = row.querySelector('.oor-price span:last-child');
-            if (detailEl) detailEl.textContent = `${data.fillCount || 0} fills \u00b7 ${(data.amplitude || 0).toFixed(1)}%`;
-            const posPct = data.maxNotional > 0 ? Math.round(((data.positionNotional || 0) / data.maxNotional) * 100) : 0;
-            const barEl = row.querySelector('.oor-qty div div');
-            if (barEl) {
-                barEl.style.width = `${posPct}%`;
-                barEl.style.background = data.state === 'DELEVERAGING' ? '#f43f5e' : '';
-            }
-            const pctLabel = row.querySelector('.oor-qty > span');
-            if (pctLabel) pctLabel.textContent = `${posPct}% of max`;
-            const pnlEl = row.querySelector('.oor-notional');
-            if (pnlEl) {
-                const pnl = data.netPnl || 0;
-                pnlEl.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
-                pnlEl.textContent = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`;
-            }
-        } else {
-            // Row not yet rendered — trigger a full open orders refresh
-            scheduleTradingRefresh({ positions: true, openOrders: true, account: true }, 30);
-        }
-    });
+// Scalper events
+// Note: scalper_progress is NOT handled here — child chases broadcast
+// chase_progress individually, which drawLiveChase already handles.
+// scalper_progress is only fired for fill count updates on the parent row.
+// scalper_progress: updates parent row fill count + per-slot backoff countdown
+mkHandler('scalper_progress', (e) => {
+    if (!S._tradingMounted) return;
+    const data = e.detail;
+    if (!data?.scalperId) return;
 
-    mkHandler('pump_chaser_fill', (e) => {
-        if (!S._tradingMounted) return;
-        const data = e.detail;
-        const fill = data.fill || {};
-        const sym = data.symbol ? data.symbol.split('/')[0] : '';
-        const sideLabel = data.side === 'LONG' ? 'L' : 'S';
-        import('../../core/index.js').then(({ showToast, formatPrice }) => {
-            const price = fill.price || 0;
-            const fillNum = fill.fillNum || '?';
-            const amp = (fill.amplitude || 0).toFixed(1);
-            const notional = (fill.notional || 0).toFixed(0);
-            const action = data.side === 'LONG' ? 'buy' : 'sell';
-            showToast(`\ud83c\udfc4 SURF ${sideLabel} fill #${fillNum}: ${sym} ${action} @ $${formatPrice(price)} \u2014 $${notional} \u00b7 ${amp}% amp`, 'success');
-        }).catch(() => { });
-        scheduleTradingRefresh({ account: true }, 500);
-    });
+    // 1. Update parent row fill count
+    const row = document.querySelector(`[data-scalper-id="${data.scalperId}"]`);
+    if (row) {
+        const fillEl = row.querySelector('.oor-price span:last-child');
+        if (fillEl) fillEl.textContent = `${data.fillCount || 0} fills`;
+    }
 
-    mkHandler('pump_chaser_scalp', (e) => {
-        if (!S._tradingMounted) return;
-        const data = e.detail;
-        const rt = data.roundTrip || {};
-        const sym = data.symbol ? data.symbol.split('/')[0] : '';
-        const sideLabel = data.side === 'LONG' ? 'L' : 'S';
-        import('../../core/index.js').then(({ showToast, formatPrice }) => {
-            const profit = rt.profit || 0;
-            const total = data.totalScalpProfit || 0;
-            showToast(`\u26a1 SURF ${sideLabel} scalp: ${sym} +$${profit.toFixed(3)} (total: +$${total.toFixed(2)})`, 'info');
-        }).catch(() => { });
-        scheduleTradingRefresh({ account: true }, 500);
-    });
+    // 2. Update per-slot badges in drawer (paused / retry countdown)
+    const drawer = document.querySelector(`[data-scalper-drawer="${data.scalperId}"]`);
+    if (!drawer) return;
 
-    mkHandler('pump_chaser_stopped', (e) => {
-        if (!S._tradingMounted) return;
-        const data = e.detail;
-        if (data.pumpChaserId) {
-            import('./pump-chaser.js').then(m => m.removePumpChaser(data.pumpChaserId));
-        }
-        const sym = data.symbol ? data.symbol.split('/')[0] : '';
-        const sideLabel = data.side === 'LONG' ? 'L' : 'S';
-        const reason = data.reason || 'completed';
-        const pnl = data.netPnl || 0;
-        const fills = data.fills || 0;
-        const scalp = data.scalpProfit || 0;
-        import('../../core/index.js').then(({ showToast }) => {
-            showToast(`\ud83c\udfc1 SURF ${sideLabel} stopped (${reason}): ${sym} \u2014 ${fills} fills \u00b7 scalp +$${scalp.toFixed(2)} \u00b7 net ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`, pnl >= 0 ? 'success' : 'warning');
-        }).catch(() => { });
-        scheduleTradingRefresh({ openOrders: true, positions: true, account: true }, 300);
-    });
+    const allSlots = [...(data.longSlots || []), ...(data.shortSlots || [])];
+    const slotsWithRetry = allSlots.filter(s => s.retryAt && !s.active);
 
-    mkHandler('pump_chaser_deleverage', (e) => {
-        if (!S._tradingMounted) return;
-        const data = e.detail;
-        const sym = data.symbol ? data.symbol.split('/')[0] : '';
-        const sideLabel = data.side === 'LONG' ? 'L' : 'S';
-        const freed = data.deleverage?.freedNotional || 0;
-        import('../../core/index.js').then(({ showToast, formatPrice }) => {
-            showToast(`\ud83d\udcc9 SURF ${sideLabel} deleverage: ${sym} \u2014 freed $${freed.toFixed(2)} @ $${formatPrice(data.deleverage?.price || 0)}`, 'info');
-        }).catch(() => { });
-        scheduleTradingRefresh({ account: true }, 500);
-    });
+    // Clear any previous countdown interval for this scalper
+    const prevTimer = drawer._scalperCountdownTimer;
+    if (prevTimer) clearInterval(prevTimer);
 
-    // Scalper events
-    // Note: scalper_progress is NOT handled here — child chases broadcast
-    // chase_progress individually, which drawLiveChase already handles.
-    // scalper_progress is only fired for fill count updates on the parent row.
-    // scalper_progress: updates parent row fill count + per-slot backoff countdown
-    mkHandler('scalper_progress', (e) => {
-        if (!S._tradingMounted) return;
-        const data = e.detail;
-        if (!data?.scalperId) return;
+    function updateSlotBadges() {
+        const now = Date.now();
+        for (const slot of allSlots) {
+            // Slot DOM node keyed by layer side+idx
+            const key = `${slot.layerIdx}`;
+            const badge = drawer.querySelector(`[data-slot-badge="${key}"]`);
+            if (!badge) continue;
 
-        // 1. Update parent row fill count
-        const row = document.querySelector(`[data-scalper-id="${data.scalperId}"]`);
-        if (row) {
-            const fillEl = row.querySelector('.oor-price span:last-child');
-            if (fillEl) fillEl.textContent = `${data.fillCount || 0} fills`;
-        }
-
-        // 2. Update per-slot badges in drawer (paused / retry countdown)
-        const drawer = document.querySelector(`[data-scalper-drawer="${data.scalperId}"]`);
-        if (!drawer) return;
-
-        const allSlots = [...(data.longSlots || []), ...(data.shortSlots || [])];
-        const slotsWithRetry = allSlots.filter(s => s.retryAt && !s.active);
-
-        // Clear any previous countdown interval for this scalper
-        const prevTimer = drawer._scalperCountdownTimer;
-        if (prevTimer) clearInterval(prevTimer);
-
-        function updateSlotBadges() {
-            const now = Date.now();
-            for (const slot of allSlots) {
-                // Slot DOM node keyed by layer side+idx
-                const key = `${slot.layerIdx}`;
-                const badge = drawer.querySelector(`[data-slot-badge="${key}"]`);
-                if (!badge) continue;
-
-                if (slot.active) {
-                    badge.textContent = '●';
-                    badge.style.color = '#22c55e';
-                    badge.title = 'Active';
-                } else if (slot.paused) {
-                    badge.textContent = '⏸ paused';
-                    badge.style.color = '#f59e0b';
-                    badge.title = 'Price filter active — waiting for price to re-enter range';
-                } else if (slot.retryAt) {
-                    const secsLeft = Math.max(0, Math.ceil((slot.retryAt - now) / 1000));
-                    badge.textContent = secsLeft > 0 ? `⟳ ${secsLeft}s` : '⟳ soon';
-                    badge.style.color = '#f43f5e';
-                    badge.title = `Retry #${slot.retryCount} — retrying in ${secsLeft}s`;
-                } else {
-                    badge.textContent = '●';
-                    badge.style.color = '#6b7280';
-                    badge.title = 'Idle';
-                }
+            if (slot.active) {
+                badge.textContent = '●';
+                badge.style.color = '#22c55e';
+                badge.title = 'Active';
+            } else if (slot.paused) {
+                badge.textContent = '⏸ paused';
+                badge.style.color = '#f59e0b';
+                badge.title = 'Price filter active — waiting for price to re-enter range';
+            } else if (slot.retryAt) {
+                const secsLeft = Math.max(0, Math.ceil((slot.retryAt - now) / 1000));
+                badge.textContent = secsLeft > 0 ? `⟳ ${secsLeft}s` : '⟳ soon';
+                badge.style.color = '#f43f5e';
+                badge.title = `Retry #${slot.retryCount} — retrying in ${secsLeft}s`;
+            } else {
+                badge.textContent = '●';
+                badge.style.color = '#6b7280';
+                badge.title = 'Idle';
             }
         }
+    }
 
-        updateSlotBadges();
+    updateSlotBadges();
 
-        // Start live countdown if any slots are backing off
-        if (slotsWithRetry.length > 0) {
-            const timer = setInterval(() => {
-                const allDone = slotsWithRetry.every(s => !s.retryAt || Date.now() >= s.retryAt);
-                updateSlotBadges();
-                if (allDone) clearInterval(timer);
-            }, 1000);
-            drawer._scalperCountdownTimer = timer;
-        }
-    });
+    // Start live countdown if any slots are backing off
+    if (slotsWithRetry.length > 0) {
+        const timer = setInterval(() => {
+            const allDone = slotsWithRetry.every(s => !s.retryAt || Date.now() >= s.retryAt);
+            updateSlotBadges();
+            if (allDone) clearInterval(timer);
+        }, 1000);
+        drawer._scalperCountdownTimer = timer;
+    }
+});
 
-    mkHandler('scalper_filled', (e) => {
-        if (!S._tradingMounted) return;
-        const data = e.detail;
-        if (data?.side) playFillSound(data.side);
-        const sym = data?.symbol ? data.symbol.split('/')[0] : '';
-        import('../../core/index.js').then(({ showToast, formatPrice }) => {
-            showToast(`⚔️ Scalper ${data?.side} L${data?.layerIdx} filled @ $${formatPrice(data?.fillPrice || 0)} (${sym})`, 'info');
-        }).catch(() => { });
-        scheduleChartRiskRefresh();
-        scheduleTradingRefresh({ openOrders: true, account: true }, 500);
-    });
+mkHandler('scalper_filled', (e) => {
+    if (!S._tradingMounted) return;
+    const data = e.detail;
+    if (data?.side) playFillSound(data.side);
+    const sym = data?.symbol ? data.symbol.split('/')[0] : '';
+    import('../../core/index.js').then(({ showToast, formatPrice }) => {
+        showToast(`⚔️ Scalper ${data?.side} L${data?.layerIdx} filled @ $${formatPrice(data?.fillPrice || 0)} (${sym})`, 'info');
+    }).catch(() => { });
+    scheduleChartRiskRefresh();
+    scheduleTradingRefresh({ openOrders: true, account: true }, 500);
+});
 
-    mkHandler('scalper_cancelled', (e) => {
-        if (!S._tradingMounted) return;
-        const data = e.detail;
-        if (data?.scalperId) {
-            import('./scalper.js').then(m => m.clearScalperById(data.scalperId)).catch(() => { });
-        }
-        const sym = data?.symbol ? data.symbol.split('/')[0] : '';
-        import('../../core/index.js').then(({ showToast }) => {
-            showToast(`⚔️ Scalper stopped: ${sym}`, 'info');
-        }).catch(() => { });
-        scheduleTradingRefresh({ openOrders: true, positions: true, account: true }, 30);
-    });
+mkHandler('scalper_cancelled', (e) => {
+    if (!S._tradingMounted) return;
+    const data = e.detail;
+    if (data?.scalperId) {
+        import('./scalper.js').then(m => m.clearScalperById(data.scalperId)).catch(() => { });
+    }
+    const sym = data?.symbol ? data.symbol.split('/')[0] : '';
+    import('../../core/index.js').then(({ showToast }) => {
+        showToast(`⚔️ Scalper stopped: ${sym}`, 'info');
+    }).catch(() => { });
+    scheduleTradingRefresh({ openOrders: true, positions: true, account: true }, 30);
+});
 
-    S.set('_compactPosListeners', compactListeners);
+S.set('_compactPosListeners', compactListeners);
 
 }
 

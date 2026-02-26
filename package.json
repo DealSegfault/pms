@@ -13,7 +13,7 @@
     "db:studio": "prisma studio",
     "test": "node --test tests/",
     "test:unit": "node --test tests/index-builder.test.js tests/pair-beta-builder.test.js tests/cross-margin-risk.test.js tests/tp-mode-api.test.js tests/liquidation.test.js",
-    "test:integration": "node --test tests/auth.test.js tests/sub-accounts.test.js tests/trading.test.js tests/babysitter-manager.test.js tests/babysitter-close-exchange.test.js tests/reconcile-babysitter.test.js tests/trade-executor.reconcile-balance.test.js",
+    "test:integration": "node --test tests/auth.test.js tests/sub-accounts.test.js tests/trading.test.js tests/trade-executor.reconcile-balance.test.js",
     "test:live": "node tests/liquidation-live.test.js",
     "test:auth": "node --test tests/auth.test.js",
     "test:accounts": "node --test tests/sub-accounts.test.js",

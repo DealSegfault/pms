@@ -190,7 +190,6 @@ function attachEventListeners() {
         else if (S.orderType === 'SCALE') submitScaleOrder();
         else if (S.orderType === 'LIMIT') submitLimitOrder();
         else if (S.orderType === 'CHASE') { import('./chase-limit.js').then(m => m.submitChase()); }
-        else if (S.orderType === 'SURF') { import('./pump-chaser.js').then(m => m.submitPumpChaser()); }
         else if (S.orderType === 'SCALPER') { import('./scalper.js').then(m => m.submitScalper()); }
         else submitTrade();
     });
@@ -246,37 +245,6 @@ function attachEventListeners() {
         import('./chase-limit.js').then(m => m.updateChasePreview());
     });
 
-    // ── Surf controls ──
-    document.getElementById('surf-scalp-ratio')?.addEventListener('input', e => {
-        const v = parseInt(e.target.value) || 60;
-        const el = document.getElementById('surf-scalp-val');
-        if (el) el.textContent = `${v}%`;
-        import('./pump-chaser.js').then(m => m.updatePumpChaserPreview());
-    });
-    document.getElementById('surf-offset-bps')?.addEventListener('input', e => {
-        const v = parseFloat(e.target.value) || 0.3;
-        const el = document.getElementById('surf-offset-val');
-        if (el) el.textContent = v.toFixed(1);
-        import('./pump-chaser.js').then(m => m.updatePumpChaserPreview());
-    });
-    // Max Position slider ↔ input sync
-    const maxPosSlider = document.getElementById('surf-max-pos-slider');
-    const maxPosInput = document.getElementById('surf-max-pos');
-    const maxPosLabel = document.getElementById('surf-max-pos-val');
-    function syncMaxPos(val) {
-        if (maxPosLabel) maxPosLabel.textContent = `$${val}`;
-        import('./pump-chaser.js').then(m => m.updatePumpChaserPreview());
-    }
-    maxPosSlider?.addEventListener('input', e => {
-        const v = parseInt(e.target.value) || 500;
-        if (maxPosInput) maxPosInput.value = v;
-        syncMaxPos(v);
-    });
-    maxPosInput?.addEventListener('input', e => {
-        const v = parseInt(e.target.value) || 500;
-        if (maxPosSlider) maxPosSlider.value = Math.min(v, 5000);
-        syncMaxPos(v);
-    });
 
     // ── Scalper controls ──
     document.getElementById('scalper-long-offset')?.addEventListener('input', e => {

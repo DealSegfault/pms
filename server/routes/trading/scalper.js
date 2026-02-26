@@ -853,7 +853,6 @@ async function onChildFill(sp, legSide, layerIdx, fillPrice, fillQty) {
                         leverage: pos.leverage,
                         margin: pos.margin,
                         liquidationPrice: pos.liquidationPrice || 0,
-                        babysitterExcluded: pos.babysitterExcluded ?? false,
                     });
                 }
             }

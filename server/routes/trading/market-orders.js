@@ -13,7 +13,7 @@ const router = Router();
 router.post('/', requireOwnership('body'), async (req, res) => {
     try {
         const startedAt = Date.now();
-        const { subAccountId, symbol, side, quantity, leverage, fastExecution, fallbackPrice, babysitterExcluded, reduceOnly } = req.body;
+        const { subAccountId, symbol, side, quantity, leverage, fastExecution, fallbackPrice, reduceOnly } = req.body;
 
         if (!subAccountId || !symbol || !side || !quantity || !leverage) {
             return res.status(400).json({ error: 'Missing required fields: subAccountId, symbol, side, quantity, leverage' });
@@ -40,7 +40,6 @@ router.post('/', requireOwnership('body'), async (req, res) => {
                 fastExecution: fastExecution !== false,
                 fallbackPrice: normalizedFallbackPrice,
                 origin: 'MANUAL',
-                ...(typeof babysitterExcluded === 'boolean' ? { babysitterExcluded } : {}),
                 ...(reduceOnly ? { reduceOnly: true } : {}),
             },
         );

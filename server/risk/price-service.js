@@ -2,7 +2,7 @@
  * PriceService — Single source of truth for mark prices.
  *
  * Maintains a local price cache fed by exchange tick events.
- * Falls back to Redis price cache (shared with Python babysitter),
+ * Falls back to Redis price cache,
  * then REST when WS prices are stale.
  * Injectable exchange dependency for testability.
  */
@@ -58,7 +58,7 @@ export class PriceService {
             return wsPrice;
         }
 
-        // 2. Try Redis price cache (cross-system: may have been written by Python babysitter)
+        // 2. Try Redis price cache (cross-system)
         try {
             const cached = await getPriceCache(symbol);
             if (cached && cached.mark && (now - cached.ts) < PRICE_STALE_MS) {

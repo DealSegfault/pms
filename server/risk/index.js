@@ -103,12 +103,7 @@ class RiskEngine {
         return result;
     }
 
-    /** Close a babysitter position (exchange-first, optional virtual fallback). */
-    async closeVirtualPositionByPrice(...args) {
-        const result = await this.tradeExecutor.closeVirtualPositionByPrice(...args);
-        this._positionsDirty = true;
-        return result;
-    }
+
 
     /** Get risk rules for an account. */
     async getRules(...args) {

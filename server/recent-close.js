@@ -9,7 +9,7 @@
 const recentlyClosed = new Map(); // symbol → timestamp
 
 /**
- * Mark a symbol as recently closed by another path (closePosition, babysitter, etc.).
+ * Mark a symbol as recently closed by another path (closePosition, etc.).
  * Prevents proxy-stream's ACCOUNT_UPDATE from triggering a duplicate reconcile.
  */
 export function markSymbolClosed(symbol) {

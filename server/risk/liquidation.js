@@ -370,7 +370,6 @@ export class LiquidationEngine {
                 liquidationPrice: liqByPosition[pos.id] ?? pos.liquidationPrice,
                 unrealizedPnl: upnlByPosition.get(pos.id) || 0,
                 pnlPercent: pos.margin > 0 ? ((upnlByPosition.get(pos.id) || 0) / pos.margin) * 100 : 0,
-                babysitterExcluded: pos.babysitterExcluded ?? false,
                 openedAt: pos.openedAt || null,
             })),
         });

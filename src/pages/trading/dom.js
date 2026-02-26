@@ -132,7 +132,6 @@ export function buildTradingHTML() {
                 <span class="cph-mark">Mark</span>
                 <span class="cph-liq">Liq</span>
                 <span class="cph-pnl">PnL</span>
-                <span class="cph-bbs">BBS</span>
                 <span class="cph-act"></span>
               </div>
               <div id="compact-pos-list"></div>
@@ -186,8 +185,8 @@ export function buildTradingHTML() {
 
           <div class="ot-dropdown" id="ot-dropdown" style="margin: 8px 10px 4px; position:relative; user-select:none;">
             <button id="ot-trigger" class="ot-trigger">
-              <span class="ot-selected-icon" id="ot-selected-icon">${{ 'MARKET': '⚡', 'LIMIT': '📌', 'SCALE': '📊', 'TWAP': '⏱️', 'TRAIL': '🛡️', 'CHASE': '🎯', 'SURF': '🏄', 'SCALPER': '⚔️' }[S.orderType] || '⚡'}</span>
-              <span class="ot-selected-label" id="ot-selected-label">${{ 'MARKET': 'Market', 'LIMIT': 'Limit', 'SCALE': 'Scale', 'TWAP': 'TWAP', 'TRAIL': 'Trail Stop', 'CHASE': 'Chase', 'SURF': 'Surf', 'SCALPER': 'Scalper' }[S.orderType] || 'Market'}</span>
+              <span class="ot-selected-icon" id="ot-selected-icon">${{ 'MARKET': '⚡', 'LIMIT': '📌', 'SCALE': '📊', 'TWAP': '⏱️', 'TRAIL': '🛡️', 'CHASE': '🎯', 'SCALPER': '⚔️' }[S.orderType] || '⚡'}</span>
+              <span class="ot-selected-label" id="ot-selected-label">${{ 'MARKET': 'Market', 'LIMIT': 'Limit', 'SCALE': 'Scale', 'TWAP': 'TWAP', 'TRAIL': 'Trail Stop', 'CHASE': 'Chase', 'SCALPER': 'Scalper' }[S.orderType] || 'Market'}</span>
               <svg class="ot-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 9l6 6 6-6"/></svg>
             </button>
             <div class="ot-menu" id="ot-menu">
@@ -211,10 +210,6 @@ export function buildTradingHTML() {
               <div class="ot-option${S.orderType === 'CHASE' ? ' active' : ''}" data-type="CHASE">
                 <span class="ot-opt-icon">🎯</span>
                 <div class="ot-opt-text"><span class="ot-opt-name">Chase</span><span class="ot-opt-desc">Stalk the best quote</span></div>
-              </div>
-              <div class="ot-option${S.orderType === 'SURF' ? ' active' : ''}" data-type="SURF">
-                <span class="ot-opt-icon">🏄</span>
-                <div class="ot-opt-text"><span class="ot-opt-name">Surf</span><span class="ot-opt-desc">Momentum rider with scalp/core split</span></div>
               </div>
               <div class="ot-option${S.orderType === 'SCALPER' ? ' active' : ''}" data-type="SCALPER">
                 <span class="ot-opt-icon">⚔️</span>
@@ -521,41 +516,9 @@ export function buildTradingHTML() {
             <div id="scalper-preview" style="font-size:10px; color:var(--text-muted); text-align:center; min-height:20px; margin-bottom:4px;"></div>
           </div>
 
-          <!-- Surf Controls -->
-          <div id="surf-controls" style="display:${S.orderType === 'SURF' ? '' : 'none'}; padding:0 10px;">
-            <div style="margin-bottom:8px;">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-                <label style="font-size:11px; color:var(--text-muted); margin:0;">Max Position (USDT)</label>
-                <span id="surf-max-pos-val" style="font-size:13px; font-weight:600; color:var(--text); font-family:var(--font-mono);">$500</span>
-              </div>
-              <div style="display:flex; gap:6px; align-items:center;">
-                <input type="range" id="surf-max-pos-slider" min="10" max="5000" value="500" step="10" style="flex:1;" />
-                <input type="number" id="surf-max-pos" value="500" min="10" step="10" inputmode="decimal" style="width:60px; background:var(--surface-2); border:1px solid var(--border); border-radius:4px; padding:4px 6px; font-weight:600; font-family:var(--font-mono); color:var(--text); font-size:11px; text-align:right;" />
-              </div>
-              <div style="font-size:9px; color:var(--text-muted); margin-top:3px; opacity:0.7;">Max position size. Auto-deleverages at cap.</div>
-            </div>
-            <div style="margin-bottom:8px;">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-                <label style="font-size:11px; color:var(--text-muted); margin:0;">Strategy</label>
-                <span id="surf-scalp-val" style="font-size:13px; font-weight:600; color:var(--text); font-family:var(--font-mono);">60%</span>
-              </div>
-              <input type="range" id="surf-scalp-ratio" min="0" max="100" value="60" step="5" style="width:100%;" />
-              <div style="display:flex; justify-content:space-between; font-size:9px; color:var(--text-muted); margin-top:2px;">
-                <span>Hold</span>
-                <span>Scalp</span>
-              </div>
-            </div>
-            <div style="margin-bottom:8px;">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-                <label style="font-size:11px; color:var(--text-muted); margin:0;">Offset (bps)</label>
-                <span id="surf-offset-val" style="font-size:13px; font-weight:600; color:var(--text); font-family:var(--font-mono);">0.3</span>
-              </div>
-              <input type="range" id="surf-offset-bps" min="0.1" max="5" value="0.3" step="0.1" style="width:100%;" />
-              <div style="font-size:9px; color:var(--text-muted); margin-top:3px; opacity:0.7;">Distance from extreme to fill trigger</div>
-            </div>
-            <div id="surf-preview" style="font-size:10px; color:var(--text-muted); text-align:center; min-height:20px; margin-bottom:4px;"></div>
-            <div id="surf-status-panel" style="display:none; background:var(--surface-2); border:1px solid var(--border); border-radius:6px; padding:6px 8px; margin-bottom:6px;"></div>
-          </div>
+
+
+          <!-- Size -->
 
           <!-- Size -->
           <div style="margin-bottom: 6px;">
@@ -594,10 +557,6 @@ export function buildTradingHTML() {
             <div class="prev-row" id="prev-min-row" style="display:none;"><span>Min Order</span><span id="prev-min">—</span></div>
           </div>
 
-          <label id="babysitter-toggle-group" style="display:flex; align-items:center; gap:6px; padding:4px 10px; font-size:11px; color:var(--text-muted); cursor:pointer; user-select:none;">
-            <input type="checkbox" id="babysitter-toggle" style="accent-color:var(--accent); cursor:pointer;" />
-            Babysitter
-          </label>
           <label id="reduce-only-toggle-group" style="display:flex; align-items:center; gap:6px; padding:4px 10px; font-size:11px; color:var(--text-muted); cursor:pointer; user-select:none;">
             <input type="checkbox" id="reduce-only-toggle" style="accent-color:var(--accent); cursor:pointer;" />
             Reduce Only
