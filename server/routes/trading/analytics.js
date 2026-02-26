@@ -5,7 +5,7 @@
 import { Router } from 'express';
 import fs from 'fs/promises';
 import path from 'path';
-import exchange from '../../exchange.js';
+// exchange.js removed — fetchTopPerpUniverse uses Binance REST directly
 import {
     DEEP_OUTPUT_DIR,
     DECISION_OUTPUT_DIR,
@@ -424,15 +424,23 @@ async function fetchTopPerpUniverse(limit = SMART_UNIVERSE_SIZE) {
         return smartUniverseCache.rows.slice(0, limit);
     }
 
-    const markets = exchange?.markets || {};
-    const perps = Object.keys(markets)
-        .filter((s) => s.endsWith(':USDT') && markets[s]?.active)
-        .map((s) => ({
-            symbol: s,
-            id: markets[s].id,
-            base: String(markets[s].base || '').toUpperCase(),
-        }))
-        .filter((x) => x.base);
+    // Fetch markets from Binance exchangeInfo (no exchange.js dependency)
+    let perps = [];
+    try {
+        const infoResp = await fetch('https://fapi.binance.com/fapi/v1/exchangeInfo');
+        const infoData = await infoResp.json();
+        perps = (infoData.symbols || [])
+            .filter((s) => s.contractType === 'PERPETUAL' && s.quoteAsset === 'USDT' && s.status === 'TRADING')
+            .map((s) => ({
+                symbol: `${s.baseAsset}/USDT:USDT`,
+                id: s.symbol,
+                base: s.baseAsset.toUpperCase(),
+            }))
+            .filter((x) => x.base);
+    } catch (err) {
+        console.error('[Analytics] exchangeInfo fetch failed:', err.message);
+        return [];
+    }
 
     if (perps.length === 0) return [];
 
