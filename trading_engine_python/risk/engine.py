@@ -421,6 +421,14 @@ class RiskEngine:
             **snapshot,
         })
 
+        # Immediately refresh Redis risk snapshot so positions endpoint returns fresh data
+        if self._redis:
+            try:
+                key = f"pms:risk:{pos.sub_account_id}"
+                await self._redis.set(key, json.dumps(snapshot), ex=60)
+            except Exception as e:
+                logger.error("Failed to refresh risk snapshot after stale close: %s", e)
+
         logger.info("Force-closed stale position: %s %s", pos.id[:8], pos.symbol)
 
     async def validate_order(
