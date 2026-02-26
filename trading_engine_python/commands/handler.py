@@ -79,6 +79,25 @@ class CommandHandler:
     via set_*_engine() methods — same pattern as OrderManager.set_risk_engine().
     """
 
+    # Frontend → Binance side mapping
+    _SIDE_MAP = {"LONG": "BUY", "SHORT": "SELL", "BUY": "BUY", "SELL": "SELL"}
+
+    @staticmethod
+    def _normalize_side(side: str) -> str:
+        """LONG→BUY, SHORT→SELL. Pass through BUY/SELL unchanged."""
+        mapped = CommandHandler._SIDE_MAP.get(side.upper())
+        if not mapped:
+            raise ValueError(f"Invalid side: {side}")
+        return mapped
+
+    @staticmethod
+    def _normalize_symbol(symbol: str) -> str:
+        """Convert 'DOGE/USDT:USDT' → 'DOGEUSDT'. Pass through 'DOGEUSDT' unchanged."""
+        s = symbol.replace("/", "").replace(":USDT", "").upper()
+        if not s.endswith("USDT"):
+            s += "USDT"
+        return s
+
     def __init__(
         self,
         redis_client: Any,
@@ -182,16 +201,11 @@ class CommandHandler:
     # ── Order Handlers ──
 
     async def handle_trade(self, cmd: dict) -> dict:
-        """
-        Handle market order.
-        Expected fields (JS proxy already converted symbol/side):
-        - subAccountId, symbol (BTCUSDT), side (BUY/SELL), quantity, leverage
-        - reduceOnly (optional)
-        """
+        """Handle market order."""
         order = await self._order_manager.place_market_order(
             sub_account_id=cmd["subAccountId"],
-            symbol=cmd["symbol"],
-            side=cmd["side"],
+            symbol=self._normalize_symbol(cmd["symbol"]),
+            side=self._normalize_side(cmd["side"]),
             quantity=float(cmd["quantity"]),
             leverage=int(cmd.get("leverage", 1)),
             reduce_only=bool(cmd.get("reduceOnly", False)),
@@ -202,8 +216,8 @@ class CommandHandler:
         """Handle limit order."""
         order = await self._order_manager.place_limit_order(
             sub_account_id=cmd["subAccountId"],
-            symbol=cmd["symbol"],
-            side=cmd["side"],
+            symbol=self._normalize_symbol(cmd["symbol"]),
+            side=self._normalize_side(cmd["side"]),
             quantity=float(cmd["quantity"]),
             price=float(cmd["price"]),
             leverage=int(cmd.get("leverage", 1)),
@@ -213,12 +227,14 @@ class CommandHandler:
 
     async def handle_scale(self, cmd: dict) -> dict:
         """Handle scale/grid orders — multiple limit orders at different prices."""
+        symbol = self._normalize_symbol(cmd["symbol"])
+        side = self._normalize_side(cmd["side"])
         orders = []
         for level in cmd.get("levels", []):
             order = await self._order_manager.place_limit_order(
                 sub_account_id=cmd["subAccountId"],
-                symbol=cmd["symbol"],
-                side=cmd["side"],
+                symbol=symbol,
+                side=side,
                 quantity=float(level["quantity"]),
                 price=float(level["price"]),
                 leverage=int(cmd.get("leverage", 1)),
@@ -231,8 +247,8 @@ class CommandHandler:
         """Handle close position — market order to flatten."""
         order = await self._order_manager.place_market_order(
             sub_account_id=cmd["subAccountId"],
-            symbol=cmd["symbol"],
-            side=cmd["side"],  # Opposite of position side
+            symbol=self._normalize_symbol(cmd["symbol"]),
+            side=self._normalize_side(cmd["side"]),
             quantity=float(cmd["quantity"]),
             reduce_only=True,
             origin="MANUAL",
@@ -263,15 +279,17 @@ class CommandHandler:
         """Handle basket trade — multiple market orders."""
         orders = []
         for item in cmd.get("items", []):
+            symbol = self._normalize_symbol(item["symbol"])
+            side = self._normalize_side(item["side"])
             order = await self._order_manager.place_market_order(
                 sub_account_id=cmd["subAccountId"],
-                symbol=item["symbol"],
-                side=item["side"],
+                symbol=symbol,
+                side=side,
                 quantity=float(item["quantity"]),
                 leverage=int(item.get("leverage", 1)),
                 origin="BASKET",
             )
-            orders.append({"clientOrderId": order.client_order_id, "symbol": item["symbol"]})
+            orders.append({"clientOrderId": order.client_order_id, "symbol": symbol})
         return {"success": True, "orders": orders}
 
     # ── Algo Handlers (delegate to algo engines — Steps 8-10) ──
