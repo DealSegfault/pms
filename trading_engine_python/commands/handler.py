@@ -245,14 +245,34 @@ class CommandHandler:
 
     async def handle_close(self, cmd: dict) -> dict:
         """Handle close position — market order to flatten."""
+        symbol = self._normalize_symbol(cmd["symbol"])
+        side = self._normalize_side(cmd["side"])
+        sub_account_id = cmd["subAccountId"]
+        quantity = float(cmd["quantity"])
+
         order = await self._order_manager.place_market_order(
-            sub_account_id=cmd["subAccountId"],
-            symbol=self._normalize_symbol(cmd["symbol"]),
-            side=self._normalize_side(cmd["side"]),
-            quantity=float(cmd["quantity"]),
+            sub_account_id=sub_account_id,
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
             reduce_only=True,
             origin="MANUAL",
         )
+
+        if order.state == "failed":
+            # Position likely doesn't exist on exchange (e.g. -2022 ReduceOnly rejected)
+            # Force-clean the stale virtual position from our books
+            if self._risk:
+                # Find the position we were trying to close (opposite side of close order)
+                pos_side = "LONG" if side == "SELL" else "SHORT"
+                existing = self._risk.position_book.find_position(sub_account_id, symbol, pos_side)
+                if existing:
+                    await self._risk.force_close_stale_position(existing)
+                    logger.warning("Force-closed stale position %s (exchange rejected reduceOnly)", existing.id[:8])
+                    return {"success": True, "staleCleanup": True, "positionId": existing.id}
+
+            return {"success": False, "error": "Close order failed and no position found to clean up"}
+
         return {"success": True, "clientOrderId": order.client_order_id, "state": order.state}
 
     async def handle_close_all(self, cmd: dict) -> dict:

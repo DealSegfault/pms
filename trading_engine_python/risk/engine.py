@@ -72,11 +72,21 @@ class RiskEngine:
 
     def set_order_manager(self, om: Any) -> None:
         """Wire up OrderManager for liquidation execution."""
+        self._om = om
         self._liquidation.set_order_manager(om)
 
     @property
     def position_book(self) -> PositionBook:
         return self._book
+
+    async def _publish_event(self, event_type: str, payload: dict) -> None:
+        """Publish a position/margin event to Redis PUB/SUB for WS forwarding."""
+        if not self._redis:
+            return
+        try:
+            await self._redis.publish(f"pms:events:{event_type}", json.dumps(payload))
+        except Exception as e:
+            logger.error("Failed to publish %s: %s", event_type, e)
 
     # ── Startup ──
 
@@ -208,6 +218,26 @@ class RiskEngine:
         if self._db:
             await self._persist_open_position(pos, order)
 
+        # Publish position_updated + margin_update to frontend
+        await self._publish_event("position_updated", {
+            "subAccountId": sub_id,
+            "positionId": pos_id,
+            "symbol": symbol,
+            "side": side,
+            "entryPrice": price,
+            "quantity": qty,
+            "notional": notional,
+            "margin": margin,
+            "leverage": leverage,
+            "liquidationPrice": liq_price,
+        })
+        snapshot = self.get_account_snapshot(sub_id)
+        await self._publish_event("margin_update", {
+            "subAccountId": sub_id,
+            "update": snapshot,
+            **snapshot,
+        })
+
         logger.info("Opened position: %s %s %s qty=%.6f @ %.2f margin=%.2f", pos_id[:8], symbol, side, qty, price, margin)
 
     async def _close_position(
@@ -228,6 +258,22 @@ class RiskEngine:
             if self._db:
                 await self._persist_close_position(existing, fill_price, pnl, order)
 
+            # Publish position_closed + margin_update to frontend
+            await self._publish_event("position_closed", {
+                "subAccountId": existing.sub_account_id,
+                "positionId": existing.id,
+                "symbol": existing.symbol,
+                "side": existing.side,
+                "realizedPnl": pnl,
+                "closePrice": fill_price,
+            })
+            snapshot = self.get_account_snapshot(existing.sub_account_id)
+            await self._publish_event("margin_update", {
+                "subAccountId": existing.sub_account_id,
+                "update": snapshot,
+                **snapshot,
+            })
+
             logger.info("Closed position: %s PnL=%.4f", existing.id[:8], pnl)
         else:
             # Partial close
@@ -245,6 +291,22 @@ class RiskEngine:
             account = self._book.get_account(existing.sub_account_id)
             new_balance = account.get("currentBalance", 0) + pnl
             self._book.update_balance(existing.sub_account_id, new_balance)
+
+            # Publish position_reduced + margin_update to frontend
+            await self._publish_event("position_reduced", {
+                "subAccountId": existing.sub_account_id,
+                "positionId": existing.id,
+                "symbol": existing.symbol,
+                "closedQty": fill_qty,
+                "remainingQty": remaining,
+                "realizedPnl": pnl,
+            })
+            snapshot = self.get_account_snapshot(existing.sub_account_id)
+            await self._publish_event("margin_update", {
+                "subAccountId": existing.sub_account_id,
+                "update": snapshot,
+                **snapshot,
+            })
 
             logger.info("Partial close: %s qty=%.6f→%.6f PnL=%.4f", existing.id[:8], existing.quantity, remaining, pnl)
 
@@ -323,6 +385,43 @@ class RiskEngine:
             logger.debug("ACCOUNT_UPDATE: %s amount=%.6f", symbol, position_amount)
 
     # ── Validation ──
+
+    async def force_close_stale_position(self, pos) -> None:
+        """
+        Force-remove a virtual position that doesn't exist on exchange.
+        Called when -2022 ReduceOnly is rejected (position already gone).
+        """
+        self._book.remove(pos.id, pos.sub_account_id)
+
+        # DB: mark as closed
+        if self._db:
+            try:
+                await self._db.execute(
+                    "UPDATE virtual_positions SET status='CLOSED', closed_at=?, close_price=?, realized_pnl=0 WHERE id=?",
+                    (int(time.time() * 1000), pos.entry_price, pos.id),
+                )
+                await self._db.commit()
+            except Exception as e:
+                logger.error("Failed to DB-close stale position %s: %s", pos.id[:8], e)
+
+        # Publish position_closed + margin_update so frontend removes card
+        await self._publish_event("position_closed", {
+            "subAccountId": pos.sub_account_id,
+            "positionId": pos.id,
+            "symbol": pos.symbol,
+            "side": pos.side,
+            "realizedPnl": 0,
+            "closePrice": pos.entry_price,
+            "staleCleanup": True,
+        })
+        snapshot = self.get_account_snapshot(pos.sub_account_id)
+        await self._publish_event("margin_update", {
+            "subAccountId": pos.sub_account_id,
+            "update": snapshot,
+            **snapshot,
+        })
+
+        logger.info("Force-closed stale position: %s %s", pos.id[:8], pos.symbol)
 
     async def validate_order(
         self, sub_account_id: str, symbol: str, side: str, quantity: float, leverage: int
