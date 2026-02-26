@@ -62,6 +62,20 @@ async def main() -> None:
     await redis_client.ping()
     logger.info("Redis connected: %s", redis_url)
 
+    # ── 2b. Clean stale order/algo state from previous session ──
+    stale_patterns = [
+        "pms:open_orders:*", "pms:active_chase:*", "pms:active_scalper:*",
+        "pms:active_twap:*", "pms:active_trail_stop:*",
+        "pms:chase:*", "pms:scalper:*", "pms:twap:*", "pms:trailstop:*",
+    ]
+    stale_count = 0
+    for pattern in stale_patterns:
+        async for key in redis_client.scan_iter(match=pattern, count=100):
+            await redis_client.delete(key)
+            stale_count += 1
+    if stale_count:
+        logger.info("Cleaned %d stale Redis keys from previous session", stale_count)
+
     # ── 3. Database ──
     from trading_engine_python.db.base import Database
     db = Database()
