@@ -63,8 +63,27 @@ router.get('/positions/:subAccountId', requireOwnership(), async (req, res) => {
 
         // Try Redis snapshot first (written by Python RiskEngine)
         const snapshot = await getRiskSnapshot(subAccountId);
-        if (snapshot?.timestamp && (Date.now() - snapshot.timestamp) < 15_000) {
-            return res.json(snapshot);
+        if (snapshot?.balance != null) {
+            const balance = snapshot.balance || 0;
+            const marginUsed = snapshot.marginUsed || 0;
+            const equity = snapshot.equity || balance;
+            const positions = snapshot.positions || [];
+            const totalExposure = positions.reduce((s, p) => s + (p.quantity * (p.markPrice || p.entryPrice)), 0);
+            const unrealizedPnl = positions.reduce((s, p) => s + (p.unrealizedPnl || 0), 0);
+            return res.json({
+                positions,
+                summary: {
+                    balance,
+                    equity,
+                    marginUsed,
+                    availableMargin: snapshot.availableMargin || Math.max(0, equity - marginUsed),
+                    totalExposure,
+                    unrealizedPnl,
+                    marginRatio: equity > 0 ? marginUsed / equity : 0,
+                    positionCount: positions.length,
+                    accountLiqPrice: null,
+                },
+            });
         }
 
         // Fallback to DB
@@ -73,21 +92,50 @@ router.get('/positions/:subAccountId', requireOwnership(), async (req, res) => {
         });
         const account = await prisma.subAccount.findUnique({
             where: { id: subAccountId },
-            select: { currentBalance: true },
+            select: { currentBalance: true, maintenanceRate: true },
         });
 
+        const balance = account?.currentBalance || 0;
+        const maintenanceRate = account?.maintenanceRate || 0.005;
+
+        // Compute summary fields from positions
+        const marginUsed = positions.reduce((s, p) => s + (p.margin || 0), 0);
+        const totalExposure = positions.reduce((s, p) => s + (p.notional || 0), 0);
+        // Without live prices, unrealized PnL = 0
+        const unrealizedPnl = 0;
+        const equity = balance + unrealizedPnl;
+        const availableMargin = Math.max(0, equity - marginUsed);
+        const marginRatio = equity > 0 ? marginUsed / equity : 0;
+
+        const mappedPositions = positions.map(p => ({
+            id: p.id,
+            symbol: p.symbol,
+            side: p.side,
+            entryPrice: p.entryPrice,
+            quantity: p.quantity,
+            notional: p.notional,
+            margin: p.margin,
+            leverage: p.leverage,
+            liquidationPrice: p.liquidationPrice,
+            markPrice: p.entryPrice,
+            unrealizedPnl: 0,
+            pnlPercent: 0,
+            openedAt: p.openedAt,
+        }));
+
         res.json({
-            balance: account?.currentBalance || 0,
-            positions: positions.map(p => ({
-                id: p.id,
-                symbol: p.symbol,
-                side: p.side,
-                entryPrice: p.entryPrice,
-                quantity: p.quantity,
-                margin: p.margin,
-                leverage: p.leverage,
-                liquidationPrice: p.liquidationPrice,
-            })),
+            positions: mappedPositions,
+            summary: {
+                balance,
+                equity,
+                marginUsed,
+                availableMargin,
+                totalExposure,
+                unrealizedPnl,
+                marginRatio,
+                positionCount: positions.length,
+                accountLiqPrice: null,
+            },
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
