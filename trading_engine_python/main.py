@@ -130,6 +130,37 @@ async def main() -> None:
     pos_count = await risk_engine.load_positions()
     logger.info("RiskEngine loaded %d positions", pos_count)
 
+    # ── 7b. Reconcile with exchange — close ghost positions ──
+    if pos_count > 0:
+        try:
+            exchange_positions = await exchange.get_position_risk()
+            # Build set of (symbol, side) that actually exist on exchange
+            exchange_set = set()
+            for ep in (exchange_positions or []):
+                amt = float(ep.get("positionAmt", 0))
+                if amt != 0:
+                    side = "LONG" if amt > 0 else "SHORT"
+                    exchange_set.add((ep.get("symbol", ""), side))
+
+            # Check each virtual position
+            stale_closed = 0
+            for sub_id, entry in list(position_book._entries.items()):
+                for pos_id, pos in list(entry["positions"].items()):
+                    if (pos.symbol, pos.side) not in exchange_set:
+                        logger.warning(
+                            "Ghost position %s %s %s — not on exchange, force-closing",
+                            pos.id[:8], pos.symbol, pos.side,
+                        )
+                        await risk_engine.force_close_stale_position(pos)
+                        stale_closed += 1
+
+            if stale_closed:
+                logger.info("Reconciliation: closed %d ghost positions", stale_closed)
+            else:
+                logger.info("Reconciliation: all %d positions verified on exchange", pos_count)
+        except Exception as e:
+            logger.error("Position reconciliation failed (non-fatal): %s", e)
+
     # ── 8. Algo Engines ──
     from trading_engine_python.algos.chase import ChaseEngine
     from trading_engine_python.algos.scalper import ScalperEngine
