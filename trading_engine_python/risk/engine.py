@@ -17,7 +17,6 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .math import (
@@ -57,15 +56,15 @@ class RiskEngine:
         market_data: Any,
         exchange_client: Any,
         redis_client: Any = None,
-        db_session_factory: Any = None,
+        db: Any = None,
     ):
         self._book = position_book
         self._market_data = market_data
         self._exchange = exchange_client
         self._redis = redis_client
-        self._db = db_session_factory
+        self._db = db  # Database instance (aiosqlite wrapper)
 
-        self._validator = TradeValidator(position_book, market_data, db_session_factory)
+        self._validator = TradeValidator(position_book, market_data, db)
         self._liquidation = LiquidationEngine(position_book)
 
         # Track last risk snapshot write time per account (throttle)
@@ -84,78 +83,67 @@ class RiskEngine:
     async def load_positions(self) -> int:
         """Load all OPEN positions from DB into PositionBook on startup."""
         if not self._db:
-            logger.warning("No DB session factory — skipping position load")
+            logger.warning("No DB — skipping position load")
             return 0
 
-        from trading_engine_python.db.models import (
-            SubAccount,
-            VirtualPosition as VPModel,
-            RiskRule,
-        )
-        from sqlalchemy import select
-
         count = 0
-        async with self._db() as session:
-            # Load all sub-accounts with ACTIVE status
-            result = await session.execute(
-                select(SubAccount).where(SubAccount.status == "ACTIVE")
+        by_account = {}
+
+        # Load all active sub-accounts
+        accounts = await self._db.fetch_all(
+            "SELECT * FROM sub_accounts WHERE status = ?", ("ACTIVE",)
+        )
+
+        for acct in accounts:
+            acct_id = acct["id"]
+
+            # Load open positions
+            positions = await self._db.fetch_all(
+                "SELECT * FROM virtual_positions WHERE sub_account_id = ? AND status = ?",
+                (acct_id, "OPEN"),
             )
-            accounts = result.scalars().all()
 
-            by_account = {}
-            for acct in accounts:
-                # Load open positions for this account
-                pos_result = await session.execute(
-                    select(VPModel).where(
-                        VPModel.sub_account_id == acct.id,
-                        VPModel.status == "OPEN",
-                    )
-                )
-                positions = pos_result.scalars().all()
+            # Load risk rules
+            rule = await self._db.fetch_one(
+                "SELECT * FROM risk_rules WHERE sub_account_id = ?",
+                (acct_id,),
+            )
 
-                # Load risk rules
-                rule_result = await session.execute(
-                    select(RiskRule).where(RiskRule.sub_account_id == acct.id)
-                )
-                rule = rule_result.scalar_one_or_none()
-
-                if positions or True:  # Always load account for validation
-                    by_account[acct.id] = {
-                        "account": {
-                            "id": acct.id,
-                            "name": acct.name,
-                            "currentBalance": acct.current_balance,
-                            "maintenanceRate": acct.maintenance_rate,
-                            "liquidationMode": acct.liquidation_mode,
-                            "status": acct.status,
-                        },
-                        "positions": [
-                            {
-                                "id": p.id,
-                                "symbol": p.symbol,
-                                "side": p.side,
-                                "entryPrice": p.entry_price,
-                                "quantity": p.quantity,
-                                "notional": p.notional,
-                                "leverage": int(p.leverage),
-                                "margin": p.margin,
-                                "liquidationPrice": p.liquidation_price,
-                                "openedAt": p.opened_at.timestamp() if p.opened_at else None,
-                            }
-                            for p in positions
-                        ],
-                        "rules": {
-                            "max_leverage": rule.max_leverage if rule else 100,
-                            "max_notional_per_trade": rule.max_notional_per_trade if rule else 200,
-                            "max_total_exposure": rule.max_total_exposure if rule else 500,
-                            "liquidation_threshold": rule.liquidation_threshold if rule else 0.90,
-                        },
+            by_account[acct_id] = {
+                "account": {
+                    "id": acct_id,
+                    "name": acct["name"],
+                    "currentBalance": acct["current_balance"],
+                    "maintenanceRate": acct.get("maintenance_rate", 0.005),
+                    "liquidationMode": acct.get("liquidation_mode", "ADL_30"),
+                    "status": acct["status"],
+                },
+                "positions": [
+                    {
+                        "id": p["id"],
+                        "symbol": p["symbol"],
+                        "side": p["side"],
+                        "entryPrice": p["entry_price"],
+                        "quantity": p["quantity"],
+                        "notional": p["notional"],
+                        "leverage": int(p["leverage"]),
+                        "margin": p["margin"],
+                        "liquidationPrice": p["liquidation_price"],
+                        "openedAt": p["opened_at"] / 1000.0 if p.get("opened_at") else None,
                     }
-                    count += len(positions)
+                    for p in positions
+                ],
+                "rules": {
+                    "max_leverage": rule["max_leverage"] if rule else 100,
+                    "max_notional_per_trade": rule["max_notional_per_trade"] if rule else 200,
+                    "max_total_exposure": rule["max_total_exposure"] if rule else 500,
+                    "liquidation_threshold": rule["liquidation_threshold"] if rule else 0.90,
+                },
+            }
+            count += len(positions)
 
-            self._book.load(by_account)
-            logger.info("Loaded %d positions across %d accounts into PositionBook", count, len(by_account))
-
+        self._book.load(by_account)
+        logger.info("Loaded %d positions across %d accounts into PositionBook", count, len(by_account))
         return count
 
     # ── Order Fill Handler ──
@@ -395,61 +383,46 @@ class RiskEngine:
             snapshot = self.get_account_snapshot(sub_id)
             key = f"pms:risk:{sub_id}"
             try:
-                if asyncio.iscoroutinefunction(getattr(self._redis, 'set', None)):
-                    await self._redis.set(key, json.dumps(snapshot), ex=60)
-                else:
-                    await asyncio.to_thread(self._redis.set, key, json.dumps(snapshot), ex=60)
+                await self._redis.set(key, json.dumps(snapshot), ex=60)
             except Exception as e:
                 logger.error("Failed to write risk snapshot for %s: %s", sub_id, e)
 
-    # ── DB Persistence Helpers ──
+    # ── DB Persistence Helpers (raw SQL via aiosqlite) ──
 
     async def _persist_open_position(self, pos: VirtualPos, order: Any) -> None:
         """Write new position and trade execution to DB."""
         if not self._db:
             return
 
-        from trading_engine_python.db.models import VirtualPosition as VPModel, TradeExecution, BalanceLog
-
         try:
-            async with self._db() as session:
-                # Create VirtualPosition record
-                db_pos = VPModel(
-                    id=pos.id,
-                    sub_account_id=pos.sub_account_id,
-                    symbol=pos.symbol,
-                    side=pos.side,
-                    entry_price=pos.entry_price,
-                    quantity=pos.quantity,
-                    notional=pos.notional,
-                    leverage=float(pos.leverage),
-                    margin=pos.margin,
-                    liquidation_price=pos.liquidation_price,
-                    status="OPEN",
-                )
-                session.add(db_pos)
+            now_ms = int(time.time() * 1000)
+            sig = create_open_trade_signature(pos.sub_account_id, pos.symbol, pos.side, pos.quantity)
 
-                # Create TradeExecution record
-                trade = TradeExecution(
-                    id=str(uuid.uuid4()),
-                    sub_account_id=pos.sub_account_id,
-                    position_id=pos.id,
-                    exchange_order_id=order.exchange_order_id,
-                    client_order_id=order.client_order_id,
-                    symbol=pos.symbol,
-                    side="BUY" if pos.side == "LONG" else "SELL",
-                    type=order.order_type,
-                    price=pos.entry_price,
-                    quantity=pos.quantity,
-                    notional=pos.notional,
-                    action="OPEN",
-                    origin_type=order.origin,
-                    signature=create_open_trade_signature(
-                        pos.sub_account_id, pos.symbol, pos.side, pos.quantity
-                    ),
-                )
-                session.add(trade)
-                await session.commit()
+            await self._db.execute(
+                """INSERT INTO virtual_positions
+                   (id, sub_account_id, symbol, side, entry_price, quantity, notional,
+                    leverage, margin, liquidation_price, status, opened_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)""",
+                (pos.id, pos.sub_account_id, pos.symbol, pos.side,
+                 pos.entry_price, pos.quantity, pos.notional,
+                 float(pos.leverage), pos.margin, pos.liquidation_price, now_ms),
+            )
+
+            trade_id = str(uuid.uuid4())
+            side = "BUY" if pos.side == "LONG" else "SELL"
+            await self._db.execute(
+                """INSERT INTO trade_executions
+                   (id, sub_account_id, position_id, exchange_order_id, client_order_id,
+                    symbol, side, type, price, quantity, notional, fee, action,
+                    origin_type, status, signature, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'OPEN', ?, 'FILLED', ?, ?)""",
+                (trade_id, pos.sub_account_id, pos.id,
+                 getattr(order, 'exchange_order_id', ''),
+                 getattr(order, 'client_order_id', ''),
+                 pos.symbol, side, getattr(order, 'order_type', 'MARKET'),
+                 pos.entry_price, pos.quantity, pos.notional,
+                 getattr(order, 'origin', 'MANUAL'), sig, now_ms),
+            )
         except Exception as e:
             logger.error("Failed to persist open position: %s", e)
 
@@ -460,75 +433,56 @@ class RiskEngine:
         if not self._db:
             return
 
-        from trading_engine_python.db.models import (
-            VirtualPosition as VPModel,
-            TradeExecution,
-            BalanceLog,
-            SubAccount,
-        )
-        from sqlalchemy import update
-
         try:
-            async with self._db() as session:
-                # Close the VirtualPosition
-                await session.execute(
-                    update(VPModel).where(VPModel.id == pos.id).values(
-                        status="CLOSED",
-                        realized_pnl=pnl,
-                        closed_at=datetime.utcnow(),
-                    )
+            now_ms = int(time.time() * 1000)
+            sig = create_trade_signature(pos.sub_account_id, "CLOSE", pos.id)
+
+            # Close position
+            await self._db.execute(
+                "UPDATE virtual_positions SET status = 'CLOSED', realized_pnl = ?, closed_at = ? WHERE id = ?",
+                (pnl, now_ms, pos.id),
+            )
+
+            # Trade execution
+            trade_id = str(uuid.uuid4())
+            side = "SELL" if pos.side == "LONG" else "BUY"
+            action = getattr(order, 'origin', 'MANUAL') if getattr(order, 'origin', '') == 'LIQUIDATION' else 'CLOSE'
+            await self._db.execute(
+                """INSERT INTO trade_executions
+                   (id, sub_account_id, position_id, exchange_order_id, client_order_id,
+                    symbol, side, type, price, quantity, notional, fee, realized_pnl,
+                    action, origin_type, status, signature, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'FILLED', ?, ?)""",
+                (trade_id, pos.sub_account_id, pos.id,
+                 getattr(order, 'exchange_order_id', ''),
+                 getattr(order, 'client_order_id', ''),
+                 pos.symbol, side, getattr(order, 'order_type', 'MARKET'),
+                 close_price, pos.quantity, pos.quantity * close_price, pnl,
+                 action, getattr(order, 'origin', 'MANUAL'), sig, now_ms),
+            )
+
+            # Update balance
+            acct = await self._db.fetch_one(
+                "SELECT current_balance FROM sub_accounts WHERE id = ?",
+                (pos.sub_account_id,),
+            )
+            if acct:
+                old_balance = acct["current_balance"]
+                new_balance = old_balance + pnl
+                await self._db.execute(
+                    "UPDATE sub_accounts SET current_balance = ?, updated_at = ? WHERE id = ?",
+                    (new_balance, now_ms, pos.sub_account_id),
                 )
 
-                # Create TradeExecution for close
-                trade = TradeExecution(
-                    id=str(uuid.uuid4()),
-                    sub_account_id=pos.sub_account_id,
-                    position_id=pos.id,
-                    exchange_order_id=order.exchange_order_id,
-                    client_order_id=order.client_order_id,
-                    symbol=pos.symbol,
-                    side="SELL" if pos.side == "LONG" else "BUY",
-                    type=order.order_type,
-                    price=close_price,
-                    quantity=pos.quantity,
-                    notional=pos.quantity * close_price,
-                    realized_pnl=pnl,
-                    action=order.origin if order.origin == "LIQUIDATION" else "CLOSE",
-                    origin_type=order.origin,
-                    signature=create_trade_signature(
-                        pos.sub_account_id, "CLOSE", pos.id
-                    ),
+                # Balance log
+                await self._db.execute(
+                    """INSERT INTO balance_logs
+                       (id, sub_account_id, balance_before, balance_after, change_amount,
+                        reason, trade_id, timestamp)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (str(uuid.uuid4()), pos.sub_account_id, old_balance, new_balance,
+                     pnl, f"CLOSE:{pos.symbol}:{pos.side}", trade_id, now_ms),
                 )
-                session.add(trade)
-
-                # Update sub-account balance
-                acct_result = await session.execute(
-                    select(SubAccount).where(SubAccount.id == pos.sub_account_id)
-                )
-                acct = acct_result.scalar_one_or_none()
-                if acct:
-                    old_balance = acct.current_balance
-                    new_balance = old_balance + pnl
-
-                    await session.execute(
-                        update(SubAccount).where(SubAccount.id == pos.sub_account_id).values(
-                            current_balance=new_balance,
-                        )
-                    )
-
-                    # Balance log
-                    log = BalanceLog(
-                        id=str(uuid.uuid4()),
-                        sub_account_id=pos.sub_account_id,
-                        balance_before=old_balance,
-                        balance_after=new_balance,
-                        change_amount=pnl,
-                        reason=f"CLOSE:{pos.symbol}:{pos.side}",
-                        trade_id=trade.id,
-                    )
-                    session.add(log)
-
-                await session.commit()
         except Exception as e:
             logger.error("Failed to persist close position: %s", e)
 

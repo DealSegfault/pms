@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Float, Index, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, Column, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import relationship
 
 from .base import Base
@@ -35,8 +35,8 @@ class User(Base):
     status = Column(String, default="PENDING")
     api_key = Column(String, unique=True, nullable=True)
     current_challenge = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(BigInteger, nullable=True)
+    updated_at = Column(BigInteger, nullable=True)
 
     sub_accounts = relationship("SubAccount", back_populates="user")
 
@@ -47,7 +47,7 @@ class SubAccount(Base):
     __tablename__ = "sub_accounts"
     
     id = Column(String, primary_key=True, default=_uuid)
-    user_id = Column(String, nullable=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=True)
     name = Column(String, nullable=False)
     type = Column(String, default="USER")
     initial_balance = Column(Float, nullable=False)
@@ -55,8 +55,8 @@ class SubAccount(Base):
     status = Column(String, default="ACTIVE")
     liquidation_mode = Column(String, default="ADL_30")
     maintenance_rate = Column(Float, default=0.005)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(BigInteger, nullable=True)
+    updated_at = Column(BigInteger, nullable=True)
 
     user = relationship("User", back_populates="sub_accounts", foreign_keys=[user_id])
     risk_rule = relationship("RiskRule", back_populates="sub_account", uselist=False)
@@ -76,7 +76,7 @@ class RiskRule(Base):
     __tablename__ = "risk_rules"
     
     id = Column(String, primary_key=True, default=_uuid)
-    sub_account_id = Column(String, unique=True, nullable=True)
+    sub_account_id = Column(String, ForeignKey("sub_accounts.id"), unique=True, nullable=True)
     is_global = Column(Boolean, default=False)
     max_leverage = Column(Float, default=100)
     max_notional_per_trade = Column(Float, default=200)
@@ -96,7 +96,7 @@ class VirtualPosition(Base):
     __tablename__ = "virtual_positions"
     
     id = Column(String, primary_key=True, default=_uuid)
-    sub_account_id = Column(String, nullable=False)
+    sub_account_id = Column(String, ForeignKey("sub_accounts.id"), nullable=False)
     symbol = Column(String, nullable=False)
     side = Column(String, nullable=False)           # LONG, SHORT
     entry_price = Column(Float, nullable=False)
@@ -109,9 +109,9 @@ class VirtualPosition(Base):
     realized_pnl = Column(Float, nullable=True)
     taken_over = Column(Boolean, default=False)
     taken_over_by = Column(String, nullable=True)
-    taken_over_at = Column(DateTime, nullable=True)
-    opened_at = Column(DateTime, default=datetime.utcnow)
-    closed_at = Column(DateTime, nullable=True)
+    taken_over_at = Column(BigInteger, nullable=True)
+    opened_at = Column(BigInteger, nullable=True)
+    closed_at = Column(BigInteger, nullable=True)
 
     sub_account = relationship("SubAccount", back_populates="positions", foreign_keys=[sub_account_id])
     trades = relationship("TradeExecution", back_populates="position")
@@ -129,8 +129,8 @@ class TradeExecution(Base):
     __tablename__ = "trade_executions"
     
     id = Column(String, primary_key=True, default=_uuid)
-    sub_account_id = Column(String, nullable=False)
-    position_id = Column(String, nullable=True)
+    sub_account_id = Column(String, ForeignKey("sub_accounts.id"), nullable=False)
+    position_id = Column(String, ForeignKey("virtual_positions.id"), nullable=True)
     exchange_order_id = Column(String, nullable=True)
     client_order_id = Column(String, nullable=True)
     symbol = Column(String, nullable=False)
@@ -145,7 +145,7 @@ class TradeExecution(Base):
     origin_type = Column(String, default="MANUAL")    # MANUAL, BOT, API
     status = Column(String, default="FILLED")         # PENDING, FILLED, FAILED, CANCELLED
     signature = Column(String, nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(BigInteger, nullable=True)
 
     sub_account = relationship("SubAccount", back_populates="trades", foreign_keys=[sub_account_id])
     position = relationship("VirtualPosition", back_populates="trades", foreign_keys=[position_id])
@@ -164,13 +164,13 @@ class BalanceLog(Base):
     __tablename__ = "balance_logs"
     
     id = Column(String, primary_key=True, default=_uuid)
-    sub_account_id = Column(String, nullable=False)
+    sub_account_id = Column(String, ForeignKey("sub_accounts.id"), nullable=False)
     balance_before = Column(Float, nullable=False)
     balance_after = Column(Float, nullable=False)
     change_amount = Column(Float, nullable=False)
     reason = Column(String, nullable=False)
     trade_id = Column(String, nullable=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(BigInteger, nullable=True)
 
     sub_account = relationship("SubAccount", back_populates="balance_logs", foreign_keys=[sub_account_id])
 
@@ -194,9 +194,9 @@ class PendingOrder(Base):
     leverage = Column(Float, nullable=False)
     exchange_order_id = Column(String, nullable=True)
     status = Column(String, default="PENDING")
-    created_at = Column(DateTime, default=datetime.utcnow)
-    filled_at = Column(DateTime, nullable=True)
-    cancelled_at = Column(DateTime, nullable=True)
+    created_at = Column(BigInteger, nullable=True)
+    filled_at = Column(BigInteger, nullable=True)
+    cancelled_at = Column(BigInteger, nullable=True)
 
     __table_args__ = (
         Index("idx_po_xoid", "exchange_order_id"),

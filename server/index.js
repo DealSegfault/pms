@@ -21,6 +21,7 @@ import { flexAuthMiddleware, adminMiddleware } from './auth.js';
 import prisma from './db/prisma.js';
 import { disconnectPrisma } from './db/prisma.js';
 import { errorHandler } from './http/error-model.js';
+import { startPythonEngine, stopPythonEngine } from './python-engine.js';
 
 // Routes
 import authRouter from './routes/auth.js';
@@ -192,13 +193,19 @@ async function start() {
             await ensurePortFree(PORT);
         }
 
-        server.listen(PORT, () => {
-            console.log(`\n🚀 PMS Server PROXY MODE on http://localhost:${PORT}`);
-            console.log(`📡 WebSocket on ws://localhost:${PORT}/ws (Redis PUB/SUB)`);
-            console.log(`📊 API at http://localhost:${PORT}/api`);
-            console.log(`🐍 Trading → Python engine via Redis`);
-            console.log(`📦 Auth, admin, history → JS (unchanged)\n`);
+        await new Promise((resolve) => {
+            server.listen(PORT, () => {
+                console.log(`\n🚀 PMS Server PROXY MODE on http://localhost:${PORT}`);
+                console.log(`📡 WebSocket on ws://localhost:${PORT}/ws (Redis PUB/SUB)`);
+                console.log(`📊 API at http://localhost:${PORT}/api`);
+                console.log(`🐍 Trading → Python engine via Redis`);
+                console.log(`📦 Auth, admin, history → JS (unchanged)\n`);
+                resolve();
+            });
         });
+
+        // Start Python trading engine as child process (after server is listening)
+        await startPythonEngine();
     } catch (err) {
         console.error('Failed to start server:', err);
         process.exit(1);
@@ -211,6 +218,7 @@ start();
 async function gracefulShutdown(signal) {
     console.log(`\n[Shutdown] Received ${signal}, cleaning up...`);
     try {
+        await stopPythonEngine();
         await closeRedis();
         await disconnectPrisma();
         await new Promise((resolve) => {

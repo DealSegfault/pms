@@ -49,10 +49,9 @@ async def main() -> None:
     logger.info("Starting Python Trading Engine...")
 
     # ── 1. Configuration ──
-    api_key = os.getenv("BINANCE_API_KEY", "")
-    api_secret = os.getenv("BINANCE_API_SECRET", "")
+    api_key = os.getenv("api_key", "")
+    api_secret = os.getenv("api_secret", "")
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-    testnet = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
 
     if not api_key or not api_secret:
         logger.warning("BINANCE_API_KEY/SECRET not set — running in dry-run mode")
@@ -63,29 +62,25 @@ async def main() -> None:
     await redis_client.ping()
     logger.info("Redis connected: %s", redis_url)
 
-    # ── 3. DB Session ──
-    from trading_engine_python.db.base import get_engine, get_session_factory
-    db_engine = get_engine()
-    db_session = get_session_factory(db_engine)
-    logger.info("DB session factory created")
+    # ── 3. Database ──
+    from trading_engine_python.db.base import Database
+    db = Database()
+    await db.connect()
+    logger.info("DB connected")
 
     # ── 4. ExchangeClient ──
     from trading_engine_python.orders.exchange_client import ExchangeClient
     exchange = ExchangeClient(
         api_key=api_key,
         api_secret=api_secret,
-        testnet=testnet,
     )
-    logger.info("ExchangeClient created (testnet=%s)", testnet)
+    logger.info("ExchangeClient created")
 
-    # ── 5. OrderTracker + OrderManager ──
-    from trading_engine_python.orders.tracker import OrderTracker
+    # ── 5. OrderManager ──
     from trading_engine_python.orders.manager import OrderManager
 
-    tracker = OrderTracker()
     order_manager = OrderManager(
         exchange_client=exchange,
-        tracker=tracker,
         redis_client=redis_client,
     )
     logger.info("OrderManager created")
@@ -105,7 +100,7 @@ async def main() -> None:
         market_data=market_data,
         exchange_client=exchange,
         redis_client=redis_client,
-        db_session_factory=db_session,
+        db=db,
     )
     risk_engine.set_order_manager(order_manager)
     order_manager.set_risk_engine(risk_engine)
@@ -148,7 +143,6 @@ async def main() -> None:
         api_secret=api_secret,
         order_manager=order_manager,
         risk_engine=risk_engine,
-        testnet=testnet,
     )
     logger.info("UserStreamService created")
 
@@ -185,7 +179,7 @@ async def main() -> None:
     except* asyncio.CancelledError:
         pass
     finally:
-        await _cleanup(redis_client, db_engine, user_stream, cmd_handler)
+        await _cleanup(redis_client, db, user_stream, cmd_handler)
         logger.info("Python Trading Engine stopped")
 
 
@@ -197,7 +191,7 @@ async def _shutdown_waiter(event, cmd_handler, user_stream):
     raise asyncio.CancelledError()
 
 
-async def _cleanup(redis, db_engine, user_stream, cmd_handler):
+async def _cleanup(redis, db, user_stream, cmd_handler):
     """Graceful cleanup."""
     try:
         await cmd_handler.stop()
@@ -212,7 +206,7 @@ async def _cleanup(redis, db_engine, user_stream, cmd_handler):
     except Exception:
         pass
     try:
-        await db_engine.dispose()
+        await db.close()
     except Exception:
         pass
 

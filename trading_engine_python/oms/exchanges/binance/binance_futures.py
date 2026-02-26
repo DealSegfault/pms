@@ -3,7 +3,11 @@ import logging
 from binance.um_futures import UMFutures
 from binance.lib.utils import config_logging
 from binance.error import ClientError
-from config import HTTP_PROXY, HTTPS_PROXY
+import os
+
+# Proxy config — read from env vars instead of config module
+HTTP_PROXY = os.getenv("HTTP_PROXY", "")
+HTTPS_PROXY = os.getenv("HTTPS_PROXY", "")
 
 class BinanceFutures:
     def __init__(self, api_key="", api_secret="", testnet=False):
