@@ -76,12 +76,19 @@ async def main() -> None:
     )
     logger.info("ExchangeClient created")
 
+    # ── 4b. Exchange Info (tick sizes, step sizes, min notional) ──
+    from trading_engine_python.feeds.symbol_info import SymbolInfoCache
+    symbol_info = SymbolInfoCache()
+    await symbol_info.load(exchange)
+    logger.info("Loaded %d symbol specs", len(symbol_info))
+
     # ── 5. OrderManager ──
     from trading_engine_python.orders.manager import OrderManager
 
     order_manager = OrderManager(
         exchange_client=exchange,
         redis_client=redis_client,
+        symbol_info=symbol_info,
     )
     logger.info("OrderManager created")
 

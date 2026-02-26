@@ -194,6 +194,10 @@ class ExchangeClient:
         """Get full account info."""
         return await self._execute(self._client.get_account_info)
 
+    async def get_exchange_info(self) -> dict:
+        """Get exchange information (symbols, filters, rate limits)."""
+        return await self._execute(self._client.get_exchange_info)
+
     # ── Leverage / Margin ──
 
     async def change_leverage(self, symbol: str, leverage: int) -> dict:

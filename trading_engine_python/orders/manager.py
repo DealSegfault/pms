@@ -52,16 +52,22 @@ class OrderManager:
         exchange_client: ExchangeClient,
         redis_client: Any = None,
         risk_engine: Any = None,
+        symbol_info: Any = None,
     ):
         self._exchange = exchange_client
         self._redis = redis_client
         self._risk = risk_engine  # Set later via set_risk_engine() (Step 7)
+        self._symbol_info = symbol_info  # SymbolInfoCache for rounding
         self._tracker = OrderTracker()
         self._seq: int = 0  # Monotonic event sequence number
 
     def set_risk_engine(self, risk_engine: Any) -> None:
         """Wire up the risk engine after it's created (Step 7)."""
         self._risk = risk_engine
+
+    def set_symbol_info(self, symbol_info: Any) -> None:
+        """Wire up the symbol info cache."""
+        self._symbol_info = symbol_info
 
     @property
     def tracker(self) -> OrderTracker:
@@ -112,6 +118,11 @@ class OrderManager:
             on_cancel=on_cancel,
             reduce_only=reduce_only,
         )
+
+        # Round quantity to exchange precision
+        if self._symbol_info:
+            quantity = self._symbol_info.round_quantity(symbol, quantity, is_market=True)
+            order.quantity = quantity
 
         order.transition("placing")
         self._tracker.register(order)
@@ -171,6 +182,13 @@ class OrderManager:
             on_partial=on_partial,
             reduce_only=reduce_only,
         )
+
+        # Round price and quantity to exchange precision
+        if self._symbol_info:
+            quantity = self._symbol_info.round_quantity(symbol, quantity, is_market=False)
+            price = self._symbol_info.round_price(symbol, price)
+            order.quantity = quantity
+            order.price = price
 
         order.transition("placing")
         self._tracker.register(order)
