@@ -263,6 +263,16 @@ export function setupAppEventListeners() {
         window.addEventListener(eventName, handler);
     };
 
+    mkHandler('order_active', (e) => {
+        if (!S._tradingMounted) return;
+        scheduleTradingRefresh({ openOrders: true, annotations: true }, 100);
+    });
+
+    mkHandler('order_failed', (e) => {
+        if (!S._tradingMounted) return;
+        scheduleTradingRefresh({ openOrders: true }, 100);
+    });
+
     mkHandler('order_filled', (e) => {
         if (!S._tradingMounted) return;
         const d = e?.detail || {};
@@ -654,102 +664,102 @@ export function setupAppEventListeners() {
     });
 
 
-// Scalper events
-// Note: scalper_progress is NOT handled here — child chases broadcast
-// chase_progress individually, which drawLiveChase already handles.
-// scalper_progress is only fired for fill count updates on the parent row.
-// scalper_progress: updates parent row fill count + per-slot backoff countdown
-mkHandler('scalper_progress', (e) => {
-    if (!S._tradingMounted) return;
-    const data = e.detail;
-    if (!data?.scalperId) return;
+    // Scalper events
+    // Note: scalper_progress is NOT handled here — child chases broadcast
+    // chase_progress individually, which drawLiveChase already handles.
+    // scalper_progress is only fired for fill count updates on the parent row.
+    // scalper_progress: updates parent row fill count + per-slot backoff countdown
+    mkHandler('scalper_progress', (e) => {
+        if (!S._tradingMounted) return;
+        const data = e.detail;
+        if (!data?.scalperId) return;
 
-    // 1. Update parent row fill count
-    const row = document.querySelector(`[data-scalper-id="${data.scalperId}"]`);
-    if (row) {
-        const fillEl = row.querySelector('.oor-price span:last-child');
-        if (fillEl) fillEl.textContent = `${data.fillCount || 0} fills`;
-    }
+        // 1. Update parent row fill count
+        const row = document.querySelector(`[data-scalper-id="${data.scalperId}"]`);
+        if (row) {
+            const fillEl = row.querySelector('.oor-price span:last-child');
+            if (fillEl) fillEl.textContent = `${data.fillCount || 0} fills`;
+        }
 
-    // 2. Update per-slot badges in drawer (paused / retry countdown)
-    const drawer = document.querySelector(`[data-scalper-drawer="${data.scalperId}"]`);
-    if (!drawer) return;
+        // 2. Update per-slot badges in drawer (paused / retry countdown)
+        const drawer = document.querySelector(`[data-scalper-drawer="${data.scalperId}"]`);
+        if (!drawer) return;
 
-    const allSlots = [...(data.longSlots || []), ...(data.shortSlots || [])];
-    const slotsWithRetry = allSlots.filter(s => s.retryAt && !s.active);
+        const allSlots = [...(data.longSlots || []), ...(data.shortSlots || [])];
+        const slotsWithRetry = allSlots.filter(s => s.retryAt && !s.active);
 
-    // Clear any previous countdown interval for this scalper
-    const prevTimer = drawer._scalperCountdownTimer;
-    if (prevTimer) clearInterval(prevTimer);
+        // Clear any previous countdown interval for this scalper
+        const prevTimer = drawer._scalperCountdownTimer;
+        if (prevTimer) clearInterval(prevTimer);
 
-    function updateSlotBadges() {
-        const now = Date.now();
-        for (const slot of allSlots) {
-            // Slot DOM node keyed by layer side+idx
-            const key = `${slot.layerIdx}`;
-            const badge = drawer.querySelector(`[data-slot-badge="${key}"]`);
-            if (!badge) continue;
+        function updateSlotBadges() {
+            const now = Date.now();
+            for (const slot of allSlots) {
+                // Slot DOM node keyed by layer side+idx
+                const key = `${slot.layerIdx}`;
+                const badge = drawer.querySelector(`[data-slot-badge="${key}"]`);
+                if (!badge) continue;
 
-            if (slot.active) {
-                badge.textContent = '●';
-                badge.style.color = '#22c55e';
-                badge.title = 'Active';
-            } else if (slot.paused) {
-                badge.textContent = '⏸ paused';
-                badge.style.color = '#f59e0b';
-                badge.title = 'Price filter active — waiting for price to re-enter range';
-            } else if (slot.retryAt) {
-                const secsLeft = Math.max(0, Math.ceil((slot.retryAt - now) / 1000));
-                badge.textContent = secsLeft > 0 ? `⟳ ${secsLeft}s` : '⟳ soon';
-                badge.style.color = '#f43f5e';
-                badge.title = `Retry #${slot.retryCount} — retrying in ${secsLeft}s`;
-            } else {
-                badge.textContent = '●';
-                badge.style.color = '#6b7280';
-                badge.title = 'Idle';
+                if (slot.active) {
+                    badge.textContent = '●';
+                    badge.style.color = '#22c55e';
+                    badge.title = 'Active';
+                } else if (slot.paused) {
+                    badge.textContent = '⏸ paused';
+                    badge.style.color = '#f59e0b';
+                    badge.title = 'Price filter active — waiting for price to re-enter range';
+                } else if (slot.retryAt) {
+                    const secsLeft = Math.max(0, Math.ceil((slot.retryAt - now) / 1000));
+                    badge.textContent = secsLeft > 0 ? `⟳ ${secsLeft}s` : '⟳ soon';
+                    badge.style.color = '#f43f5e';
+                    badge.title = `Retry #${slot.retryCount} — retrying in ${secsLeft}s`;
+                } else {
+                    badge.textContent = '●';
+                    badge.style.color = '#6b7280';
+                    badge.title = 'Idle';
+                }
             }
         }
-    }
 
-    updateSlotBadges();
+        updateSlotBadges();
 
-    // Start live countdown if any slots are backing off
-    if (slotsWithRetry.length > 0) {
-        const timer = setInterval(() => {
-            const allDone = slotsWithRetry.every(s => !s.retryAt || Date.now() >= s.retryAt);
-            updateSlotBadges();
-            if (allDone) clearInterval(timer);
-        }, 1000);
-        drawer._scalperCountdownTimer = timer;
-    }
-});
+        // Start live countdown if any slots are backing off
+        if (slotsWithRetry.length > 0) {
+            const timer = setInterval(() => {
+                const allDone = slotsWithRetry.every(s => !s.retryAt || Date.now() >= s.retryAt);
+                updateSlotBadges();
+                if (allDone) clearInterval(timer);
+            }, 1000);
+            drawer._scalperCountdownTimer = timer;
+        }
+    });
 
-mkHandler('scalper_filled', (e) => {
-    if (!S._tradingMounted) return;
-    const data = e.detail;
-    if (data?.side) playFillSound(data.side);
-    const sym = data?.symbol ? data.symbol.split('/')[0] : '';
-    import('../../core/index.js').then(({ showToast, formatPrice }) => {
-        showToast(`⚔️ Scalper ${data?.side} L${data?.layerIdx} filled @ $${formatPrice(data?.fillPrice || 0)} (${sym})`, 'info');
-    }).catch(() => { });
-    scheduleChartRiskRefresh();
-    scheduleTradingRefresh({ openOrders: true, account: true }, 500);
-});
+    mkHandler('scalper_filled', (e) => {
+        if (!S._tradingMounted) return;
+        const data = e.detail;
+        if (data?.side) playFillSound(data.side);
+        const sym = data?.symbol ? data.symbol.split('/')[0] : '';
+        import('../../core/index.js').then(({ showToast, formatPrice }) => {
+            showToast(`⚔️ Scalper ${data?.side} L${data?.layerIdx} filled @ $${formatPrice(data?.fillPrice || 0)} (${sym})`, 'info');
+        }).catch(() => { });
+        scheduleChartRiskRefresh();
+        scheduleTradingRefresh({ openOrders: true, account: true }, 500);
+    });
 
-mkHandler('scalper_cancelled', (e) => {
-    if (!S._tradingMounted) return;
-    const data = e.detail;
-    if (data?.scalperId) {
-        import('./scalper.js').then(m => m.clearScalperById(data.scalperId)).catch(() => { });
-    }
-    const sym = data?.symbol ? data.symbol.split('/')[0] : '';
-    import('../../core/index.js').then(({ showToast }) => {
-        showToast(`⚔️ Scalper stopped: ${sym}`, 'info');
-    }).catch(() => { });
-    scheduleTradingRefresh({ openOrders: true, positions: true, account: true }, 30);
-});
+    mkHandler('scalper_cancelled', (e) => {
+        if (!S._tradingMounted) return;
+        const data = e.detail;
+        if (data?.scalperId) {
+            import('./scalper.js').then(m => m.clearScalperById(data.scalperId)).catch(() => { });
+        }
+        const sym = data?.symbol ? data.symbol.split('/')[0] : '';
+        import('../../core/index.js').then(({ showToast }) => {
+            showToast(`⚔️ Scalper stopped: ${sym}`, 'info');
+        }).catch(() => { });
+        scheduleTradingRefresh({ openOrders: true, positions: true, account: true }, 30);
+    });
 
-S.set('_compactPosListeners', compactListeners);
+    S.set('_compactPosListeners', compactListeners);
 
 }
 

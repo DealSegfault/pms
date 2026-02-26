@@ -248,6 +248,7 @@ class ChaseEngine:
         self._active.pop(state.id, None)
         if self._redis:
             await self._redis.delete(f"pms:chase:{state.id}")
+            await self._redis.hdel(f"pms:active_chase:{state.sub_account_id}", state.id)
 
     async def _save_state(self, state: ChaseState) -> None:
         """Persist state to Redis."""
@@ -260,8 +261,16 @@ class ChaseEngine:
             "stalkMode": state.stalk_mode, "stalkOffsetPct": state.stalk_offset_pct,
             "maxDistancePct": state.max_distance_pct, "status": state.status,
             "repriceCount": state.reprice_count,
+            "startedAt": state.created_at,
+            "currentOrderPrice": state.initial_price,
+            "sizeUsd": state.quantity * (state.initial_price or 0),
         }
-        await self._redis.set(f"pms:chase:{state.id}", json.dumps(data), ex=CHASE_REDIS_TTL)
+        data_json = json.dumps(data)
+        await self._redis.set(f"pms:chase:{state.id}", data_json, ex=CHASE_REDIS_TTL)
+        # Also write to per-account hash for bulk queries
+        acct_key = f"pms:active_chase:{state.sub_account_id}"
+        await self._redis.hset(acct_key, state.id, data_json)
+        await self._redis.expire(acct_key, CHASE_REDIS_TTL)
 
     async def _publish_event(self, event_type: str, state: ChaseState, **extra) -> None:
         """Publish chase event to Redis."""

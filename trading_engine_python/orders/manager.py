@@ -338,6 +338,10 @@ class OrderManager:
             if not order.exchange_order_id and exchange_order_id:
                 self._tracker.update_exchange_id(order.client_order_id, exchange_order_id)
             order.transition("active")
+            await self._redis_set_open_order(order)
+            # Publish order_placed for limit orders (frontend shows in open orders)
+            if order.order_type == "LIMIT":
+                await self._publish_event("order_placed", order)
             await self._publish_event("order_active", order)
 
         elif status == "PARTIALLY_FILLED":
@@ -363,6 +367,9 @@ class OrderManager:
                 order.avg_fill_price = avg_price
 
             order.transition("filled")
+
+            # Remove from Redis open orders
+            await self._redis_remove_open_order(order)
 
             # Call risk engine if available
             if self._risk:
@@ -391,6 +398,7 @@ class OrderManager:
                     logger.error("on_cancel callback error: %s", e)
 
             await self._publish_event("order_cancelled", order, reason=status)
+            await self._redis_remove_open_order(order)
 
         if order.state != old_state:
             logger.info(
@@ -459,6 +467,29 @@ class OrderManager:
                 logger.error("Failed to publish event %s: %s", event_type, e)
         else:
             logger.debug("No Redis client — skipping publish: %s", event_type)
+
+    # ── Redis Open Order Tracking ──
+
+    async def _redis_set_open_order(self, order: OrderState) -> None:
+        """Write active order to Redis hash for JS open-orders endpoint."""
+        if not self._redis:
+            return
+        try:
+            key = f"pms:open_orders:{order.sub_account_id}"
+            await self._redis.hset(key, order.client_order_id, json.dumps(order.to_event_dict()))
+            await self._redis.expire(key, 86400)  # 24h TTL safety net
+        except Exception as e:
+            logger.error("Failed to set open order in Redis: %s", e)
+
+    async def _redis_remove_open_order(self, order: OrderState) -> None:
+        """Remove terminal order from Redis hash."""
+        if not self._redis:
+            return
+        try:
+            key = f"pms:open_orders:{order.sub_account_id}"
+            await self._redis.hdel(key, order.client_order_id)
+        except Exception as e:
+            logger.error("Failed to remove open order from Redis: %s", e)
 
     # ── Housekeeping ──
 

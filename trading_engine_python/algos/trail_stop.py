@@ -187,6 +187,7 @@ class TrailStopEngine:
             self._md.unsubscribe(state.symbol, handler)
         if self._redis:
             await self._redis.delete(f"pms:trailstop:{state.id}")
+            await self._redis.hdel(f"pms:active_trail_stop:{state.sub_account_id}", state.id)
 
     async def _save_state(self, state: TrailStopState) -> None:
         if not self._redis:
@@ -199,7 +200,11 @@ class TrailStopEngine:
             "extremePrice": state.extreme_price, "triggerPrice": state.trigger_price,
             "activated": state.activated, "status": state.status,
         }
-        await self._redis.set(f"pms:trailstop:{state.id}", json.dumps(data), ex=TRAIL_STOP_REDIS_TTL)
+        data_json = json.dumps(data)
+        await self._redis.set(f"pms:trailstop:{state.id}", data_json, ex=TRAIL_STOP_REDIS_TTL)
+        acct_key = f"pms:active_trail_stop:{state.sub_account_id}"
+        await self._redis.hset(acct_key, state.id, data_json)
+        await self._redis.expire(acct_key, TRAIL_STOP_REDIS_TTL)
 
     async def _publish_event(self, event_type: str, state: TrailStopState, **extra) -> None:
         if not self._redis:

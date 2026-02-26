@@ -192,6 +192,7 @@ class TWAPEngine:
         self._active.pop(state.id, None)
         if self._redis:
             await self._redis.delete(f"pms:twap:{state.id}")
+            await self._redis.hdel(f"pms:active_twap:{state.sub_account_id}", state.id)
 
     async def _save_state(self, state: TWAPState) -> None:
         if not self._redis:
@@ -203,7 +204,11 @@ class TWAPEngine:
             "intervalSeconds": state.interval_seconds, "status": state.status,
             "filledLots": state.filled_lots, "filledQuantity": state.filled_quantity,
         }
-        await self._redis.set(f"pms:twap:{state.id}", json.dumps(data), ex=TWAP_REDIS_TTL)
+        data_json = json.dumps(data)
+        await self._redis.set(f"pms:twap:{state.id}", data_json, ex=TWAP_REDIS_TTL)
+        acct_key = f"pms:active_twap:{state.sub_account_id}"
+        await self._redis.hset(acct_key, state.id, data_json)
+        await self._redis.expire(acct_key, TWAP_REDIS_TTL)
 
     async def _publish_event(self, event_type: str, state: TWAPState, **extra) -> None:
         if not self._redis:

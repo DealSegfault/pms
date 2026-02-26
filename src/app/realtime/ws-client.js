@@ -125,6 +125,21 @@ export function createWsClient({
                     return;
                 }
 
+                if (msg.type === 'order_active') {
+                    if (!isMyEvent) return;
+                    dispatchEvent('order_active', msg.data);
+                    return;
+                }
+
+                if (msg.type === 'order_failed') {
+                    if (!isMyEvent) return;
+                    const d = msg.data || {};
+                    const base = d.symbol ? d.symbol.replace('USDT', '') : 'Unknown';
+                    showToast(`Order failed: ${d.side || ''} ${base} — ${d.error || 'unknown error'}`, 'error');
+                    dispatchEvent('order_failed', d);
+                    return;
+                }
+
                 if (msg.type === 'position_closed') {
                     if (!isMyEvent) return;
                     const d = msg.data;

@@ -51,16 +51,37 @@ router.post('/cancel-all', requireOwnership('body'), proxyToRedis('pms:cmd:cance
 
 // ── Read-Only ──
 
-// GET /api/trade/orders/:subAccountId — Pending orders from DB
+// GET /api/trade/orders/:subAccountId — Active orders from Redis (Python OrderManager writes here)
 router.get('/orders/:subAccountId', requireOwnership(), async (req, res) => {
     try {
-        const orders = await prisma.pendingOrder.findMany({
-            where: {
-                subAccountId: req.params.subAccountId,
-                status: { in: ['PENDING'] },
-            },
-            orderBy: { createdAt: 'desc' },
-        });
+        const { getRedis } = await import('../../redis.js');
+        const redis = getRedis();
+        const key = `pms:open_orders:${req.params.subAccountId}`;
+        const raw = await redis.hgetall(key);
+        const orders = Object.values(raw || {}).map(v => {
+            try {
+                const o = JSON.parse(v);
+                // Map Python OrderState fields → frontend expected fields
+                return {
+                    id: o.clientOrderId,
+                    exchangeOrderId: o.exchangeOrderId,
+                    subAccountId: o.subAccountId,
+                    symbol: o.symbol.replace('USDT', '/USDT'),
+                    side: o.side === 'BUY' ? 'LONG' : 'SHORT',
+                    type: o.orderType || 'LIMIT',
+                    price: o.price || 0,
+                    quantity: o.quantity || 0,
+                    filledQty: o.filledQty || 0,
+                    leverage: o.leverage || 1,
+                    reduceOnly: o.reduceOnly || false,
+                    origin: o.origin || 'MANUAL',
+                    state: o.state,
+                    createdAt: o.createdAt ? new Date(o.createdAt * 1000).toISOString() : new Date().toISOString(),
+                };
+            } catch { return null; }
+        }).filter(Boolean);
+        // Sort by createdAt desc
+        orders.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
         res.json(orders);
     } catch (err) {
         res.status(500).json({ error: err.message });
