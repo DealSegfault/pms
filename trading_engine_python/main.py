@@ -50,7 +50,7 @@ async def main() -> None:
 
     # ── 1. Configuration ──
     api_key = os.getenv("api_key", "")
-    api_secret = os.getenv("api_secret", "")
+    api_secret = os.getenv("api_secret", "") or os.getenv("secret", "")
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
 
     if not api_key or not api_secret:

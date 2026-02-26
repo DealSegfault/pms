@@ -91,6 +91,10 @@ class UserStreamService:
         # Fill price cache — bounded at 500, used for reconciliation
         self._recent_fills: OrderedDict[str, Dict] = OrderedDict()
 
+        # Binance server time drift (ms) — synced on first signed request
+        self._time_drift: int = 0
+        self._drift_synced: bool = False
+
     def set_risk_engine(self, risk_engine: Any) -> None:
         """Wire up risk engine after creation (Step 7)."""
         self._risk_engine = risk_engine
@@ -367,7 +371,10 @@ class UserStreamService:
             params = {}
 
         if signed:
-            params["timestamp"] = int(time.time() * 1000)
+            if not self._drift_synced:
+                self._sync_time_drift()
+            params["timestamp"] = int(time.time() * 1000) + self._time_drift
+            params["recvWindow"] = 10000
             query = urlencode(params)
             params["signature"] = hmac.new(
                 self._api_secret.encode(),
@@ -384,7 +391,16 @@ class UserStreamService:
             verify=True,
             timeout=10,
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            try:
+                err_body = response.json()
+            except Exception:
+                err_body = response.text
+            logger.error(
+                "Binance API error: %s %s → %d %s",
+                method, endpoint, response.status_code, err_body,
+            )
+            response.raise_for_status()
         return response.json()
 
     def _generate_signature(self, params: dict) -> str:
@@ -395,3 +411,24 @@ class UserStreamService:
             query.encode(),
             hashlib.sha256,
         ).hexdigest()
+
+    def _sync_time_drift(self) -> None:
+        """Sync local clock with Binance server time to fix signature errors."""
+        try:
+            resp = requests.get(
+                f"{self._base_url}/fapi/v1/time",
+                timeout=5,
+                proxies=self._proxies,
+            )
+            server_time = resp.json()["serverTime"]
+            local_time = int(time.time() * 1000)
+            self._time_drift = server_time - local_time
+            self._drift_synced = True
+            if abs(self._time_drift) > 500:
+                logger.warning("Clock drift detected: %dms (server - local)", self._time_drift)
+            else:
+                logger.debug("Time drift: %dms", self._time_drift)
+        except Exception as e:
+            logger.error("Failed to sync Binance server time: %s", e)
+            self._time_drift = 0
+            self._drift_synced = True  # Don't retry endlessly
