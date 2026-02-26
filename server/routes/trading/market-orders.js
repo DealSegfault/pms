@@ -234,13 +234,22 @@ router.get('/chart-data/:subAccountId', requireOwnership(), async (req, res) => 
         const subAccountId = req.params.subAccountId;
         const { getRedis } = await import('../../redis.js');
 
+        // Normalize symbol for comparison: 'RAVE/USDT:USDT' → 'RAVEUSDT'
+        const normSymbol = symbol.replace('/', '').replace(':USDT', '').toUpperCase();
+        // Also create a slash form for matching snapshot positions: 'RAVE/USDT'
+        const slashSymbol = normSymbol.replace('USDT', '/USDT');
+
         // 1. Positions from Redis risk snapshot
         let positions = [];
         const { getRiskSnapshot } = await import('../../redis.js');
         const snapshot = await getRiskSnapshot(subAccountId);
         if (snapshot && Array.isArray(snapshot.positions)) {
             positions = snapshot.positions
-                .filter(p => p.symbol === symbol)
+                .filter(p => {
+                    // Match any format: RAVEUSDT, RAVE/USDT, RAVE/USDT:USDT
+                    const pNorm = (p.symbol || '').replace('/', '').replace(':USDT', '').toUpperCase();
+                    return pNorm === normSymbol;
+                })
                 .map(p => ({
                     id: p.id, symbol: p.symbol, side: p.side,
                     entryPrice: p.entryPrice, markPrice: p.markPrice,
@@ -258,12 +267,12 @@ router.get('/chart-data/:subAccountId', requireOwnership(), async (req, res) => 
         const openOrders = Object.values(rawOrders || {}).map(v => {
             try {
                 const o = JSON.parse(v);
-                // Convert BTCUSDT → BTC/USDT for symbol matching
-                const mappedSymbol = o.symbol.replace('USDT', '/USDT');
-                if (mappedSymbol !== symbol) return null;
+                // Compare normalized: RAVEUSDT === RAVEUSDT
+                const oNorm = (o.symbol || '').replace('/', '').replace(':USDT', '').toUpperCase();
+                if (oNorm !== normSymbol) return null;
                 return {
                     id: o.clientOrderId,
-                    symbol: mappedSymbol,
+                    symbol: slashSymbol,
                     side: o.side === 'BUY' ? 'LONG' : 'SHORT',
                     type: o.orderType || 'LIMIT',
                     price: o.price || 0,
