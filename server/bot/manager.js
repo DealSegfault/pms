@@ -8,9 +8,20 @@
 import prisma from '../db/prisma.js';
 import { WebSocket } from 'ws';
 import BotEngine from './engine.js';
-import riskEngine from '../risk/index.js';
-import exchange from '../exchange.js';
 import hotScanner from './hot-scanner.js';
+
+// Lazy-loaded: riskEngine and exchange are in Python now.
+// Bot system is temporarily degraded — it will log warnings but won't crash.
+let riskEngine = null;
+let exchange = null;
+try {
+    const mod = await import('../_archived/risk/index.js');
+    riskEngine = mod.default;
+} catch { console.warn('[BotManager] riskEngine not available — bot trading disabled'); }
+try {
+    const mod = await import('../_archived/exchange.js');
+    exchange = mod.default;
+} catch { console.warn('[BotManager] exchange not available — bot trading disabled'); }
 
 
 

@@ -1,6 +1,7 @@
 import { Router } from 'express';
-import riskEngine, { prisma } from '../risk/index.js';
+import prisma from '../db/prisma.js';
 import { getRiskSnapshot } from '../redis.js';
+import { pushAndWait } from '../redis-proxy.js';
 import { sanitize } from '../sanitize.js';
 import { validate } from '../middleware/validate.js';
 import {
@@ -22,18 +23,22 @@ router.get('/dashboard', async (req, res) => {
 
         const dashboard = [];
         for (const acct of accounts) {
-            const summary = await riskEngine.getAccountSummary(acct.id);
-            dashboard.push(summary);
+            // Try Redis snapshot from Python, fallback to DB
+            const snapshot = await getRiskSnapshot(acct.id);
+            if (snapshot) {
+                dashboard.push({ subAccountId: acct.id, name: acct.name, ...snapshot });
+            } else {
+                dashboard.push({
+                    subAccountId: acct.id,
+                    name: acct.name,
+                    balance: acct.currentBalance,
+                    positions: acct.positions || [],
+                    status: acct.status,
+                });
+            }
         }
 
-        // Get main account balance from exchange
-        let mainBalance = null;
-        try {
-            const { default: exchange } = await import('../exchange.js');
-            mainBalance = await exchange.fetchBalance();
-        } catch { }
-
-        res.json({ accounts: dashboard, mainAccountBalance: mainBalance });
+        res.json({ accounts: dashboard, mainAccountBalance: null });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -42,7 +47,7 @@ router.get('/dashboard', async (req, res) => {
 // POST /api/admin/force-close/:positionId - Force close any position
 router.post('/force-close/:positionId', validate(PositionIdParam, 'params'), async (req, res) => {
     try {
-        const result = await riskEngine.closePosition(req.params.positionId, 'CLOSE');
+        const result = await pushAndWait('pms:cmd:admin_close', { positionId: req.params.positionId });
         if (!result.success) {
             return res.status(400).json({ error: 'Force close failed', reasons: result.errors });
         }
@@ -87,7 +92,7 @@ router.post('/force-close-all/:subAccountId', validate(SubAccountIdParam, 'param
 
         const results = [];
         for (const pos of positions) {
-            const result = await riskEngine.closePosition(pos.id, 'CLOSE');
+            const result = await pushAndWait('pms:cmd:admin_close', { positionId: pos.id });
             results.push({ positionId: pos.id, symbol: pos.symbol, ...result });
         }
 
@@ -141,7 +146,7 @@ router.get('/all-positions', async (req, res) => {
                 continue;
             }
 
-            const summary = await riskEngine.getAccountSummary(acct.id);
+            const summary = await getRiskSnapshot(acct.id);
             for (const p of (summary?.positions || [])) {
                 all.push({
                     ...p,
@@ -162,7 +167,7 @@ router.get('/all-positions', async (req, res) => {
 router.post('/takeover/:positionId', validate(PositionIdParam, 'params'), async (req, res) => {
     try {
         const adminUserId = req.user?.id || 'admin';
-        const result = await riskEngine.takeoverPosition(req.params.positionId, adminUserId);
+        const result = await pushAndWait('pms:cmd:admin_takeover', { positionId: req.params.positionId, adminUserId });
         if (!result.success) {
             return res.status(400).json({ error: 'Takeover failed', reasons: result.errors });
         }
@@ -197,7 +202,7 @@ router.get('/at-risk', async (req, res) => {
         const atRisk = [];
         for (const acct of accounts) {
             if (acct.positions.length === 0) continue;
-            const summary = await riskEngine.getAccountSummary(acct.id);
+            const summary = await getRiskSnapshot(acct.id);
             if (summary && summary.summary.marginRatio >= 0.5) {
                 atRisk.push(summary);
             }

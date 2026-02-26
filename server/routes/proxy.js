@@ -109,29 +109,33 @@ router.post('/v1/order',
 
             // If not reduceOnly, run risk checks
             if (!reduceOnly) {
-                // Infer leverage from existing rules or use 1
-                const rules = await riskEngine.getEffectiveRules(req.subAccount.id);
-                const leverage = rules.maxLeverage || 1;
+                if (!riskEngine) {
+                    // Python handles risk — skip JS-side validation
+                } else {
+                    // Infer leverage from existing rules or use 1
+                    const rules = await riskEngine.getEffectiveRules(req.subAccount.id);
+                    const leverage = rules.maxLeverage || 1;
 
-                // Get current price for notional calc
-                let markPrice = prc;
-                if (!markPrice) {
-                    try {
-                        const ticker = await exchange.fetchTicker(ccxtSymbol);
-                        markPrice = ticker?.mark || ticker?.last;
-                    } catch { }
-                }
+                    // Get current price for notional calc
+                    let markPrice = prc;
+                    if (!markPrice) {
+                        try {
+                            const ticker = await exchange.fetchTicker(ccxtSymbol);
+                            markPrice = ticker?.mark || ticker?.last;
+                        } catch { }
+                    }
 
-                if (markPrice) {
-                    const notional = qty * markPrice;
-                    const validation = await riskEngine.validateTrade(
-                        req.subAccount.id, ccxtSymbol, side.toUpperCase(), qty, leverage,
-                    );
-                    if (!validation.valid) {
-                        return res.status(400).json({
-                            code: -2027,
-                            msg: `Risk check failed: ${validation.errors.join(', ')}`,
-                        });
+                    if (markPrice) {
+                        const notional = qty * markPrice;
+                        const validation = await riskEngine.validateTrade(
+                            req.subAccount.id, ccxtSymbol, side.toUpperCase(), qty, leverage,
+                        );
+                        if (!validation.valid) {
+                            return res.status(400).json({
+                                code: -2027,
+                                msg: `Risk check failed: ${validation.errors.join(', ')}`,
+                            });
+                        }
                     }
                 }
             }
@@ -329,8 +333,14 @@ router.get('/v2/positionRisk',
             if (snapshotFresh && Array.isArray(snapshot.positions)) {
                 positions = snapshot.positions;
             } else {
-                const summary = await riskEngine.getAccountSummary(subAccountId);
-                positions = summary?.positions || [];
+                // Try Redis snapshot first (from Python), fallback to riskEngine
+                const riskSnap = await getRiskSnapshot(subAccountId);
+                if (riskSnap) {
+                    positions = riskSnap.positions || [];
+                } else if (riskEngine) {
+                    const summary = await riskEngine.getAccountSummary(subAccountId);
+                    positions = summary?.positions || [];
+                }
             }
 
             // Return Binance-compatible format

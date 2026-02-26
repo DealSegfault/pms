@@ -1,20 +1,14 @@
-/**
- * ws-proxy.js — WebSocket server with Redis PUB/SUB event forwarding.
- *
- * PROXY VERSION: Instead of wiring to riskEngine directly, subscribes to
- * Redis pms:events:* channels from Python engine and forwards to clients.
- *
- * Auth, subscriptions, and backpressure handling are unchanged.
- */
 import { WebSocketServer } from 'ws';
 import prisma from './db/prisma.js';
+import riskEngine from './risk/index.js';
+import botManager from './bot/manager.js';
 import { verifyToken } from './auth.js';
-import { subscribeToPmsEvents } from './redis-proxy.js';
+
 
 let wss = null;
 
 // ── Indexed routing: O(1) lookup by subAccountId ──
-const subAccountSockets = new Map();
+const subAccountSockets = new Map(); // subAccountId → Set<WebSocket>
 
 function indexSocket(ws, subAccountId) {
     if (!subAccountSockets.has(subAccountId)) {
@@ -34,7 +28,7 @@ function unindexSocket(ws) {
 }
 
 // ── Backpressure-safe send ──
-const MAX_BUFFER_BYTES = 1024 * 1024;
+const MAX_BUFFER_BYTES = 1024 * 1024; // 1MB
 
 function safeSend(ws, message) {
     if (ws.readyState !== 1) return;
@@ -49,17 +43,18 @@ function safeSend(ws, message) {
 export function initWebSocket(server) {
     wss = new WebSocketServer({ server, path: '/ws' });
 
-    // Wire up Redis PUB/SUB → broadcast (replaces riskEngine.setWsEmitter)
-    subscribeToPmsEvents(broadcast).catch(err => {
-        console.error('[WS] Redis event subscription failed:', err.message);
-    });
+    // Wire up the risk engine's WS emitter
+    riskEngine.setWsEmitter(broadcast);
+
+    // Wire up the bot manager's WS emitter for live scanner
+    botManager.setWsEmitter(broadcast);
 
     wss.on('connection', (ws) => {
         console.log('[WS] Client connected');
 
         ws.isAlive = true;
-        ws.userId = null;
-        ws.subscribedAccount = null;
+        ws.userId = null;           // Set after auth
+        ws.subscribedAccount = null; // Set after subscribe
         ws.on('pong', () => { ws.isAlive = true; });
 
         ws.on('message', async (data) => {
@@ -69,6 +64,7 @@ export function initWebSocket(server) {
                     const subAccountId = msg.subAccountId || null;
                     const token = msg.token || null;
 
+                    // Validate auth token
                     if (token) {
                         const payload = verifyToken(token);
                         if (payload) {
@@ -77,13 +73,17 @@ export function initWebSocket(server) {
                         }
                     }
 
+                    // If we have a userId, validate ownership of the subAccount
                     if (subAccountId && ws.userId) {
+                        // Remove from previous subscription index
                         unindexSocket(ws);
 
                         if (ws.userRole === 'ADMIN') {
+                            // Admins can subscribe to any account
                             ws.subscribedAccount = subAccountId;
                             indexSocket(ws, subAccountId);
                         } else {
+                            // Regular users: verify they own this sub-account
                             const account = await prisma.subAccount.findUnique({
                                 where: { id: subAccountId },
                                 select: { userId: true },
@@ -92,10 +92,12 @@ export function initWebSocket(server) {
                                 ws.subscribedAccount = subAccountId;
                                 indexSocket(ws, subAccountId);
                             } else {
+                                console.warn(`[WS] User ${ws.userId} tried to subscribe to unowned account ${subAccountId}`);
                                 ws.send(JSON.stringify({ type: 'error', message: 'Not authorized for this account' }));
                             }
                         }
                     } else if (subAccountId) {
+                        // No auth token provided — reject subscription
                         ws.send(JSON.stringify({ type: 'error', message: 'Authentication token required' }));
                     }
                 }
@@ -107,6 +109,7 @@ export function initWebSocket(server) {
             console.log('[WS] Client disconnected');
         });
 
+        // Send welcome
         ws.send(JSON.stringify({ type: 'connected', timestamp: Date.now() }));
     });
 
@@ -121,7 +124,7 @@ export function initWebSocket(server) {
 
     wss.on('close', () => clearInterval(heartbeat));
 
-    console.log('[WS] WebSocket server started (proxy mode)');
+    console.log('[WS] WebSocket server started');
 }
 
 function broadcast(type, data) {
@@ -129,6 +132,7 @@ function broadcast(type, data) {
     const message = JSON.stringify({ type, data, timestamp: Date.now() });
 
     if (data.subAccountId) {
+        // Targeted broadcast: O(1) lookup + O(subscribers)
         const sockets = subAccountSockets.get(data.subAccountId);
         if (sockets) {
             for (const ws of sockets) {
@@ -136,6 +140,7 @@ function broadcast(type, data) {
             }
         }
     } else {
+        // Global broadcast (rare — no subAccountId)
         for (const ws of wss.clients) {
             safeSend(ws, message);
         }
@@ -143,3 +148,4 @@ function broadcast(type, data) {
 }
 
 export { broadcast };
+

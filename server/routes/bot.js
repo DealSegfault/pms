@@ -12,7 +12,6 @@ import { Router } from 'express';
 import prisma from '../db/prisma.js';
 import botManager from '../bot/manager.js';
 import { requireOwnership } from '../ownership.js';
-import riskEngine from '../risk/index.js';
 const router = Router();
 
 // ─────────────────────────────────────

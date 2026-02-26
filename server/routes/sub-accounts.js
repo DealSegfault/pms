@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { prisma } from '../risk/index.js';
+import prisma from '../db/prisma.js';
 import { sanitize } from '../sanitize.js';
 import { requireOwnership } from '../ownership.js';
 import { validate } from '../middleware/validate.js';

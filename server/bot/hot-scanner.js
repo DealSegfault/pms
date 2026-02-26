@@ -6,7 +6,11 @@
  * Results are cached and available for the scanner tab.
  */
 
-import exchange from '../exchange.js';
+let exchange = null;
+try {
+    const mod = await import('../_archived/exchange.js');
+    exchange = mod.default;
+} catch { console.warn('[HotScanner] exchange not available — scanning disabled'); }
 
 // ── Configuration ──────────────────────────────
 const SCAN_INTERVAL_MS = 30_000;   // Rescan every 30s
