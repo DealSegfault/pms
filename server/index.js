@@ -176,8 +176,8 @@ async function start() {
 
         if (redisReady) {
             // Wire redis-proxy helper to use the Redis client
-            const { default: redisClient } = await import('./redis.js');
-            setRedisClient(redisClient);
+            const { getRedis } = await import('./redis.js');
+            setRedisClient(getRedis());
             console.log('[Server] Redis proxy wired — trading commands will go to Python engine');
         } else {
             console.warn('[Server] Redis not available — trading commands will fail (Python engine unreachable)');
