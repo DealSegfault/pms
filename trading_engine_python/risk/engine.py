@@ -357,10 +357,14 @@ class RiskEngine:
                     "side": p.side,
                     "entryPrice": p.entry_price,
                     "quantity": p.quantity,
+                    "notional": p.notional,
                     "margin": p.margin,
                     "leverage": p.leverage,
+                    "liquidationPrice": p.liquidation_price,
                     "unrealizedPnl": p.unrealized_pnl,
+                    "pnlPercent": (p.unrealized_pnl / p.margin * 100) if p.margin else 0,
                     "markPrice": p.mark_price,
+                    "openedAt": p.opened_at,
                 }
                 for p in positions
             ],

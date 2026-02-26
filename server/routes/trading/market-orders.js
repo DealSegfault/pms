@@ -145,11 +145,57 @@ router.get('/positions/:subAccountId', requireOwnership(), async (req, res) => {
 // GET /api/trade/margin/:subAccountId — Margin info (from Redis snapshot)
 router.get('/margin/:subAccountId', requireOwnership(), async (req, res) => {
     try {
-        const snapshot = await getRiskSnapshot(req.params.subAccountId);
-        if (snapshot) {
+        const subAccountId = req.params.subAccountId;
+        const snapshot = await getRiskSnapshot(subAccountId);
+        if (snapshot?.balance != null) {
+            // Enrich with rules if not present
+            if (!snapshot.rules) {
+                const rule = await prisma.riskRule.findFirst({ where: { subAccountId } });
+                if (rule) {
+                    snapshot.rules = {
+                        maxNotionalPerTrade: rule.maxNotionalPerTrade,
+                        maxTotalExposure: rule.maxTotalExposure,
+                        maxLeverage: rule.maxLeverage,
+                    };
+                }
+            }
             return res.json(snapshot);
         }
-        res.json({ balance: 0, equity: 0, marginUsed: 0, availableMargin: 0, positions: [] });
+
+        // DB fallback — compute from positions + account
+        const [account, positions, rule] = await Promise.all([
+            prisma.subAccount.findUnique({ where: { id: subAccountId }, select: { currentBalance: true } }),
+            prisma.virtualPosition.findMany({ where: { subAccountId, status: 'OPEN' } }),
+            prisma.riskRule.findFirst({ where: { subAccountId } }),
+        ]);
+
+        const balance = account?.currentBalance || 0;
+        const marginUsed = positions.reduce((s, p) => s + (p.margin || 0), 0);
+        const equity = balance;
+        const availableMargin = Math.max(0, equity - marginUsed);
+
+        res.json({
+            balance,
+            equity,
+            marginUsed,
+            availableMargin,
+            positions: positions.map(p => ({
+                id: p.id, symbol: p.symbol, side: p.side,
+                entryPrice: p.entryPrice, quantity: p.quantity,
+                margin: p.margin, leverage: p.leverage,
+                notional: p.notional,
+                liquidationPrice: p.liquidationPrice,
+                markPrice: p.entryPrice,
+                unrealizedPnl: 0,
+            })),
+            ...(rule ? {
+                rules: {
+                    maxNotionalPerTrade: rule.maxNotionalPerTrade,
+                    maxTotalExposure: rule.maxTotalExposure,
+                    maxLeverage: rule.maxLeverage,
+                },
+            } : {}),
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
