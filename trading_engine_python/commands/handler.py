@@ -319,7 +319,16 @@ class CommandHandler:
         if not self._chase_engine:
             return {"success": False, "error": "Chase engine not available"}
         chase_id = await self._chase_engine.start_chase(cmd)
-        return {"success": True, "chaseId": chase_id}
+        chase_state = self._chase_engine._active.get(chase_id)
+        return {
+            "success": True,
+            "chaseId": chase_id,
+            "symbol": cmd.get("symbol", ""),  # Keep original format for frontend
+            "side": cmd.get("side", ""),
+            "currentOrderPrice": chase_state.initial_price if chase_state else None,
+            "stalkOffsetPct": chase_state.stalk_offset_pct if chase_state else 0,
+            "stalkMode": chase_state.stalk_mode if chase_state else "none",
+        }
 
     async def handle_chase_cancel(self, cmd: dict) -> dict:
         """Cancel chase order."""

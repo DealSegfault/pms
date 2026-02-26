@@ -225,4 +225,64 @@ router.get('/history/:subAccountId', requireOwnership(), async (req, res) => {
     }
 });
 
+// GET /api/trade/chart-data/:subAccountId — Data for chart annotations (positions, orders, trades)
+router.get('/chart-data/:subAccountId', requireOwnership(), async (req, res) => {
+    try {
+        const { symbol } = req.query;
+        if (!symbol) return res.status(400).json({ error: 'symbol required' });
+
+        const subAccountId = req.params.subAccountId;
+        const { getRedis } = await import('../../redis.js');
+
+        // 1. Positions from Redis risk snapshot
+        let positions = [];
+        const { getRiskSnapshot } = await import('../../redis.js');
+        const snapshot = await getRiskSnapshot(subAccountId);
+        if (snapshot && Array.isArray(snapshot.positions)) {
+            positions = snapshot.positions
+                .filter(p => p.symbol === symbol)
+                .map(p => ({
+                    id: p.id, symbol: p.symbol, side: p.side,
+                    entryPrice: p.entryPrice, markPrice: p.markPrice,
+                    quantity: p.quantity, notional: p.notional,
+                    leverage: p.leverage, margin: p.margin,
+                    liquidationPrice: p.liquidationPrice,
+                    unrealizedPnl: p.unrealizedPnl, pnlPercent: p.pnlPercent,
+                    status: 'OPEN', openedAt: p.openedAt,
+                }));
+        }
+
+        // 2. Open orders from Redis hash (same source as loadOpenOrders)
+        const redis = getRedis();
+        const rawOrders = await redis.hgetall(`pms:open_orders:${subAccountId}`);
+        const openOrders = Object.values(rawOrders || {}).map(v => {
+            try {
+                const o = JSON.parse(v);
+                // Convert BTCUSDT → BTC/USDT for symbol matching
+                const mappedSymbol = o.symbol.replace('USDT', '/USDT');
+                if (mappedSymbol !== symbol) return null;
+                return {
+                    id: o.clientOrderId,
+                    symbol: mappedSymbol,
+                    side: o.side === 'BUY' ? 'LONG' : 'SHORT',
+                    type: o.orderType || 'LIMIT',
+                    price: o.price || 0,
+                    quantity: o.quantity || 0,
+                };
+            } catch { return null; }
+        }).filter(Boolean);
+
+        // 3. Recent trades from DB
+        const trades = await prisma.tradeExecution.findMany({
+            where: { subAccountId, symbol },
+            orderBy: { timestamp: 'desc' },
+            take: 200,
+        });
+
+        res.json({ positions, trades, openOrders });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 export default router;
