@@ -1,0 +1,18 @@
+# Binance SDK
+binance-futures-connector==4.1.0
+
+# Async / Networking
+aiohttp==3.13.3
+websockets==16.0
+uvloop==0.22.1
+requests==2.32.3
+
+# Database
+sqlalchemy==2.0.34
+aiosqlite==0.22.1
+
+# Redis
+redis==7.1.0
+
+# Data structures
+sortedcontainers==2.4.0
