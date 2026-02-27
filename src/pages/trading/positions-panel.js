@@ -8,6 +8,99 @@ import { _refreshEquityUpnl } from './order-form.js';
 import { cancelTwap } from './twap.js';
 import { scheduleTradingRefresh } from './refresh-scheduler.js';
 
+// ── Optimistic Open Order Helpers (WS-driven, no HTTP) ──
+
+/**
+ * Remove an open order row from the DOM by clientOrderId.
+ * Called by WS order_filled / order_cancelled handlers.
+ */
+export function removeOpenOrderRow(clientOrderId) {
+    if (!clientOrderId) return;
+    const btn = document.querySelector(`[data-cancel-order="${clientOrderId}"]`);
+    const row = btn?.closest('.oo-row');
+    if (row) row.remove();
+    _updateOpenOrderCount();
+}
+
+/**
+ * Add a limit order row to the open orders DOM from WS event data.
+ * Called by WS order_active handler for LIMIT orders.
+ */
+export function addLimitOrderRow(d) {
+    const list = document.getElementById('open-orders-list');
+    if (!list || !d.clientOrderId) return;
+
+    // Skip algo-managed orders — they have dedicated rows
+    if (['CHASE', 'SCALPER', 'TWAP', 'TWAP_SLICE'].includes(d.origin)) return;
+    // Only add LIMIT orders (market orders don't persist in open orders)
+    if (d.orderType !== 'LIMIT') return;
+
+    // Don't add if already exists
+    if (list.querySelector(`[data-cancel-order="${d.clientOrderId}"]`)) return;
+
+    // Clear "No open orders" placeholder
+    const noOrders = list.querySelector('div[style*="text-align:center"]');
+    if (noOrders && list.children.length === 1) list.innerHTML = '';
+
+    const notional = ((d.price || 0) * (d.quantity || 0)).toFixed(2);
+    const isLong = d.side === 'BUY';
+    const sym = d.symbol || '';
+    const base = sym.split('/')[0] || sym;
+
+    const tmp = document.createElement('div');
+    tmp.innerHTML = `
+      <div class="oo-row">
+        <span class="oor-sym">
+          <span class="oor-name" data-oo-symbol="${sym}">${base}</span>
+          <span class="oor-badge ${isLong ? 'cpr-long' : 'cpr-short'}">${isLong ? 'L' : 'S'}</span>
+        </span>
+        <span class="oor-price">$${formatPrice(d.price)}</span>
+        <span class="oor-qty">${(d.quantity || 0).toFixed(4)}</span>
+        <span class="oor-notional">$${notional}</span>
+        <span class="oor-age">0s</span>
+        <span class="oor-cancel" data-cancel-order="${d.clientOrderId}" title="Cancel order">✕</span>
+      </div>
+    `;
+    const newRow = tmp.firstElementChild;
+    list.appendChild(newRow);
+
+    // Attach cancel handler
+    newRow.querySelector('[data-cancel-order]')?.addEventListener('click', () => {
+        cancelOrder(d.clientOrderId);
+    });
+
+    // Attach symbol click handler
+    newRow.querySelector('.oor-name')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (sym && sym !== S.selectedSymbol) {
+            import('./order-form.js').then(({ switchSymbol }) => switchSymbol(sym));
+        }
+    });
+
+    _updateOpenOrderCount();
+}
+
+/**
+ * Recount open order rows and update the badge.
+ */
+function _updateOpenOrderCount() {
+    const list = document.getElementById('open-orders-list');
+    const countEl = document.getElementById('open-orders-count');
+    if (!list || !countEl) return;
+    const count = list.querySelectorAll('.oo-row').length;
+    countEl.textContent = count;
+
+    if (count === 0) {
+        list.innerHTML = '<div style="padding:8px; color:var(--text-muted); text-align:center;">No open orders</div>';
+    }
+
+    // Toggle cancel-all button visibility
+    const cancelAllBtn = document.getElementById('cancel-all-orders');
+    if (cancelAllBtn) {
+        cancelAllBtn.style.display = count > 0 ? '' : 'none';
+    }
+}
+
 // ── Helpers ─────────────────────────────────────
 
 export function formatRelativeTime(dateStr) {

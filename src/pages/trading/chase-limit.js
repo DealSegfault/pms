@@ -156,8 +156,9 @@ export function onChaseDepthTick() {
         // Only update for current symbol
         if (st.symbol && st.symbol !== S.selectedSymbol) continue;
 
+        const isLong = st.side === 'LONG' || st.side === 'BUY';
         let target, quoteRef;
-        if (st.side === 'LONG') {
+        if (isLong) {
             target = st.stalkOffsetPct > 0 ? bestBid * (1 - st.stalkOffsetPct / 100) : bestBid;
             quoteRef = bestBid;
         } else {
@@ -186,21 +187,35 @@ export function clearActiveChase() {
 }
 
 function _renderOneChase(entry, price, quoteRef) {
-    _removeLinesForChase(entry);
     if (!S.candleSeries) return;
 
     const st = entry.state;
-    const isLong = st.side === 'LONG';
+    const isLong = st.side === 'LONG' || st.side === 'BUY';
     const sym = st.symbol?.split('/')[0] || '';
+    const title = `🎯 ${sym} ${isLong ? 'Buy' : 'Sell'}${st.stalkOffsetPct > 0 ? ` ${st.stalkOffsetPct}%` : ''}`;
 
-    // Main chase price line (solid cyan)
+    // Update lines in-place if they already exist (avoids flashing)
+    if (entry.lines.length > 0) {
+        try {
+            entry.lines[0].applyOptions({ price, title });
+        } catch { /* line was removed externally */ }
+        // Update initial price line if present
+        if (entry.lines.length > 1 && st.initialPrice && st.initialPrice !== price) {
+            try {
+                entry.lines[1].applyOptions({ price: st.initialPrice });
+            } catch { }
+        }
+        return;
+    }
+
+    // First render — create lines
     entry.lines.push(S.candleSeries.createPriceLine({
         price,
         color: '#06b6d4',
         lineWidth: 2,
         lineStyle: 0,
         axisLabelVisible: true,
-        title: `🎯 ${sym} ${isLong ? 'Buy' : 'Sell'}${st.stalkOffsetPct > 0 ? ` ${st.stalkOffsetPct}%` : ''}`,
+        title,
     }));
 
     // Initial price reference (faint)

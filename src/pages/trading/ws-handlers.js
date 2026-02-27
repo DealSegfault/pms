@@ -4,7 +4,7 @@ import { streams } from '../../lib/binance-streams.js';
 import * as S from './state.js';
 import { scheduleOrderBookRender, scheduleTradeTapeRender } from './orderbook.js';
 import { _refreshEquityUpnl, _applyNegativeBalanceLock } from './order-form.js';
-import { scheduleChartRiskRefresh, updateCompactLiqForPosition, connectCompactMarkStreams, loadChartAnnotations } from './positions-panel.js';
+import { scheduleChartRiskRefresh, updateCompactLiqForPosition, connectCompactMarkStreams, loadChartAnnotations, removeOpenOrderRow, addLimitOrderRow } from './positions-panel.js';
 import { saveToStorage } from './candle-storage.js';
 import { scheduleTradingRefresh } from './refresh-scheduler.js';
 import { playFillSound } from './fill-sounds.js';
@@ -268,7 +268,11 @@ export function setupAppEventListeners() {
 
     mkHandler('order_active', (e) => {
         if (!S._tradingMounted) return;
-        scheduleTradingRefresh({ openOrders: true, annotations: true }, 100);
+        const d = e?.detail || {};
+        // Optimistically add the order to open orders DOM (only LIMIT, non-algo)
+        addLimitOrderRow(d);
+        // Refresh chart annotations for new price line
+        loadChartAnnotations(true);
     });
 
     mkHandler('order_failed', (e) => {
@@ -286,16 +290,16 @@ export function setupAppEventListeners() {
         if (d.clientOrderId && _orderLineRegistry.has(d.clientOrderId)) {
             try { S.candleSeries.removePriceLine(_orderLineRegistry.get(d.clientOrderId)); } catch { }
             _orderLineRegistry.delete(d.clientOrderId);
-            // Request fresh labels too
             import('./positions-panel.js').then(m => m.refreshChartLeftAnnotationLabels());
         }
 
-        scheduleTradingRefresh({
-            positions: true,
-            openOrders: true,
-            annotations: true,
-            forceAnnotations: true,
-        }, 300);
+        // Optimistically remove from open orders DOM (no HTTP refetch)
+        removeOpenOrderRow(d.clientOrderId);
+
+        // Position is created by the separate position_updated WS event
+        // Margin is updated by the separate margin_update WS event
+        // Only refresh chart annotations for the filled order's price line removal
+        loadChartAnnotations(true);
     });
 
     mkHandler('order_cancelled', (e) => {
@@ -306,15 +310,12 @@ export function setupAppEventListeners() {
         if (d.clientOrderId && _orderLineRegistry.has(d.clientOrderId)) {
             try { S.candleSeries.removePriceLine(_orderLineRegistry.get(d.clientOrderId)); } catch { }
             _orderLineRegistry.delete(d.clientOrderId);
-            // Request fresh labels too
             import('./positions-panel.js').then(m => m.refreshChartLeftAnnotationLabels());
         }
 
-        scheduleTradingRefresh({
-            openOrders: true,
-            annotations: true,
-            forceAnnotations: true,
-        }, 300);
+        // Optimistically remove from open orders DOM (no HTTP refetch)
+        removeOpenOrderRow(d.clientOrderId);
+        loadChartAnnotations(true);
     });
 
     mkHandler('position_closed', (e) => {

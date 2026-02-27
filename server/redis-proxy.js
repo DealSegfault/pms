@@ -104,26 +104,28 @@ export function proxyToRedis(queue, extractFields = null) {
  * @param {Function} broadcastFn - Function(type, data) to send to clients
  */
 export async function subscribeToPmsEvents(broadcastFn) {
+    console.log('[RedisProxy] subscribeToPmsEvents called, redis =', redis ? 'SET' : 'NULL');
     if (!redis) {
         console.warn('[RedisProxy] Redis not available — PMS events will not be forwarded');
         return;
     }
 
-    // Create a separate subscriber connection (ioredis requires this for pub/sub)
+    // Create a FRESH subscriber connection (not duplicate — avoids lazyConnect issues)
     try {
-        const sub = redis.duplicate();
+        const Redis = (await import('ioredis')).default;
+        const sub = new Redis({
+            host: process.env.REDIS_HOST || '127.0.0.1',
+            port: parseInt(process.env.REDIS_PORT || '6379'),
+            maxRetriesPerRequest: null, // subscriber mode needs this
+        });
 
         sub.on('error', (err) => {
             console.error('[RedisProxy] Subscriber error:', err.message);
         });
 
-        // ioredis with lazyConnect needs explicit connect
-        if (sub.status === 'wait') {
-            await sub.connect();
-            console.log('[RedisProxy] Subscriber connection established (status:', sub.status, ')');
-        }
-
+        console.log('[RedisProxy] Subscriber connecting...');
         await sub.psubscribe('pms:events:*');
+        console.log('[RedisProxy] ✓ Subscribed to pms:events:* — forwarding to WebSocket clients');
 
         sub.on('pmessage', (pattern, channel, message) => {
             try {
@@ -135,8 +137,6 @@ export async function subscribeToPmsEvents(broadcastFn) {
                 console.error('[RedisProxy] Failed to parse PMS event:', err.message);
             }
         });
-
-        console.log('[RedisProxy] ✓ Subscribed to pms:events:* — forwarding to WebSocket clients');
     } catch (err) {
         console.error('[RedisProxy] Failed to set up PUB/SUB subscriber:', err.message, err.stack);
     }
