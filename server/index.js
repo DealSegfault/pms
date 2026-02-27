@@ -62,7 +62,7 @@ import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 
 const apiLimiter = rateLimit({
     windowMs: 60_000,
-    max: 100,
+    max: 600,
     keyGenerator: (req) => req.user?.id || ipKeyGenerator(req.ip),
     standardHeaders: true,
     legacyHeaders: false,
@@ -101,10 +101,16 @@ app.get('/api/health', async (req, res) => {
         dbOk = true;
     } catch { }
     try {
-        // Check if Python engine is alive by pinging Redis key
-        const { default: redis } = await import('./redis.js');
-        // Python engine writes pms:risk:* keys — if any exist, engine is running
-        pythonOk = true; // Optimistic — actual check happens via Redis proxy timeout
+        // Check if Python engine is alive by checking for recent risk snapshots
+        const { getRedis } = await import('./redis.js');
+        const r = getRedis();
+        // Scan for any pms:risk:* keys — Python writes these on every price tick
+        let found = false;
+        for await (const key of r.scanIterator({ MATCH: 'pms:risk:*', COUNT: 10 })) {
+            found = true;
+            break;
+        }
+        pythonOk = found;
     } catch { }
 
     const status = dbOk ? 'ok' : 'degraded';
@@ -166,8 +172,8 @@ server.on('error', (err) => {
     process.exit(1);
 });
 
-// Initialize WebSocket (proxy mode — subscribes to Redis PUB/SUB from Python)
-initWebSocket(server);
+// NOTE: initWebSocket is called inside start() AFTER Redis is connected,
+// so that subscribeToPmsEvents can create a PUB/SUB subscriber.
 
 async function start() {
     try {
@@ -178,8 +184,12 @@ async function start() {
             // Wire redis-proxy helper to use the Redis client
             const { getRedis } = await import('./redis.js');
             setRedisClient(getRedis());
+            // Initialize WebSocket AFTER Redis is wired — PUB/SUB subscriber needs redis client
+            initWebSocket(server);
             console.log('[Server] Redis proxy wired — trading commands will go to Python engine');
         } else {
+            // Start WS without PUB/SUB — connections work but no real-time events
+            initWebSocket(server);
             console.warn('[Server] Redis not available — trading commands will fail (Python engine unreachable)');
         }
 

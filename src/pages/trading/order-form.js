@@ -11,19 +11,44 @@ import { beginOrderLatency, markOrderSent, markOrderAck, markOrderPaint } from '
 
 // ── Side / Leverage / Size ──────────────────────
 
+/** Restore the submit button label & style to match the current orderType. */
+export function restoreSubmitButton() {
+    const btn = document.getElementById('submit-trade');
+    if (!btn) return;
+    if (S.orderType === 'TRAIL') {
+        btn.textContent = '⚡ Set Trail Stop';
+        btn.className = 'btn-submit';
+        btn.style.background = '#f59e0b';
+        btn.style.color = '#000';
+    } else if (S.orderType === 'CHASE') {
+        btn.textContent = '🎯 Start Chase';
+        btn.className = 'btn-submit';
+        btn.style.background = '#06b6d4';
+        btn.style.color = '#000';
+    } else if (S.orderType === 'SCALPER') {
+        btn.textContent = '⚔️ Start Scalper';
+        btn.className = 'btn-submit';
+        btn.style.background = 'linear-gradient(90deg, #06b6d4 0%, #f97316 100%)';
+        btn.style.color = '#000';
+    } else {
+        btn.textContent = S.selectedSide === 'LONG' ? 'Buy / Long' : 'Sell / Short';
+        btn.className = `btn-submit btn-submit-${S.selectedSide.toLowerCase()}`;
+        btn.style.background = '';
+        btn.style.color = '';
+    }
+    btn.disabled = false;
+}
+
 export function setSide(side) {
     S.set('selectedSide', side);
     localStorage.setItem('pms_trade_side', side);
     document.getElementById('btn-long').className = side === 'LONG' ? 'active-long' : '';
     document.getElementById('btn-neutral').className = side === 'NEUTRAL' ? 'active-neutral' : '';
     document.getElementById('btn-short').className = side === 'SHORT' ? 'active-short' : '';
-    const btn = document.getElementById('submit-trade');
-    if (btn) {
-        if (S.orderType === 'TRAIL') {
-            // Don't change trail button on side toggle
-        } else if (S.orderType === 'CHASE') {
-            // Don't change chase button on side toggle
-        } else {
+    // Only update the button for basic order types; Chase/Trail/Scalper keep their own label
+    if (S.orderType !== 'TRAIL' && S.orderType !== 'CHASE' && S.orderType !== 'SCALPER') {
+        const btn = document.getElementById('submit-trade');
+        if (btn) {
             btn.className = `btn-submit btn-submit-${side.toLowerCase()}`;
             btn.textContent = side === 'LONG' ? 'Buy / Long' : 'Sell / Short';
             btn.style.background = '';
@@ -196,8 +221,6 @@ export async function submitTrade() {
         }
         refreshAccountsInBackground();
         scheduleTradingRefresh({
-            positions: true,
-            account: true,
             annotations: true,
             forceAnnotations: true,
         }, 40);
@@ -208,7 +231,7 @@ export async function submitTrade() {
             showToast(`${err.message || 'Trade failed'}`, 'error');
         }
     } finally {
-        if (btn) { btn.disabled = false; btn.textContent = S.selectedSide === 'LONG' ? 'Buy / Long' : 'Sell / Short'; }
+        restoreSubmitButton();
     }
 }
 
@@ -263,7 +286,7 @@ export async function submitLimitOrder() {
             showToast(`${err.message || 'Limit order failed'}`, 'error');
         }
     } finally {
-        if (btn) { btn.disabled = false; btn.textContent = S.selectedSide === 'LONG' ? 'Buy / Long' : 'Sell / Short'; }
+        restoreSubmitButton();
     }
 }
 
@@ -675,10 +698,7 @@ export async function updateAccountDisplay() {
     const accountId = state.currentAccount;
     if (accountId) {
         try {
-            const [margin, posData] = await Promise.all([
-                api(`/trade/margin/${accountId}`),
-                api(`/trade/positions/${accountId}`).catch(() => null),
-            ]);
+            const margin = await api(`/trade/margin/${accountId}`);
             S.set('cachedMarginInfo', margin);
 
             const avEl = document.getElementById('acct-available');
@@ -690,9 +710,10 @@ export async function updateAccountDisplay() {
             S.set('_cachedBalance', margin.balance || 0);
             S.set('_cachedMarginUsed', margin.marginUsed || 0);
 
-            if (posData?.positions) {
+            // Sync position map from margin snapshot positions (if present)
+            if (margin.positions && Array.isArray(margin.positions)) {
                 S._positionMap.clear();
-                for (const p of posData.positions) {
+                for (const p of margin.positions) {
                     S._positionMap.set(p.id, {
                         symbol: p.symbol,
                         side: p.side,

@@ -68,6 +68,14 @@ class SymbolInfoCache:
     def __init__(self):
         self._specs: Dict[str, SymbolSpec] = {}
 
+    @staticmethod
+    def _norm_key(symbol: str) -> str:
+        """Normalize any symbol format to Binance key: RAVE/USDT:USDT → RAVEUSDT."""
+        s = symbol.replace("/", "").replace(":USDT", "").upper()
+        if not s.endswith("USDT"):
+            s += "USDT"
+        return s
+
     async def load(self, exchange_client: Any) -> int:
         """
         Fetch exchange info and parse filters for all symbols.
@@ -117,36 +125,35 @@ class SymbolInfoCache:
 
     def get(self, symbol: str) -> Optional[SymbolSpec]:
         """Get spec for a symbol, or None if unknown."""
-        return self._specs.get(symbol)
+        return self._specs.get(self._norm_key(symbol))
 
     def round_price(self, symbol: str, price: float) -> float:
         """Round price to valid tick size precision (truncate down)."""
-        spec = self._specs.get(symbol)
+        spec = self._specs.get(self._norm_key(symbol))
         if not spec:
-            return price  # Unknown symbol — pass through
+            return price
         return _truncate(price, spec.price_precision)
 
     def round_quantity(self, symbol: str, qty: float, is_market: bool = False) -> float:
         """Round quantity to valid step size precision (truncate down)."""
-        spec = self._specs.get(symbol)
+        spec = self._specs.get(self._norm_key(symbol))
         if not spec:
-            return qty  # Unknown symbol — pass through
+            return qty
         precision = spec.market_qty_precision if is_market else spec.qty_precision
         result = _truncate(qty, precision)
-        # Clamp to min/max
         result = max(spec.min_qty, min(result, spec.max_qty))
         return result
 
     def get_min_notional(self, symbol: str) -> float:
         """Get minimum notional for a symbol."""
-        spec = self._specs.get(symbol)
+        spec = self._specs.get(self._norm_key(symbol))
         return spec.min_notional if spec else 5.0
 
     def __len__(self) -> int:
         return len(self._specs)
 
     def __contains__(self, symbol: str) -> bool:
-        return symbol in self._specs
+        return self._norm_key(symbol) in self._specs
 
     def __repr__(self) -> str:
         return f"SymbolInfoCache({len(self._specs)} symbols)"

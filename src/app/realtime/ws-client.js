@@ -134,7 +134,7 @@ export function createWsClient({
                 if (msg.type === 'order_failed') {
                     if (!isMyEvent) return;
                     const d = msg.data || {};
-                    const base = d.symbol ? d.symbol.replace('USDT', '') : 'Unknown';
+                    const base = d.symbol ? d.symbol.split('/')[0] : 'Unknown';
                     showToast(`Order failed: ${d.side || ''} ${base} — ${d.error || 'unknown error'}`, 'error');
                     dispatchEvent('order_failed', d);
                     return;
@@ -214,7 +214,7 @@ export function createWsClient({
                 }
 
                 // ── Chase Limit events ──
-                if (msg.type === 'chase_progress') {
+                if (msg.type === 'chase_progress' || msg.type === 'chase_started') {
                     if (isMyEvent) dispatchEvent('chase_progress', msg.data);
                     return;
                 }

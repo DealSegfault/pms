@@ -2,7 +2,7 @@
 import { state, api, showToast, formatPrice } from '../../core/index.js';
 import { cuteConfirm } from '../../lib/cute-confirm.js';
 import * as S from './state.js';
-import { showTradeError } from './order-form.js';
+import { showTradeError, restoreSubmitButton } from './order-form.js';
 import { scheduleTradingRefresh } from './refresh-scheduler.js';
 import { beginOrderLatency, markOrderSent, markOrderAck, markOrderPaint } from './perf-metrics.js';
 
@@ -415,7 +415,7 @@ export async function submitScaleOrder() {
             showToast(`${err.message || 'Scale order failed'}`, 'error');
         }
     } finally {
-        if (btn) { btn.disabled = false; btn.textContent = S.selectedSide === 'LONG' ? 'Buy / Long' : 'Sell / Short'; }
+        if (btn) { btn.disabled = false; } restoreSubmitButton();
     }
 }
 

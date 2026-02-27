@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional
 from .state import OrderState, generate_client_order_id, TERMINAL_STATES
 from .tracker import OrderTracker
 from .exchange_client import ExchangeClient
+from contracts.invariants import InvariantViolation
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +54,13 @@ class OrderManager:
         redis_client: Any = None,
         risk_engine: Any = None,
         symbol_info: Any = None,
+        db: Any = None,
     ):
         self._exchange = exchange_client
         self._redis = redis_client
         self._risk = risk_engine  # Set later via set_risk_engine() (Step 7)
         self._symbol_info = symbol_info  # SymbolInfoCache for rounding
+        self._db = db  # Database for pending_orders persistence
         self._tracker = OrderTracker()
         self._seq: int = 0  # Monotonic event sequence number
 
@@ -128,6 +131,7 @@ class OrderManager:
         self._tracker.register(order)
 
         try:
+            t0 = time.perf_counter()
             result = await self._exchange.create_market_order(
                 symbol,
                 side,
@@ -136,6 +140,8 @@ class OrderManager:
                 reduceOnly="true" if reduce_only else None,
                 **kwargs,
             )
+            latency_ms = (time.perf_counter() - t0) * 1000
+            logger.info("Market order placed in %.1fms: %s %s qty=%.6f", latency_ms, symbol, side, quantity)
             # Map exchange ID for feed routing
             eid = str(result.get("orderId", ""))
             if eid:
@@ -194,6 +200,7 @@ class OrderManager:
         self._tracker.register(order)
 
         try:
+            t0 = time.perf_counter()
             result = await self._exchange.create_limit_order(
                 symbol,
                 side,
@@ -203,9 +210,18 @@ class OrderManager:
                 reduceOnly="true" if reduce_only else None,
                 **kwargs,
             )
+            latency_ms = (time.perf_counter() - t0) * 1000
+            logger.info("Limit order placed in %.1fms: %s %s qty=%.6f @ %.8f", latency_ms, symbol, side, quantity, price)
             eid = str(result.get("orderId", ""))
             if eid:
                 self._tracker.update_exchange_id(order.client_order_id, eid)
+
+            # Transition placing → active on REST success.
+            # The feed will handle further transitions (filled/cancelled).
+            order.transition("active")
+
+            # Persist to pending_orders table
+            await self._db_persist_pending_order(order)
 
         except Exception as e:
             order.transition("failed")
@@ -213,6 +229,103 @@ class OrderManager:
             await self._publish_event("order_failed", order, error=str(e))
 
         return order
+
+    async def place_batch_limit_orders(
+        self, order_params: list[dict]
+    ) -> list[OrderState]:
+        """Place multiple limit orders in a single batch REST call.
+        
+        Each dict in order_params should have:
+            sub_account_id, symbol, side, quantity, price, leverage,
+            origin, parent_id, on_fill, on_cancel, reduce_only (all optional except first 5)
+        
+        Returns list of OrderState objects (same order as input).
+        Orders that fail individually within the batch are marked as 'failed'.
+        """
+        if not order_params:
+            return []
+
+        # 1. Create OrderState objects and register in tracker
+        orders: list[OrderState] = []
+        exchange_params: list[dict] = []
+
+        for p in order_params:
+            symbol = p["symbol"]
+            side = p["side"]
+            quantity = float(p["quantity"])
+            price = float(p["price"])
+
+            order = OrderState(
+                client_order_id=generate_client_order_id(p.get("sub_account_id", ""), "LMT"),
+                sub_account_id=p.get("sub_account_id", ""),
+                symbol=symbol,
+                side=side,
+                order_type="LIMIT",
+                quantity=quantity,
+                price=price,
+                leverage=p.get("leverage", 1),
+                origin=p.get("origin", "MANUAL"),
+                parent_id=p.get("parent_id"),
+                on_fill=p.get("on_fill"),
+                on_cancel=p.get("on_cancel"),
+                reduce_only=p.get("reduce_only", False),
+            )
+
+            # Round to exchange precision
+            if self._symbol_info:
+                order.quantity = self._symbol_info.round_quantity(symbol, quantity, is_market=False)
+                order.price = self._symbol_info.round_price(symbol, price)
+
+            order.transition("placing")
+            self._tracker.register(order)
+            orders.append(order)
+
+            exchange_params.append({
+                "symbol": symbol,
+                "side": side,
+                "quantity": order.quantity,
+                "price": order.price,
+                "newClientOrderId": order.client_order_id,
+                "reduceOnly": order.reduce_only,
+            })
+
+        # 2. Send batch to exchange
+        try:
+            t0 = time.perf_counter()
+            results = await self._exchange.create_batch_limit_orders(exchange_params)
+            latency_ms = (time.perf_counter() - t0) * 1000
+            logger.info(
+                "Batch placed %d orders in %.1fms",
+                len(exchange_params), latency_ms,
+            )
+
+            # 3. Map results back to OrderStates
+            for i, (order, result) in enumerate(zip(orders, results)):
+                if isinstance(result, dict) and "orderId" in result:
+                    # Success
+                    eid = str(result["orderId"])
+                    self._tracker.update_exchange_id(order.client_order_id, eid)
+                    order.transition("active")
+                    await self._db_persist_pending_order(order)
+                elif isinstance(result, dict) and "code" in result:
+                    # Individual order failed within batch
+                    order.transition("failed")
+                    logger.error(
+                        "Batch order %d failed: code=%s msg=%s",
+                        i, result.get("code"), result.get("msg"),
+                    )
+                else:
+                    order.transition("failed")
+                    logger.error("Batch order %d: unexpected result: %s", i, result)
+
+        except Exception as e:
+            # Entire batch failed — mark all as failed
+            for order in orders:
+                if order.state == "placing":
+                    order.transition("failed")
+            logger.error("Batch order failed entirely: %s", e)
+
+        return orders
 
     async def cancel_order(self, client_order_id: str) -> bool:
         """
@@ -225,27 +338,61 @@ class OrderManager:
             logger.warning("cancel_order: unknown order %s", client_order_id)
             return False
 
-        if not order.transition("cancelling"):
+        # Terminal states — nothing to cancel
+        if order.state in ("cancelled", "filled", "expired", "failed"):
             logger.warning(
-                "cancel_order: can't cancel order in state=%s (coid=%s)",
+                "cancel_order: order already in terminal state=%s (coid=%s)",
                 order.state, client_order_id,
             )
             return False
 
+        # If already cancelling, skip transition but re-send cancel to exchange (idempotent)
+        if order.state != "cancelling":
+            if not order.transition("cancelling"):
+                logger.warning(
+                    "cancel_order: can't cancel order in state=%s (coid=%s)",
+                    order.state, client_order_id,
+                )
+                return False
+
         try:
-            await self._exchange.cancel_order(
-                order.symbol,
-                origClientOrderId=order.client_order_id,
-            )
+            # Prefer exchange orderId (more reliable), fall back to clientOrderId
+            t0 = time.perf_counter()
+            if order.exchange_order_id:
+                await self._exchange.cancel_order(
+                    order.symbol,
+                    orderId=int(order.exchange_order_id),
+                )
+            else:
+                await self._exchange.cancel_order(
+                    order.symbol,
+                    origClientOrderId=order.client_order_id,
+                )
+            latency_ms = (time.perf_counter() - t0) * 1000
+            logger.info("Cancel sent in %.1fms: %s %s", latency_ms, order.symbol, client_order_id)
         except Exception as e:
-            # Don't revert state — feed will confirm actual state
-            logger.warning("Cancel request failed (feed will resolve): %s — %s", client_order_id, e)
+            err_str = str(e)
+            # -2011 = "Unknown order" = order already gone (filled or expired)
+            if "-2011" in err_str:
+                logger.info("cancel_order: order already gone (filled/expired?): %s", client_order_id)
+                # Let the feed confirm actual state — don't revert
+            else:
+                logger.warning("Cancel request failed (feed will resolve): %s — %s", client_order_id, e)
 
         return True
 
     async def cancel_all_orders_for_symbol(self, symbol: str) -> int:
         """Cancel all tracked active orders for a symbol. Returns count."""
         active = self._tracker.get_active_by_symbol(symbol)
+        count = 0
+        for order in active:
+            if await self.cancel_order(order.client_order_id):
+                count += 1
+        return count
+
+    async def cancel_all_orders_for_account(self, sub_account_id: str) -> int:
+        """Cancel all tracked active orders for a sub-account (all symbols). Returns count."""
+        active = self._tracker.get_by_sub_account(sub_account_id, active_only=True)
         count = 0
         for order in active:
             if await self.cancel_order(order.client_order_id):
@@ -263,17 +410,29 @@ class OrderManager:
         1. Cancel existing order
         2. Place new order with same params but new price
         3. Link new order to same parent/callbacks
-        Returns the new OrderState, or None if original not found.
+        Returns the new OrderState, or None if cancel failed, order was filled, or original not found.
         """
         old = self._tracker.lookup(client_order_id=client_order_id)
         if not old:
             return None
 
-        # Cancel the old order (feed will confirm)
-        await self.cancel_order(client_order_id)
+        t0 = time.perf_counter()
+
+        # Cancel the old order — if cancel fails, do NOT place a new order
+        cancelled = await self.cancel_order(client_order_id)
+        if not cancelled:
+            logger.warning("replace_order: can't cancel %s (state=%s), skipping replace", client_order_id, old.state)
+            return None
+
+        # Check if old order was filled during the cancel window.
+        # The UserStream on_order_update runs in the same event loop and may have
+        # processed a FILLED event while we were awaiting the cancel REST call.
+        if old.state == "filled":
+            logger.info("replace_order: old order %s was filled during cancel — aborting replace", client_order_id)
+            return None
 
         # Place new order with same metadata
-        return await self.place_limit_order(
+        result = await self.place_limit_order(
             sub_account_id=old.sub_account_id,
             symbol=old.symbol,
             side=old.side,
@@ -287,6 +446,9 @@ class OrderManager:
             on_partial=old.on_partial,
             reduce_only=old.reduce_only,
         )
+        latency_ms = (time.perf_counter() - t0) * 1000
+        logger.info("Replace order in %.1fms: %s %s @ %.8f", latency_ms, old.symbol, old.side, new_price)
+        return result
 
     # ── Feed Event Handler (called by UserStreamService) ──
 
@@ -362,14 +524,28 @@ class OrderManager:
             fill_qty = float(data.get("last_filled_qty", 0))
             avg_price = float(data.get("avg_price", 0))
 
+            # ── Guard: reject duplicate FILLED events (e.g. TRADE_LITE + ORDER_TRADE_UPDATE) ──
+            if not order.transition("filled"):
+                logger.warning(
+                    "Order %s already terminal (%s), ignoring duplicate FILLED event",
+                    order.client_order_id, order.state,
+                )
+                return
+
+            # ── Invariant: fill data sanity ──
+            if fill_price <= 0 or fill_qty <= 0:
+                logger.error(
+                    "Order %s FILLED with invalid data: fill_price=%.8f fill_qty=%.8f",
+                    order.client_order_id, fill_price, fill_qty,
+                )
+
             order.apply_fill(fill_price, fill_qty)
             if avg_price > 0:
                 order.avg_fill_price = avg_price
 
-            order.transition("filled")
-
-            # Remove from Redis open orders
+            # Remove from Redis open orders + update DB
             await self._redis_remove_open_order(order)
+            await self._db_update_pending_order(order, "FILLED")
 
             # Call risk engine if available
             if self._risk:
@@ -399,6 +575,7 @@ class OrderManager:
 
             await self._publish_event("order_cancelled", order, reason=status)
             await self._redis_remove_open_order(order)
+            await self._db_update_pending_order(order, "CANCELLED")
 
         if order.state != old_state:
             logger.info(
@@ -439,6 +616,8 @@ class OrderManager:
         so frontend can update locally without refetching /margin endpoint.
         Frontend only fetches /margin on page refresh (cold start).
         """
+        from contracts.common import ts_ms, RedisKey
+
         # Get account snapshot for idempotent frontend update
         account_state = {}
         if self._risk and event_type in (
@@ -454,11 +633,11 @@ class OrderManager:
             "type": event_type,
             **order.to_event_dict(),
             "account": account_state,
-            "timestamp": time.time(),
+            "timestamp": ts_ms(),
             **extra,
         }
 
-        channel = f"pms:events:{event_type}"
+        channel = RedisKey.event_channel(event_type)
 
         if self._redis:
             try:
@@ -475,7 +654,8 @@ class OrderManager:
         if not self._redis:
             return
         try:
-            key = f"pms:open_orders:{order.sub_account_id}"
+            from contracts.common import RedisKey
+            key = RedisKey.open_orders(order.sub_account_id)
             await self._redis.hset(key, order.client_order_id, json.dumps(order.to_event_dict()))
             await self._redis.expire(key, 86400)  # 24h TTL safety net
         except Exception as e:
@@ -486,16 +666,245 @@ class OrderManager:
         if not self._redis:
             return
         try:
-            key = f"pms:open_orders:{order.sub_account_id}"
+            from contracts.common import RedisKey
+            key = RedisKey.open_orders(order.sub_account_id)
             await self._redis.hdel(key, order.client_order_id)
         except Exception as e:
             logger.error("Failed to remove open order from Redis: %s", e)
 
+    # ── Startup Recovery ──
+
+    async def load_open_orders_from_exchange(self) -> int:
+        """
+        On startup, recover open orders using DB as the sub-account
+        ownership source and exchange as the liveness source.
+
+        1. Load PENDING orders from pending_orders DB table (has sub_account_id)
+        2. Query exchange for all open orders (liveness check)
+        3. Cross-reference: only recover orders that exist on BOTH
+        4. Mark DB orders not on exchange as CANCELLED (stale)
+
+        Returns count of recovered orders.
+        """
+        # Step 1: Load pending orders from DB (keyed by exchange_order_id)
+        db_orders = {}
+        if self._db:
+            try:
+                rows = await self._db.fetch_all(
+                    "SELECT * FROM pending_orders WHERE status = 'PENDING'"
+                )
+                for row in rows:
+                    eid = row.get("exchange_order_id")
+                    if eid:
+                        db_orders[str(eid)] = row
+            except Exception as e:
+                logger.error("Failed to load pending orders from DB: %s", e)
+
+        # Step 2: Query exchange for open orders
+        try:
+            exchange_orders = await self._exchange.get_open_orders()
+        except Exception as e:
+            logger.error("Failed to fetch open orders from exchange: %s", e)
+            return 0
+
+        # Build set of exchange order IDs that are actually live
+        exchange_eids = set()
+        for eo in (exchange_orders or []):
+            exchange_eids.add(str(eo.get("orderId", "")))
+
+        # Step 3: Recover orders that exist in both DB and exchange
+        count = 0
+        for eo in (exchange_orders or []):
+            coid = eo.get("clientOrderId", "")
+            if not coid.startswith("PMS"):
+                continue  # Not our order
+
+            eid = str(eo.get("orderId", ""))
+            db_row = db_orders.get(eid)
+
+            # Resolve sub_account_id: prefer DB, fallback to prefix parsing
+            if db_row:
+                sub_account_id = db_row.get("sub_account_id", "")
+                leverage = int(db_row.get("leverage", 1))
+            else:
+                # Fallback: parse from client order ID prefix
+                parts = coid[3:].split("_", 2)
+                sub_prefix = parts[0] if len(parts) >= 1 else ""
+                sub_account_id = self._resolve_sub_account(sub_prefix)
+                leverage = 1
+                if not sub_account_id:
+                    logger.debug("Cannot resolve sub-account for order %s", coid)
+                    continue
+
+            order = OrderState(
+                client_order_id=coid,
+                sub_account_id=sub_account_id,
+                exchange_order_id=eid,
+                symbol=eo.get("symbol", ""),
+                side=eo.get("side", ""),
+                order_type=eo.get("type", "LIMIT"),
+                quantity=float(eo.get("origQty", 0)),
+                price=float(eo.get("price", 0)),
+                state="active",
+                filled_qty=float(eo.get("executedQty", 0)),
+                origin="RECOVERED",
+                leverage=leverage,
+                created_at=eo.get("time", 0) / 1000.0 if eo.get("time") else 0,
+                reduce_only=eo.get("reduceOnly", False),
+            )
+
+            self._tracker.register(order)
+            await self._redis_set_open_order(order)
+            count += 1
+            logger.debug("Recovered order: %s %s %s qty=%.6f @ %.2f (sub=%s)",
+                         coid, order.symbol, order.side, order.quantity, order.price or 0, sub_account_id[:8])
+
+        # Step 4: Mark stale DB orders (not on exchange) as CANCELLED
+        if self._db:
+            stale_count = 0
+            for eid, row in db_orders.items():
+                if eid not in exchange_eids:
+                    try:
+                        await self._db.execute(
+                            "UPDATE pending_orders SET status = 'CANCELLED', cancelled_at = datetime('now') WHERE id = ?",
+                            (row["id"],),
+                        )
+                        stale_count += 1
+                    except Exception as e:
+                        logger.error("Failed to mark stale order %s: %s", eid, e)
+            if stale_count:
+                logger.info("Marked %d stale DB orders as CANCELLED (not on exchange)", stale_count)
+
+        if count:
+            logger.info("Recovered %d open orders from exchange", count)
+        return count
+
+    def _resolve_sub_account(self, prefix: str) -> Optional[str]:
+        """Resolve 8-char sub-account prefix to full ID using PositionBook."""
+        if not self._risk:
+            return None
+        book = getattr(self._risk, 'position_book', None) or getattr(self._risk, '_book', None)
+        if not book:
+            return None
+        for sub_id in book._entries:
+            if sub_id.startswith(prefix):
+                return sub_id
+        return None
+
+    # ── DB Persistence for Pending Orders ──
+
+    async def _db_persist_pending_order(self, order: OrderState) -> None:
+        """Write a new limit order to the pending_orders table."""
+        if not self._db or order.order_type != "LIMIT":
+            return
+        try:
+            # Map BUY/SELL to LONG/SHORT for DB consistency
+            db_side = "LONG" if order.side == "BUY" else "SHORT"
+            await self._db.execute(
+                """INSERT INTO pending_orders
+                   (id, sub_account_id, symbol, side, type, price, quantity, leverage,
+                    exchange_order_id, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', datetime('now'))""",
+                (order.client_order_id, order.sub_account_id, order.symbol,
+                 db_side, order.order_type, order.price, order.quantity,
+                 float(order.leverage), order.exchange_order_id or ""),
+            )
+        except Exception as e:
+            logger.error("Failed to persist pending order to DB: %s", e)
+
+    async def _db_update_pending_order(self, order: OrderState, status: str) -> None:
+        """Update pending order status (FILLED / CANCELLED)."""
+        if not self._db:
+            return
+        try:
+            if status == "FILLED":
+                await self._db.execute(
+                    "UPDATE pending_orders SET status = 'FILLED', filled_at = datetime('now') WHERE id = ?",
+                    (order.client_order_id,),
+                )
+            else:
+                await self._db.execute(
+                    "UPDATE pending_orders SET status = 'CANCELLED', cancelled_at = datetime('now') WHERE id = ?",
+                    (order.client_order_id,),
+                )
+        except Exception as e:
+            logger.error("Failed to update pending order %s to %s: %s", order.client_order_id, status, e)
+
     # ── Housekeeping ──
 
     async def cleanup(self) -> int:
-        """Clean up terminal orders older than 5 minutes. Call periodically."""
-        return self._tracker.cleanup_terminal()
+        """Clean up terminal orders older than 5 minutes + expire stale orders + purge ghost Redis entries."""
+        # 1. Expire stale orders stuck in "placing" > 30s
+        stale_count = 0
+        for order in list(self._tracker._by_client_id.values()):
+            if order.is_stale:
+                order.transition("failed")
+                stale_count += 1
+                logger.warning(
+                    "Expired stale order %s (stuck in placing for %.0fs)",
+                    order.client_order_id, time.time() - order.created_at,
+                )
+                await self._redis_remove_open_order(order)
+        if stale_count:
+            logger.info("Expired %d stale orders", stale_count)
+
+        # 2. Clean up terminal orders older than 5 min
+        cleaned = self._tracker.cleanup_terminal()
+
+        # 3. Purge ghost entries from Redis open_orders hashes
+        ghost_count = await self._reconcile_redis_open_orders()
+
+        # 4. Observability
+        if cleaned or stale_count or ghost_count:
+            logger.info(
+                "OrderTracker: total=%d active=%d (cleaned=%d stale=%d ghosts=%d)",
+                self._tracker.total_count, self._tracker.active_count,
+                cleaned, stale_count, ghost_count,
+            )
+
+        return cleaned + stale_count + ghost_count
+
+    async def _reconcile_redis_open_orders(self) -> int:
+        """Scan all pms:open_orders:* hashes and remove entries with terminal state.
+
+        Catches ghost entries where _redis_remove_open_order failed silently
+        (e.g. during fills/cancels) or the engine crashed before cleanup.
+        """
+        if not self._redis:
+            return 0
+
+        ghost_count = 0
+        terminal_states = {"filled", "cancelled", "expired", "failed"}
+
+        try:
+            async for key in self._redis.scan_iter(match="pms:open_orders:*", count=50):
+                entries = await self._redis.hgetall(key)
+                for field, raw in entries.items():
+                    try:
+                        data = json.loads(raw)
+                        state = (data.get("state") or data.get("status") or "").lower()
+                        if state in terminal_states:
+                            await self._redis.hdel(key, field)
+                            ghost_count += 1
+                            logger.warning(
+                                "Purged ghost open_order %s (state=%s) from %s",
+                                field, state, key,
+                            )
+                    except (json.JSONDecodeError, TypeError):
+                        # Corrupt entry — remove it
+                        await self._redis.hdel(key, field)
+                        ghost_count += 1
+                        logger.warning("Purged corrupt open_order entry %s from %s", field, key)
+
+                # If hash is now empty, delete the key entirely
+                if entries and ghost_count > 0:
+                    remaining = await self._redis.hlen(key)
+                    if remaining == 0:
+                        await self._redis.delete(key)
+        except Exception as e:
+            logger.error("Redis open_orders reconciliation error: %s", e)
+
+        return ghost_count
 
     def __repr__(self) -> str:
         return f"OrderManager(tracker={self._tracker!r})"

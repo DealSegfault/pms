@@ -382,7 +382,7 @@ export async function submitTrailStop() {
                 drawLiveTrailStop(result);
             }
 
-            scheduleTradingRefresh({ positions: true, openOrders: true }, 30);
+            scheduleTradingRefresh({ openOrders: true }, 30);
         }
     } catch (err) {
         if (err.errors && Array.isArray(err.errors)) {
@@ -399,7 +399,7 @@ export async function cancelTrailStop(trailStopId) {
         const result = await api(`/trade/trail-stop/${trailStopId}`, { method: 'DELETE' });
         showToast(`Trail stop cancelled (${result.symbol})`, 'success');
         clearLiveLines();
-        scheduleTradingRefresh({ positions: true, openOrders: true }, 30);
+        scheduleTradingRefresh({ openOrders: true }, 30);
     } catch (err) {
         showToast(`${err.message}`, 'error');
     }

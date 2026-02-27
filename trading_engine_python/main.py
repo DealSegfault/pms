@@ -28,6 +28,7 @@ Startup order (respects dependency graph):
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import signal
@@ -48,6 +49,11 @@ async def main() -> None:
 
     logger.info("Starting Python Trading Engine...")
 
+    # ── 0b. Thread pool — increase from default ~12 to 32 for high-latency REST calls ──
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=32))
+    logger.info("ThreadPoolExecutor set to 32 workers")
+
     # ── 1. Configuration ──
     api_key = os.getenv("api_key", "")
     api_secret = os.getenv("api_secret", "") or os.getenv("secret", "")
@@ -66,7 +72,7 @@ async def main() -> None:
     stale_patterns = [
         "pms:open_orders:*", "pms:active_chase:*", "pms:active_scalper:*",
         "pms:active_twap:*", "pms:active_trail_stop:*",
-        "pms:chase:*", "pms:scalper:*", "pms:twap:*", "pms:trailstop:*",
+        "pms:chase:*", "pms:scalper:*", "pms:twap:*", "pms:trail_stop:*",
     ]
     stale_count = 0
     for pattern in stale_patterns:
@@ -103,13 +109,16 @@ async def main() -> None:
         exchange_client=exchange,
         redis_client=redis_client,
         symbol_info=symbol_info,
+        db=db,
     )
     logger.info("OrderManager created")
 
-    # ── 6. MarketDataService ──
+    # ── 6. DepthSupervisor + MarketDataService ──
+    from trading_engine_python.feeds.depth_supervisor import DepthSupervisor
     from trading_engine_python.feeds.market_data import MarketDataService
-    market_data = MarketDataService(redis_client=redis_client)
-    logger.info("MarketDataService created")
+    depth_supervisor = DepthSupervisor()
+    market_data = MarketDataService(redis_client=redis_client, depth_supervisor=depth_supervisor)
+    logger.info("DepthSupervisor + MarketDataService created")
 
     # ── 7. RiskEngine ──
     from trading_engine_python.risk.position_book import PositionBook
@@ -161,6 +170,16 @@ async def main() -> None:
         except Exception as e:
             logger.error("Position reconciliation failed (non-fatal): %s", e)
 
+    # ── 7c. Recover open orders from exchange ──
+    try:
+        recovered = await order_manager.load_open_orders_from_exchange()
+        if recovered:
+            logger.info("Recovered %d open orders from exchange", recovered)
+        else:
+            logger.info("No open orders to recover from exchange")
+    except Exception as e:
+        logger.error("Open order recovery failed (non-fatal): %s", e)
+
     # ── 8. Algo Engines ──
     from trading_engine_python.algos.chase import ChaseEngine
     from trading_engine_python.algos.scalper import ScalperEngine
@@ -168,6 +187,7 @@ async def main() -> None:
     from trading_engine_python.algos.trail_stop import TrailStopEngine
 
     chase = ChaseEngine(order_manager, market_data, redis_client)
+    chase.start_background_tasks()  # Fill checker polling (JS startFillChecker pattern)
     scalper = ScalperEngine(order_manager, market_data, chase, redis_client)
     twap = TWAPEngine(order_manager, market_data, redis_client)
     trail_stop = TrailStopEngine(order_manager, market_data, redis_client)
@@ -223,6 +243,9 @@ async def main() -> None:
             if api_key:
                 tg.create_task(user_stream.start())
 
+            # Periodic cleanup — expires stale orders + reclaims terminal order memory
+            tg.create_task(_periodic_cleanup(order_manager, shutdown_event))
+
             # Wait for shutdown
             tg.create_task(_shutdown_waiter(shutdown_event, cmd_handler, user_stream))
 
@@ -231,6 +254,7 @@ async def main() -> None:
     except* asyncio.CancelledError:
         pass
     finally:
+        await depth_supervisor.shutdown()
         await _cleanup(redis_client, db, user_stream, cmd_handler)
         logger.info("Python Trading Engine stopped")
 
@@ -241,6 +265,20 @@ async def _shutdown_waiter(event, cmd_handler, user_stream):
     await cmd_handler.stop()
     await user_stream.stop()
     raise asyncio.CancelledError()
+
+
+async def _periodic_cleanup(order_manager, shutdown_event, interval: float = 5.0):
+    """Periodic housekeeping: expire stale orders + reclaim terminal order memory + purge ghost Redis."""
+    while not shutdown_event.is_set():
+        try:
+            await asyncio.sleep(interval)
+            cleaned = await order_manager.cleanup()
+            if cleaned:
+                logger.info("Periodic cleanup: %d orders cleaned", cleaned)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Periodic cleanup error: %s", e)
 
 
 async def _cleanup(redis, db, user_stream, cmd_handler):

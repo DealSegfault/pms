@@ -28,14 +28,59 @@ router.post('/scale', requireOwnership('body'), proxyToRedis('pms:cmd:scale', (r
     symbol: req.body.symbol,
     side: req.body.side,
     leverage: req.body.leverage,
-    levels: req.body.levels,
+    levels: req.body.orders || req.body.levels,
 })));
+
+// DELETE /api/trade/orders/all/:subAccountId — Cancel ALL orders for account via Python
+router.delete('/orders/all/:subAccountId', requireOwnership(), async (req, res) => {
+    try {
+        const result = await pushAndWait('pms:cmd:cancel_all', {
+            subAccountId: req.params.subAccountId,
+        });
+        res.json({ cancelled: result.cancelledCount || 0, failed: result.failedCount || 0 });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
 // DELETE /api/trade/orders/:id — Cancel single order via Python
 router.delete('/orders/:id', async (req, res) => {
     try {
+        const clientOrderId = req.params.id;
+
+        // Ownership check: extract subAccountId from clientOrderId prefix (#7)
+        // Format: PMS{sub[:8]}_{type}_{uuid} — first 8 chars after PMS are sub-account prefix
+        if (req.user?.role !== 'ADMIN') {
+            const { getRedis } = await import('../../redis.js');
+            const r = getRedis();
+            // Scan open orders hashes to find which account owns this order
+            let foundSubAccountId = null;
+            let cursor = '0';
+            do {
+                const [nextCursor, keys] = await r.scan(cursor, 'MATCH', 'pms:open_orders:*', 'COUNT', 100);
+                cursor = nextCursor;
+                for (const key of keys) {
+                    const orderJson = await r.hget(key, clientOrderId);
+                    if (orderJson) {
+                        const order = JSON.parse(orderJson);
+                        foundSubAccountId = order.subAccountId;
+                        break;
+                    }
+                }
+                if (foundSubAccountId) break;
+            } while (cursor !== '0');
+            if (foundSubAccountId) {
+                const account = await prisma.subAccount.findUnique({
+                    where: { id: foundSubAccountId }, select: { userId: true },
+                });
+                if (account && account.userId !== req.user?.id) {
+                    return res.status(403).json({ error: 'You do not own this order' });
+                }
+            }
+        }
+
         const result = await pushAndWait('pms:cmd:cancel', {
-            clientOrderId: req.params.id,
+            clientOrderId,
         });
         res.json(result);
     } catch (err) {
@@ -52,6 +97,7 @@ router.post('/cancel-all', requireOwnership('body'), proxyToRedis('pms:cmd:cance
 // ── Read-Only ──
 
 // GET /api/trade/orders/:subAccountId — Active orders from Redis (Python OrderManager writes here)
+// Python to_event_dict() is the sole contract — passed through as-is.
 router.get('/orders/:subAccountId', requireOwnership(), async (req, res) => {
     try {
         const { getRedis } = await import('../../redis.js');
@@ -59,29 +105,16 @@ router.get('/orders/:subAccountId', requireOwnership(), async (req, res) => {
         const key = `pms:open_orders:${req.params.subAccountId}`;
         const raw = await redis.hgetall(key);
         const orders = Object.values(raw || {}).map(v => {
-            try {
-                const o = JSON.parse(v);
-                // Map Python OrderState fields → frontend expected fields
-                return {
-                    id: o.clientOrderId,
-                    exchangeOrderId: o.exchangeOrderId,
-                    subAccountId: o.subAccountId,
-                    symbol: o.symbol.replace('USDT', '/USDT'),
-                    side: o.side === 'BUY' ? 'LONG' : 'SHORT',
-                    type: o.orderType || 'LIMIT',
-                    price: o.price || 0,
-                    quantity: o.quantity || 0,
-                    filledQty: o.filledQty || 0,
-                    leverage: o.leverage || 1,
-                    reduceOnly: o.reduceOnly || false,
-                    origin: o.origin || 'MANUAL',
-                    state: o.state,
-                    createdAt: o.createdAt ? new Date(o.createdAt * 1000).toISOString() : new Date().toISOString(),
-                };
-            } catch { return null; }
-        }).filter(Boolean);
-        // Sort by createdAt desc
-        orders.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+            try { return JSON.parse(v); }
+            catch { return null; }
+        }).filter(o => {
+            if (!o) return false;
+            // Filter out terminal-state ghosts (filled orders stuck in Redis)
+            const st = (o.state || o.status || '').toLowerCase();
+            return st !== 'filled' && st !== 'cancelled' && st !== 'expired' && st !== 'failed';
+        });
+        // Sort by createdAt desc (seconds float)
+        orders.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
         res.json(orders);
     } catch (err) {
         res.status(500).json({ error: err.message });

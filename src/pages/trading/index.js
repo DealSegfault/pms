@@ -59,6 +59,11 @@ export function renderTradingPage(container) {
     fetchSymbolInfo(S.selectedSymbol);
     updateAccountDisplay();
     prefetchSymbolsList();
+
+    // Sync the submit button with the saved order type (e.g. CHASE → "Start Chase")
+    if (S.orderType && S.orderType !== 'MARKET') setOrderType(S.orderType);
+    // Ensure side toggle + submit button match the persisted side
+    if (S.orderType !== 'SCALPER') setSide(S.selectedSide);
 }
 
 // ── Event Listeners ─────────────────────────────
@@ -298,8 +303,10 @@ function attachEventListeners() {
         S.set('selectedSide', mode);
         import('./scalper.js').then(m => m.updateScalperPreview());
     }
-    // Default state
-    _setScalperMode('LONG');
+    // Default state — only apply scalper mode when SCALPER is the active order type
+    if (S.orderType === 'SCALPER') {
+        _setScalperMode(S.selectedSide || 'LONG');
+    }
     document.getElementById('btn-long')?.addEventListener('click', () => {
         if (S.orderType !== 'SCALPER') return;
         _setScalperMode('LONG');

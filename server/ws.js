@@ -130,12 +130,15 @@ function broadcast(type, data) {
 
     if (data.subAccountId) {
         const sockets = subAccountSockets.get(data.subAccountId);
+        const count = sockets ? sockets.size : 0;
+        console.log(`[WS] ▶ ${type} → account:${data.subAccountId.slice(0, 8)}… (${count} clients)`);
         if (sockets) {
             for (const ws of sockets) {
                 safeSend(ws, message);
             }
         }
     } else {
+        console.log(`[WS] ▶ ${type} → ALL (${wss.clients.size} clients)`);
         for (const ws of wss.clients) {
             safeSend(ws, message);
         }

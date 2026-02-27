@@ -9,6 +9,74 @@ import os
 HTTP_PROXY = os.getenv("HTTP_PROXY", "")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY", "")
 
+# ── ANSI colors for terminal order logs ──────────────────────────────
+_C = {
+    "R": "\033[0m",       # reset
+    "DIM": "\033[2m",     # dim
+    "BOLD": "\033[1m",    # bold
+    "GREEN": "\033[92m",  # bright green
+    "YELLOW": "\033[93m", # bright yellow
+    "CYAN": "\033[96m",   # bright cyan
+    "MAGENTA": "\033[95m",# bright magenta
+    "RED": "\033[91m",    # bright red
+    "BLUE": "\033[94m",   # bright blue
+    "WHITE": "\033[97m",  # bright white
+}
+
+_STATUS_STYLE = {
+    "NEW":              ("GREEN",   "✚"),
+    "PARTIALLY_FILLED": ("MAGENTA", "◐"),
+    "FILLED":           ("CYAN",    "✔"),
+    "CANCELED":         ("YELLOW",  "✖"),
+    "REJECTED":         ("RED",     "✘"),
+    "EXPIRED":          ("RED",     "⏱"),
+    "NEW_INSURANCE":    ("BLUE",    "🛡"),
+    "NEW_ADL":          ("RED",     "⚠"),
+}
+
+def _fmt_order(label: str, r: dict) -> str:
+    """One-line compact colored order log."""
+    status = r.get("status", "?")
+    color_key, icon = _STATUS_STYLE.get(status, ("WHITE", "?"))
+    c = _C[color_key]
+    d, rst, b = _C["DIM"], _C["R"], _C["BOLD"]
+
+    side = r.get("side", "?")
+    side_c = _C["GREEN"] if side == "BUY" else _C["RED"]
+
+    sym = r.get("symbol", "?")
+    otype = r.get("origType", r.get("type", "?"))
+    qty = r.get("origQty", r.get("quantity", "?"))
+    exec_qty = r.get("executedQty", "0")
+    price = r.get("price", "?")
+    avg = r.get("avgPrice", None)
+    oid = r.get("orderId", "?")
+    cid = r.get("clientOrderId", "")
+    # shorten clientOrderId to last 6 chars for readability
+    cid_short = cid[-6:] if cid else ""
+
+    # Build compact line:  ✚ NEW BUY STEEMUSDT LMT 122 @ 0.06723 | oid=123 cid=..ab12
+    parts = [
+        f"{c}{b}{icon} {status}{rst}",
+        f"{side_c}{b}{side}{rst}",
+        f"{b}{sym}{rst}",
+        f"{d}{otype}{rst}",
+        f"{qty}",
+    ]
+    # price info
+    if price and price != "0" and price != "0.00000000":
+        parts.append(f"@ {price}")
+    # filled info
+    if exec_qty and exec_qty != "0":
+        avg_str = f" avg {avg}" if avg and avg != "0.00" and avg != "0" else ""
+        parts.append(f"{d}filled {exec_qty}{avg_str}{rst}")
+    # ids
+    parts.append(f"{d}oid={oid}{rst}")
+    if cid_short:
+        parts.append(f"{d}cid=..{cid_short}{rst}")
+
+    return f"{label}: {' '.join(parts)}"
+
 class BinanceFutures:
     def __init__(self, api_key="", api_secret="", testnet=False):
         """Initialize Binance Futures client
@@ -18,12 +86,10 @@ class BinanceFutures:
             api_secret (str): Binance API secret
             testnet (bool): Use testnet if True
         """
-        self.proxies = None
-        if HTTP_PROXY or HTTPS_PROXY:
-            self.proxies = {
-                'http': HTTP_PROXY,
-                'https': HTTPS_PROXY
-            }
+        # Proxy config — explicitly disable to avoid system env vars
+        # (HTTP_PROXY / HTTPS_PROXY) causing SSL errors.
+        # If a proxy IS needed, set these to the correct http:// URLs.
+        self.proxies = {}
         self.client = UMFutures(key=api_key, secret=api_secret, proxies=self.proxies)
         config_logging(logging, logging.INFO)
         self.logger = logging.getLogger(__name__)
@@ -211,7 +277,7 @@ class BinanceFutures:
                 type=orderType,
                 **kwargs
             )
-            self.logger.info(f"Order created: {response}")
+            self.logger.info(_fmt_order("ORDER", response))
             return response
         except ClientError as error:
             self.logger.error(
@@ -305,7 +371,10 @@ class BinanceFutures:
         Args:
             symbol (str, optional): Trading pair symbol
         """
-        return self.client.get_open_orders(symbol=symbol)
+        kwargs = {}
+        if symbol:
+            kwargs["symbol"] = symbol
+        return self.client.get_open_orders(**kwargs)
     
     def get_all_orders(self, symbol, **kwargs):
         """Get all orders
@@ -333,7 +402,7 @@ class BinanceFutures:
                 orderId=orderId,
                 origClientOrderId=origClientOrderId
             )
-            self.logger.info(f"Order canceled: {response}")
+            self.logger.info(_fmt_order("ORDER", response))
             return response
         except ClientError as error:
             self.logger.error(
@@ -349,11 +418,70 @@ class BinanceFutures:
         """
         try:
             response = self.client.cancel_all_open_orders(symbol=symbol)
-            self.logger.info(f"All orders canceled for {symbol}: {response}")
+            self.logger.info(f"{_C['YELLOW']}{_C['BOLD']}✖ CANCEL ALL{_C['R']} {_C['BOLD']}{symbol}{_C['R']} {_C['DIM']}{response}{_C['R']}")
             return response
         except ClientError as error:
             self.logger.error(
                 f"Order cancellation failed. Status: {error.status_code}, Error code: {error.error_code}, Message: {error.error_message}"
+            )
+            raise
+
+    def create_batch_orders(self, orders: list) -> list:
+        """Place up to 5 orders in a single REST call.
+        
+        Args:
+            orders (list[dict]): List of order parameters, each dict containing:
+                symbol, side, type, quantity, price, timeInForce, newClientOrderId, 
+                reduceOnly, etc. Maximum 5 orders per call.
+        
+        Returns:
+            list[dict]: List of order responses (same order as input).
+                        Failed individual orders have 'code' and 'msg' fields.
+        """
+        import json
+        if len(orders) > 5:
+            raise ValueError(f"Batch limit is 5 orders, got {len(orders)}")
+        try:
+            response = self.client.new_batch_order(batchOrders=json.dumps(orders))
+            for r in response:
+                if isinstance(r, dict) and 'status' in r:
+                    self.logger.info(_fmt_order("BATCH", r))
+                elif isinstance(r, dict) and 'code' in r:
+                    self.logger.error(f"BATCH order failed: code={r.get('code')} msg={r.get('msg')}")
+            return response
+        except ClientError as error:
+            self.logger.error(
+                f"Batch order failed. Status: {error.status_code}, Error code: {error.error_code}, Message: {error.error_message}"
+            )
+            raise
+
+    def cancel_batch_orders(self, symbol: str, order_id_list: list = None, 
+                            orig_client_order_id_list: list = None) -> list:
+        """Cancel up to 5 orders in a single REST call.
+        
+        Args:
+            symbol (str): Trading pair symbol
+            order_id_list (list[int], optional): List of exchange order IDs
+            orig_client_order_id_list (list[str], optional): List of client order IDs
+        
+        Returns:
+            list[dict]: List of cancel responses.
+        """
+        import json
+        kwargs = {"symbol": symbol}
+        if order_id_list:
+            kwargs["orderIdList"] = json.dumps(order_id_list)
+        if orig_client_order_id_list:
+            kwargs["origClientOrderIdList"] = json.dumps(orig_client_order_id_list)
+        try:
+            response = self.client.cancel_batch_order(**kwargs)
+            for r in response:
+                if isinstance(r, dict) and 'status' in r:
+                    self.logger.info(_fmt_order("BATCH_CANCEL", r))
+            return response
+        except ClientError as error:
+            self.logger.error(
+                f"Batch cancel failed. Status: {error.status_code}, Error code: {error.error_code}, Message: {error.error_message}"
             )
             raise
     

@@ -97,7 +97,7 @@ def compute_liquidation_price(
         return 0.0
     loss_threshold = margin * (1.0 - maintenance_rate)
     if side == "LONG":
-        return entry_price - (loss_threshold / quantity)
+        return max(0.0, entry_price - (loss_threshold / quantity))
     return entry_price + (loss_threshold / quantity)
 
 

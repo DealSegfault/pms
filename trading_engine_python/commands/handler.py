@@ -23,50 +23,54 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
+from contracts.common import normalize_side, normalize_symbol, RedisKey
+
 logger = logging.getLogger(__name__)
 
 # Command queues — JS pushes to these, Python BLPOPs
 COMMAND_QUEUES = [
-    "pms:cmd:trade",              # Market order
-    "pms:cmd:limit",              # Limit order
-    "pms:cmd:scale",              # Scale/grid orders
-    "pms:cmd:close",              # Close position
-    "pms:cmd:close_all",          # Close all positions
-    "pms:cmd:cancel",             # Cancel order
-    "pms:cmd:cancel_all",         # Cancel all orders
-    "pms:cmd:basket",             # Basket trade
-    "pms:cmd:chase",              # Start chase
-    "pms:cmd:chase_cancel",       # Cancel chase
-    "pms:cmd:scalper",            # Start scalper
-    "pms:cmd:scalper_cancel",     # Stop scalper
-    "pms:cmd:twap",               # Start TWAP
-    "pms:cmd:twap_cancel",        # Cancel TWAP
-    "pms:cmd:twap_basket",        # Start TWAP basket
-    "pms:cmd:trail_stop",         # Start trail stop
-    "pms:cmd:trail_stop_cancel",  # Cancel trail stop
-    "pms:cmd:validate",           # Pre-trade validation (dry run)
+    RedisKey.CMD_TRADE,
+    RedisKey.CMD_LIMIT,
+    RedisKey.CMD_SCALE,
+    RedisKey.CMD_CLOSE,
+    RedisKey.CMD_CLOSE_ALL,
+    RedisKey.CMD_CANCEL,
+    RedisKey.CMD_CANCEL_ALL,
+    RedisKey.CMD_BASKET,
+    RedisKey.CMD_CHASE,
+    RedisKey.CMD_CHASE_CANCEL,
+    RedisKey.CMD_SCALPER,
+    RedisKey.CMD_SCALPER_CANCEL,
+    RedisKey.CMD_TWAP,
+    RedisKey.CMD_TWAP_CANCEL,
+    RedisKey.CMD_TWAP_BASKET,
+    RedisKey.CMD_TWAP_BASKET_CANCEL,
+    RedisKey.CMD_TRAIL_STOP,
+    RedisKey.CMD_TRAIL_STOP_CANCEL,
+    RedisKey.CMD_VALIDATE,
 ]
 
 # Map queue name → handler method name
 QUEUE_ROUTE = {
-    "pms:cmd:trade": "handle_trade",
-    "pms:cmd:limit": "handle_limit",
-    "pms:cmd:scale": "handle_scale",
-    "pms:cmd:close": "handle_close",
-    "pms:cmd:close_all": "handle_close_all",
-    "pms:cmd:cancel": "handle_cancel",
-    "pms:cmd:cancel_all": "handle_cancel_all",
-    "pms:cmd:basket": "handle_basket",
-    "pms:cmd:chase": "handle_chase",
-    "pms:cmd:chase_cancel": "handle_chase_cancel",
-    "pms:cmd:scalper": "handle_scalper",
-    "pms:cmd:scalper_cancel": "handle_scalper_cancel",
-    "pms:cmd:twap": "handle_twap",
-    "pms:cmd:twap_cancel": "handle_twap_cancel",
-    "pms:cmd:twap_basket": "handle_twap_basket",
-    "pms:cmd:trail_stop": "handle_trail_stop",
-    "pms:cmd:trail_stop_cancel": "handle_trail_stop_cancel",
-    "pms:cmd:validate": "handle_validate",
+    RedisKey.CMD_TRADE: "handle_trade",
+    RedisKey.CMD_LIMIT: "handle_limit",
+    RedisKey.CMD_SCALE: "handle_scale",
+    RedisKey.CMD_CLOSE: "handle_close",
+    RedisKey.CMD_CLOSE_ALL: "handle_close_all",
+    RedisKey.CMD_CANCEL: "handle_cancel",
+    RedisKey.CMD_CANCEL_ALL: "handle_cancel_all",
+    RedisKey.CMD_BASKET: "handle_basket",
+    RedisKey.CMD_CHASE: "handle_chase",
+    RedisKey.CMD_CHASE_CANCEL: "handle_chase_cancel",
+    RedisKey.CMD_SCALPER: "handle_scalper",
+    RedisKey.CMD_SCALPER_CANCEL: "handle_scalper_cancel",
+    RedisKey.CMD_TWAP: "handle_twap",
+    RedisKey.CMD_TWAP_CANCEL: "handle_twap_cancel",
+    RedisKey.CMD_TWAP_BASKET: "handle_twap_basket",
+    RedisKey.CMD_TWAP_BASKET_CANCEL: "handle_twap_basket_cancel",
+    RedisKey.CMD_TRAIL_STOP: "handle_trail_stop",
+    RedisKey.CMD_TRAIL_STOP_CANCEL: "handle_trail_stop_cancel",
+    RedisKey.CMD_VALIDATE: "handle_validate",
 }
 
 
@@ -79,24 +83,9 @@ class CommandHandler:
     via set_*_engine() methods — same pattern as OrderManager.set_risk_engine().
     """
 
-    # Frontend → Binance side mapping
-    _SIDE_MAP = {"LONG": "BUY", "SHORT": "SELL", "BUY": "BUY", "SELL": "SELL"}
-
-    @staticmethod
-    def _normalize_side(side: str) -> str:
-        """LONG→BUY, SHORT→SELL. Pass through BUY/SELL unchanged."""
-        mapped = CommandHandler._SIDE_MAP.get(side.upper())
-        if not mapped:
-            raise ValueError(f"Invalid side: {side}")
-        return mapped
-
-    @staticmethod
-    def _normalize_symbol(symbol: str) -> str:
-        """Convert 'DOGE/USDT:USDT' → 'DOGEUSDT'. Pass through 'DOGEUSDT' unchanged."""
-        s = symbol.replace("/", "").replace(":USDT", "").upper()
-        if not s.endswith("USDT"):
-            s += "USDT"
-        return s
+    # Side/symbol normalization now from contracts.common (single source of truth)
+    _normalize_side = staticmethod(normalize_side)
+    _normalize_symbol = staticmethod(normalize_symbol)
 
     def __init__(
         self,
@@ -191,7 +180,7 @@ class CommandHandler:
             return
         try:
             await self._redis.set(
-                f"pms:result:{request_id}",
+                RedisKey.result(request_id),
                 json.dumps(result),
                 ex=30,
             )
@@ -204,7 +193,7 @@ class CommandHandler:
         """Handle market order."""
         order = await self._order_manager.place_market_order(
             sub_account_id=cmd["subAccountId"],
-            symbol=self._normalize_symbol(cmd["symbol"]),
+            symbol=cmd["symbol"],
             side=self._normalize_side(cmd["side"]),
             quantity=float(cmd["quantity"]),
             leverage=int(cmd.get("leverage", 1)),
@@ -216,7 +205,7 @@ class CommandHandler:
         """Handle limit order."""
         order = await self._order_manager.place_limit_order(
             sub_account_id=cmd["subAccountId"],
-            symbol=self._normalize_symbol(cmd["symbol"]),
+            symbol=cmd["symbol"],
             side=self._normalize_side(cmd["side"]),
             quantity=float(cmd["quantity"]),
             price=float(cmd["price"]),
@@ -227,28 +216,41 @@ class CommandHandler:
 
     async def handle_scale(self, cmd: dict) -> dict:
         """Handle scale/grid orders — multiple limit orders at different prices."""
-        symbol = self._normalize_symbol(cmd["symbol"])
+        symbol = cmd["symbol"]
         side = self._normalize_side(cmd["side"])
         orders = []
+        errors = []
         for level in cmd.get("levels", []):
-            order = await self._order_manager.place_limit_order(
-                sub_account_id=cmd["subAccountId"],
-                symbol=symbol,
-                side=side,
-                quantity=float(level["quantity"]),
-                price=float(level["price"]),
-                leverage=int(cmd.get("leverage", 1)),
-                origin="BASKET",
-            )
-            orders.append({"clientOrderId": order.client_order_id, "price": level["price"]})
-        return {"success": True, "orders": orders}
+            try:
+                order = await self._order_manager.place_limit_order(
+                    sub_account_id=cmd["subAccountId"],
+                    symbol=symbol,
+                    side=side,
+                    quantity=float(level["quantity"]),
+                    price=float(level["price"]),
+                    leverage=int(cmd.get("leverage", 1)),
+                    origin="BASKET",
+                )
+                orders.append({"clientOrderId": order.client_order_id, "price": level["price"]})
+            except Exception as e:
+                errors.append({"price": level["price"], "error": str(e)})
+        total = len(orders) + len(errors)
+        return {
+            "success": len(orders) > 0,
+            "placed": len(orders),
+            "failed": len(errors),
+            "total": total,
+            "orders": orders,
+            "errors": errors,
+        }
 
     async def handle_close(self, cmd: dict) -> dict:
         """Handle close position — market order to flatten."""
-        symbol = self._normalize_symbol(cmd["symbol"])
+        symbol = cmd["symbol"]
         side = self._normalize_side(cmd["side"])
         sub_account_id = cmd["subAccountId"]
         quantity = float(cmd["quantity"])
+        position_id = cmd.get("positionId")  # JS now sends this
 
         order = await self._order_manager.place_market_order(
             sub_account_id=sub_account_id,
@@ -271,16 +273,67 @@ class CommandHandler:
                     logger.warning("Force-closed stale position %s (exchange rejected reduceOnly)", existing.id[:8])
                     return {"success": True, "staleCleanup": True, "positionId": existing.id}
 
+                # Position not in book — try direct DB cleanup using positionId from JS
+                if position_id and self._risk._db:
+                    try:
+                        import time as _time
+                        await self._risk._db.execute(
+                            "UPDATE virtual_positions SET status='CLOSED', closed_at=?, realized_pnl=0 WHERE id=? AND status='OPEN'",
+                            (int(_time.time() * 1000), position_id),
+                        )
+                        # Database.execute() auto-commits — no extra commit needed
+                        logger.warning("Force-closed ghost position %s via direct DB update", position_id[:8])
+                        return {"success": True, "staleCleanup": True, "positionId": position_id}
+                    except Exception as e:
+                        logger.error("Direct DB cleanup for %s failed: %s", position_id[:8], e)
+
             return {"success": False, "error": "Close order failed and no position found to clean up"}
 
         return {"success": True, "clientOrderId": order.client_order_id, "state": order.state}
 
+
     async def handle_close_all(self, cmd: dict) -> dict:
         """Handle close all positions for a sub-account."""
-        # Cancel all pending orders first
-        # Then close each position with market orders
-        # Implementation depends on RiskEngine/PositionBook (Step 7)
-        return {"success": True, "message": "close_all queued"}
+        sub_id = cmd.get("subAccountId")
+        if not sub_id:
+            return {"success": False, "error": "subAccountId required"}
+
+        # 1. Cancel all pending orders first
+        try:
+            cancelled = await self._order_manager.cancel_all_orders_for_account(sub_id)
+            logger.info("close_all: cancelled %d orders for %s", cancelled, sub_id[:8])
+        except Exception as e:
+            logger.error("close_all: cancel orders failed: %s", e)
+
+        # 2. Close each open position with reduce-only market orders
+        positions = self._risk.position_book.get_by_sub_account(sub_id)
+        if not positions:
+            return {"success": True, "closedCount": 0, "cancelledCount": cancelled if 'cancelled' in dir() else 0}
+
+        closed = 0
+        errors = []
+        for pos in positions:
+            close_side = "SELL" if pos.side == "LONG" else "BUY"
+            try:
+                order = await self._order_manager.place_market_order(
+                    sub_account_id=sub_id,
+                    symbol=pos.symbol,
+                    side=close_side,
+                    quantity=pos.quantity,
+                    reduce_only=True,
+                    origin="CLOSE_ALL",
+                )
+                closed += 1
+            except Exception as e:
+                errors.append(f"{pos.symbol}: {e}")
+                logger.error("close_all: failed to close %s: %s", pos.symbol, e)
+
+        return {
+            "success": len(errors) == 0,
+            "closedCount": closed,
+            "cancelledCount": cancelled if 'cancelled' in dir() else 0,
+            "errors": errors if errors else None,
+        }
 
     async def handle_cancel(self, cmd: dict) -> dict:
         """Handle cancel single order."""
@@ -291,15 +344,23 @@ class CommandHandler:
         return {"success": ok}
 
     async def handle_cancel_all(self, cmd: dict) -> dict:
-        """Handle cancel all orders for a symbol."""
-        count = await self._order_manager.cancel_all_orders_for_symbol(cmd["symbol"])
+        """Handle cancel all orders — for a symbol or entire account."""
+        symbol = cmd.get("symbol")
+        if symbol:
+            count = await self._order_manager.cancel_all_orders_for_symbol(
+                symbol
+            )
+        else:
+            count = await self._order_manager.cancel_all_orders_for_account(
+                cmd["subAccountId"]
+            )
         return {"success": True, "cancelledCount": count}
 
     async def handle_basket(self, cmd: dict) -> dict:
         """Handle basket trade — multiple market orders."""
         orders = []
         for item in cmd.get("items", []):
-            symbol = self._normalize_symbol(item["symbol"])
+            symbol = item["symbol"]
             side = self._normalize_side(item["side"])
             order = await self._order_manager.place_market_order(
                 sub_account_id=cmd["subAccountId"],
@@ -318,6 +379,8 @@ class CommandHandler:
         """Start chase order — delegates to ChaseEngine."""
         if not self._chase_engine:
             return {"success": False, "error": "Chase engine not available"}
+        # Normalize side: LONG→BUY, SHORT→SELL (matching all other handlers)
+        cmd["side"] = self._normalize_side(cmd["side"])
         chase_id = await self._chase_engine.start_chase(cmd)
         chase_state = self._chase_engine._active.get(chase_id)
         return {
@@ -325,7 +388,7 @@ class CommandHandler:
             "chaseId": chase_id,
             "symbol": cmd.get("symbol", ""),  # Keep original format for frontend
             "side": cmd.get("side", ""),
-            "currentOrderPrice": chase_state.initial_price if chase_state else None,
+            "currentOrderPrice": chase_state.current_order_price if chase_state else None,
             "stalkOffsetPct": chase_state.stalk_offset_pct if chase_state else 0,
             "stalkMode": chase_state.stalk_mode if chase_state else "none",
         }
@@ -341,14 +404,33 @@ class CommandHandler:
         """Start scalper — delegates to ScalperEngine."""
         if not self._scalper_engine:
             return {"success": False, "error": "Scalper engine not available"}
+        # Symbol passed through as-is (ccxt format) — same pattern as chase handler.
+        # normalize_symbol would convert to Binance native (STEEMUSDT) which breaks
+        # MarketData.get_l1() lookups (keyed by ccxt format STEEM/USDT:USDT).
         scalper_id = await self._scalper_engine.start_scalper(cmd)
-        return {"success": True, "scalperId": scalper_id}
+        scalper_state = self._scalper_engine.get_state(scalper_id)
+        long_count = len(scalper_state.long_slots) if scalper_state else 0
+        short_count = len(scalper_state.short_slots) if scalper_state else 0
+        return {
+            "success": True,
+            "scalperId": scalper_id,
+            "symbol": cmd.get("symbol", ""),
+            "startSide": cmd.get("startSide", "LONG"),
+            "childCount": cmd.get("childCount", 1),
+            "neutralMode": bool(cmd.get("neutralMode", False)),
+            "longLayers": sum(1 for s in scalper_state.long_slots if s.chase_id) if scalper_state else 0,
+            "shortLayers": sum(1 for s in scalper_state.short_slots if s.chase_id) if scalper_state else 0,
+        }
 
     async def handle_scalper_cancel(self, cmd: dict) -> dict:
         """Cancel scalper."""
         if not self._scalper_engine:
             return {"success": False, "error": "Scalper engine not available"}
-        ok = await self._scalper_engine.cancel_scalper(cmd.get("scalperId"))
+        close_positions = bool(cmd.get("closePositions", False))
+        ok = await self._scalper_engine.cancel_scalper(
+            cmd.get("scalperId"),
+            close_positions=close_positions,
+        )
         return {"success": ok}
 
     async def handle_twap(self, cmd: dict) -> dict:
@@ -366,18 +448,48 @@ class CommandHandler:
         return {"success": ok}
 
     async def handle_twap_basket(self, cmd: dict) -> dict:
-        """Start TWAP basket — multiple TWAPs."""
+        """Start TWAP basket — grouped multi-symbol TWAPs."""
         if not self._twap_engine:
             return {"success": False, "error": "TWAP engine not available"}
-        twap_ids = await self._twap_engine.start_basket_twap(cmd)
-        return {"success": True, "twapIds": twap_ids}
+        result = await self._twap_engine.start_basket_twap(cmd)
+        return {"success": True, **result}
+
+    async def handle_twap_basket_cancel(self, cmd: dict) -> dict:
+        """Cancel TWAP basket — cancels all child TWAPs."""
+        if not self._twap_engine:
+            return {"success": False, "error": "TWAP engine not available"}
+        ok = await self._twap_engine.cancel_basket_twap(cmd.get("twapBasketId"))
+        return {"success": ok}
 
     async def handle_trail_stop(self, cmd: dict) -> dict:
         """Start trail stop — delegates to TrailStopEngine."""
         if not self._trail_stop_engine:
             return {"success": False, "error": "Trail stop engine not available"}
+
+        # Enrich from positionId — frontend sends only positionId + callbackPct
+        if "positionId" in cmd and self._risk:
+            pos = self._risk.position_book.get_position(cmd["subAccountId"], cmd["positionId"])
+            if not pos:
+                return {"success": False, "error": f"Position {cmd['positionId']} not found"}
+            cmd.setdefault("symbol", pos.symbol)
+            cmd.setdefault("quantity", pos.quantity)
+            cmd.setdefault("positionSide", pos.side)
+
+        # Accept callbackPct as alias for trailPct
+        if "callbackPct" in cmd and "trailPct" not in cmd:
+            cmd["trailPct"] = cmd["callbackPct"]
+
         ts_id = await self._trail_stop_engine.start_trail_stop(cmd)
-        return {"success": True, "trailStopId": ts_id}
+        state = self._trail_stop_engine._active.get(ts_id)
+        return {
+            "success": True, "trailStopId": ts_id,
+            "symbol": cmd.get("symbol", ""),
+            "side": cmd.get("positionSide", "LONG"),
+            "callbackPct": float(cmd.get("trailPct", cmd.get("callbackPct", 1))),
+            "extremePrice": state.extreme_price if state else None,
+            "triggerPrice": state.trigger_price if state else None,
+            "activated": state.activated if state else False,
+        }
 
     async def handle_trail_stop_cancel(self, cmd: dict) -> dict:
         """Cancel trail stop."""

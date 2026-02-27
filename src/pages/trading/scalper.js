@@ -205,7 +205,7 @@ export async function submitScalper() {
                 `${result.longLayers}L + ${result.shortLayers}S layers`,
                 'success'
             );
-            scheduleTradingRefresh({ positions: true, openOrders: true }, 30);
+            scheduleTradingRefresh({ openOrders: true }, 30);
         }
     } catch (err) {
         if (err.errors && Array.isArray(err.errors)) {
@@ -263,7 +263,7 @@ export async function cancelScalper(scalperId) {
     try {
         await api(`/trade/scalper/${scalperId}${closePositions ? '?close=1' : ''}`, { method: 'DELETE' });
         showToast(closePositions ? 'Scalper stopped & positions closed' : 'Scalper stopped', 'success');
-        scheduleTradingRefresh({ positions: true, openOrders: true }, 30);
+        scheduleTradingRefresh({ openOrders: true }, 30);
     } catch (err) {
         showToast(`${err.message}`, 'error');
     }

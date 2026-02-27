@@ -2,7 +2,7 @@
 import { state, api, showToast, formatPrice } from '../../core/index.js';
 import { cuteConfirm } from '../../lib/cute-confirm.js';
 import * as S from './state.js';
-import { showTradeError, setSizePercent } from './order-form.js';
+import { showTradeError, setSizePercent, restoreSubmitButton } from './order-form.js';
 import { scheduleTradingRefresh } from './refresh-scheduler.js';
 import { beginOrderLatency, markOrderSent, markOrderAck, markOrderPaint } from './perf-metrics.js';
 
@@ -85,7 +85,7 @@ export async function submitTwapOrder() {
             showToast(`${err.message || 'TWAP failed to start'}`, 'error');
         }
     } finally {
-        if (btn) { btn.disabled = false; btn.textContent = S.selectedSide === 'LONG' ? 'Buy / Long' : 'Sell / Short'; }
+        if (btn) { btn.disabled = false; } restoreSubmitButton();
     }
 }
 

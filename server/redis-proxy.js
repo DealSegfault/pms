@@ -110,19 +110,34 @@ export async function subscribeToPmsEvents(broadcastFn) {
     }
 
     // Create a separate subscriber connection (ioredis requires this for pub/sub)
-    const sub = redis.duplicate();
-    await sub.connect?.();
+    try {
+        const sub = redis.duplicate();
 
-    await sub.psubscribe('pms:events:*');
-    sub.on('pmessage', (pattern, channel, message) => {
-        try {
-            const data = JSON.parse(message);
-            const type = channel.replace('pms:events:', '');
-            broadcastFn(type, data);
-        } catch (err) {
-            console.error('[RedisProxy] Failed to parse PMS event:', err.message);
+        sub.on('error', (err) => {
+            console.error('[RedisProxy] Subscriber error:', err.message);
+        });
+
+        // ioredis with lazyConnect needs explicit connect
+        if (sub.status === 'wait') {
+            await sub.connect();
+            console.log('[RedisProxy] Subscriber connection established (status:', sub.status, ')');
         }
-    });
 
-    console.log('[RedisProxy] Subscribed to pms:events:* — forwarding to WebSocket clients');
+        await sub.psubscribe('pms:events:*');
+
+        sub.on('pmessage', (pattern, channel, message) => {
+            try {
+                const data = JSON.parse(message);
+                const type = channel.replace('pms:events:', '');
+                console.log(`[RedisProxy] ◀ ${type} (subAccountId: ${data.subAccountId || 'none'})`);
+                broadcastFn(type, data);
+            } catch (err) {
+                console.error('[RedisProxy] Failed to parse PMS event:', err.message);
+            }
+        });
+
+        console.log('[RedisProxy] ✓ Subscribed to pms:events:* — forwarding to WebSocket clients');
+    } catch (err) {
+        console.error('[RedisProxy] Failed to set up PUB/SUB subscriber:', err.message, err.stack);
+    }
 }

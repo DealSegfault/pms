@@ -151,9 +151,8 @@ class PositionBook:
                 if not acct_set:
                     del self._symbol_accounts[pos.symbol]
 
-        # Auto-remove empty accounts
-        if not entry["positions"]:
-            del self._entries[sub_account_id]
+        # Keep account entry even when empty — balance/rules must persist
+        # (Previously deleted here, causing get_account_snapshot to return $0)
 
         return pos
 

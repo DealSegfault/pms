@@ -11,7 +11,14 @@ import { scheduleTradingRefresh } from './refresh-scheduler.js';
 // ── Helpers ─────────────────────────────────────
 
 export function formatRelativeTime(dateStr) {
-    const diff = Date.now() - new Date(dateStr).getTime();
+    let ts;
+    if (typeof dateStr === 'number') {
+        // Seconds float (< 1e12) vs milliseconds (>= 1e12)
+        ts = dateStr < 1e12 ? dateStr * 1000 : dateStr;
+    } else {
+        ts = new Date(dateStr).getTime();
+    }
+    const diff = Date.now() - ts;
     const sec = Math.floor(diff / 1000);
     if (sec < 60) return `${sec}s`;
     const min = Math.floor(sec / 60);
@@ -90,10 +97,14 @@ export async function loadOpenOrders() {
 
         for (const t of twaps) {
             const isLong = t.side === 'LONG';
-            const pct = t.totalLots > 0 ? Math.round((t.filledLots / t.totalLots) * 100) : 0;
-            const eta = new Date(t.estimatedEnd).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const totalLots = t.numLots || 0;
+            const filledLots = t.filledLots || 0;
+            const pct = totalLots > 0 ? Math.round((filledLots / totalLots) * 100) : 0;
+            const durationMinutes = Math.round(((t.intervalSeconds || 60) * totalLots) / 60);
+            const estimatedEnd = Date.now() + ((totalLots - filledLots) * (t.intervalSeconds || 60) * 1000);
+            const eta = new Date(estimatedEnd).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
             const priceLimitStr = t.priceLimit ? `<span style="font-size:9px; color:var(--accent); opacity:0.85;">${isLong ? 'Max' : 'Min'}: $${formatPrice(t.priceLimit)}</span>` : '';
-            const twapEdit = JSON.stringify({ type: 'TWAP', orderId: t.twapId, symbol: t.symbol, side: t.side, totalSize: t.totalSize, lots: t.totalLots, durationMinutes: t.durationMinutes, jitter: t.jitter || false, irregular: t.irregular || false, priceLimit: t.priceLimit || null });
+            const twapEdit = JSON.stringify({ type: 'TWAP', orderId: t.twapId, symbol: t.symbol, side: t.side, totalSize: t.totalQuantity, lots: totalLots, durationMinutes: durationMinutes, jitter: t.jitter || false, irregular: t.irregular || false, priceLimit: t.priceLimit || null });
             html += `
         <div class="oo-row" style="border-left:3px solid var(--accent); background:rgba(99,102,241,0.05);">
           <span class="oor-sym">
@@ -102,7 +113,7 @@ export async function loadOpenOrders() {
             <span data-edit-type="TWAP" data-edit='${twapEdit.replace(/'/g, "&#39;")}' style="font-size:9px; color:var(--accent); font-weight:600; margin-left:2px; cursor:pointer; text-decoration:underline dotted; text-underline-offset:2px;" title="Click to edit">TWAP</span>
           </span>
           <span class="oor-price" style="display:flex; flex-direction:column; align-items:flex-end; gap:1px;">
-            <span style="font-size:10px; font-weight:600;">${t.filledLots}/${t.totalLots} lots</span>
+            <span style="font-size:10px; font-weight:600;">${filledLots}/${totalLots} lots</span>
             <span style="font-size:9px; color:var(--text-muted);">ETA ${eta}</span>
             ${priceLimitStr}
           </span>
@@ -112,8 +123,8 @@ export async function loadOpenOrders() {
             </div>
             <span style="font-size:9px; color:var(--text-muted);">${pct}%</span>
           </span>
-          <span class="oor-notional">$${t.filledSize.toFixed(0)}/$${t.totalSize.toFixed(0)}</span>
-          <span class="oor-age">${t.durationMinutes}m</span>
+          <span class="oor-notional">$${(t.filledQuantity || 0).toFixed(0)}/$${(t.totalQuantity || 0).toFixed(0)}</span>
+          <span class="oor-age">${durationMinutes}m</span>
           <span class="oor-cancel" data-cancel-twap="${t.twapId}" title="Cancel TWAP">✕</span>
         </div>
       `;
@@ -149,7 +160,7 @@ export async function loadOpenOrders() {
         for (const sp of scalpers) {
             const sym = sp.symbol.split('/')[0];
             const children = scalperChildMap.get(sp.scalperId) || [];
-            const fillCount = sp.fillCount || 0;
+            const fillCount = sp.totalFillCount || 0;
             const longChildren = children.filter(c => c.side === 'LONG');
             const shortChildren = children.filter(c => c.side === 'SHORT');
             const totalLayers = sp.childCount * 2;
@@ -243,10 +254,12 @@ export async function loadOpenOrders() {
 
 
         for (const o of orders) {
-            if (['TWAP', 'TWAP_SLICE', 'CHASE_LIMIT', 'SCALPER_LIMIT'].includes(o.type)) continue;
+            if (['TWAP', 'TWAP_SLICE', 'CHASE_LIMIT', 'SCALPER_LIMIT'].includes(o.orderType)) continue;
+            // Skip orders owned by algo engines — they have dedicated rows above
+            if (['CHASE', 'SCALPER', 'TWAP', 'TWAP_SLICE'].includes(o.origin)) continue;
 
-            const notional = (o.price * o.quantity).toFixed(2);
-            const isLong = o.side === 'LONG';
+            const notional = ((o.price || 0) * (o.quantity || 0)).toFixed(2);
+            const isLong = o.side === 'BUY';
             const age = formatRelativeTime(o.createdAt);
             html += `
         <div class="oo-row">
@@ -255,16 +268,25 @@ export async function loadOpenOrders() {
             <span class="oor-badge ${isLong ? 'cpr-long' : 'cpr-short'}">${isLong ? 'L' : 'S'}</span>
           </span>
           <span class="oor-price">$${formatPrice(o.price)}</span>
-          <span class="oor-qty">${o.quantity.toFixed(4)}</span>
+          <span class="oor-qty">${(o.quantity || 0).toFixed(4)}</span>
           <span class="oor-notional">$${notional}</span>
           <span class="oor-age">${age}</span>
-          <span class="oor-cancel" data-cancel-order="${o.id}" title="Cancel order">✕</span>
+          <span class="oor-cancel" data-cancel-order="${o.clientOrderId}" title="Cancel order">✕</span>
         </div>
       `;
         }
 
         list.innerHTML = html;
         applySymbolFilter();
+
+        // Seed chart lines for active chases so they appear immediately on refresh
+        if (standaloneChases.length > 0) {
+            import('./chase-limit.js').then(m => {
+                for (const ch of standaloneChases) {
+                    m.drawLiveChase(ch);
+                }
+            }).catch(() => { });
+        }
 
         list.querySelectorAll('[data-cancel-order]').forEach(btn => {
             btn.addEventListener('click', () => cancelOrder(btn.dataset.cancelOrder));
@@ -419,7 +441,7 @@ export async function prefillOrderForm(params) {
     await new Promise(r => requestAnimationFrame(r));
 
     if (type === 'TWAP') {
-        if (params.totalSize) setInput('trade-size', params.totalSize);
+        if (params.totalSize || params.totalQuantity) setInput('trade-size', params.totalQuantity || params.totalSize);
         setInput('twap-lots', params.lots ?? 10);
         setInput('twap-duration', params.durationMinutes ?? 30);
         setChecked('twap-jitter', params.jitter);
@@ -710,17 +732,33 @@ export async function marketClosePosition(positionId, symbol) {
     try {
         const result = await api(`/trade/close/${positionId}`, { method: 'POST' });
         const pnl = result.trade?.realizedPnl || 0;
-        showToast(`Closed ${symbol.split('/')[0]}. PnL: ${formatUsd(pnl)}`, pnl >= 0 ? 'success' : 'warning');
+        const label = result.staleCleanup ? 'Removed stale position' : `Closed ${symbol.split('/')[0]}. PnL: ${formatUsd(pnl)}`;
+        showToast(label, result.staleCleanup ? 'info' : (pnl >= 0 ? 'success' : 'warning'));
+        _removePositionRow(positionId);
         scheduleTradingRefresh({
-            positions: true,
             openOrders: true,
             annotations: true,
             forceAnnotations: true,
-            account: true,
         }, 30);
     } catch (err) {
-        showToast(`${err.message}`, 'error');
+        const msg = (err.message || '').toLowerCase();
+        if (msg.includes('not found') || msg.includes('already closed')) {
+            // Position is gone — remove the ghost row from UI
+            _removePositionRow(positionId);
+            showToast('Position already closed — removed from list', 'info');
+        } else {
+            showToast(`${err.message}`, 'error');
+        }
     }
+}
+
+/** Remove a position row from the DOM, update the count badge, and clean _positionMap. */
+function _removePositionRow(positionId) {
+    const row = document.querySelector(`.compact-pos-row[data-cp-id="${positionId}"]`);
+    if (row) row.remove();
+    S._positionMap.delete(positionId);
+    const countEl = document.getElementById('compact-pos-count');
+    if (countEl) countEl.textContent = document.querySelectorAll('#compact-pos-list .compact-pos-row').length;
 }
 
 export function updateCompactLiqForPosition(positionId, liqPrice = null) {
@@ -833,7 +871,7 @@ function _chartAnnotationDataFingerprint(data, showPositions, showOpenOrders, sh
         .sort()
         .join(';');
     const ordKey = (data.openOrders || [])
-        .map(o => `${o.id}|${o.side}|${o.price}|${o.quantity}`)
+        .map(o => `${o.clientOrderId}|${o.side}|${o.price}|${o.quantity}`)
         .sort()
         .join(';');
     const tradeKey = (data.trades || [])
@@ -965,7 +1003,7 @@ function _drawChartAnnotations(data, showPositions, showOpenOrders, showPastOrde
 
     if (showOpenOrders && data.openOrders) {
         for (const order of data.openOrders) {
-            const isLong = order.side === 'LONG';
+            const isLong = order.side === 'BUY';
             const orderLine = S.candleSeries.createPriceLine({
                 price: order.price,
                 color: isLong ? '#4ade80' : '#f87171',
@@ -975,7 +1013,7 @@ function _drawChartAnnotations(data, showPositions, showOpenOrders, showPastOrde
                 title: '',
             });
             S.chartPriceLines.push(orderLine);
-            _orderLineRegistry.set(order.id, orderLine);
+            _orderLineRegistry.set(order.clientOrderId, orderLine);
             leftLabelSpecs.push({
                 price: order.price,
                 text: `${order.side} Limit`,

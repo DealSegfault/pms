@@ -129,6 +129,11 @@ class OrderState:
         return self.state in ("placing", "active", "cancelling")
 
     @property
+    def is_stale(self) -> bool:
+        """Order stuck in 'placing' for > 30s — likely lost in transit."""
+        return self.state == "placing" and (time.time() - self.created_at) > 30.0
+
+    @property
     def remaining_qty(self) -> float:
         """Quantity still unfilled."""
         return max(0.0, self.quantity - self.filled_qty)

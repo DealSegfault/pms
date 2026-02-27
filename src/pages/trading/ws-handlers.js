@@ -195,6 +195,9 @@ export function setupAppEventListeners() {
 
         S.set('cachedMarginInfo', update);
 
+        // Treat margin_update as proof WS is alive (pnl_update only fires with positions)
+        S.set('_lastTradingWsPnlTs', Date.now());
+
         const avail = update.availableMargin ?? 0;
         const avEl = document.getElementById('acct-available');
         const availEl = document.getElementById('form-available');
@@ -280,9 +283,9 @@ export function setupAppEventListeners() {
         if (!d.suppressToast && d.side) playFillSound(d.side);
 
         // Optimistically remove charting line immediately
-        if (d.orderId && _orderLineRegistry.has(d.orderId)) {
-            try { S.candleSeries.removePriceLine(_orderLineRegistry.get(d.orderId)); } catch { }
-            _orderLineRegistry.delete(d.orderId);
+        if (d.clientOrderId && _orderLineRegistry.has(d.clientOrderId)) {
+            try { S.candleSeries.removePriceLine(_orderLineRegistry.get(d.clientOrderId)); } catch { }
+            _orderLineRegistry.delete(d.clientOrderId);
             // Request fresh labels too
             import('./positions-panel.js').then(m => m.refreshChartLeftAnnotationLabels());
         }
@@ -292,7 +295,6 @@ export function setupAppEventListeners() {
             openOrders: true,
             annotations: true,
             forceAnnotations: true,
-            account: true,
         }, 300);
     });
 
@@ -301,9 +303,9 @@ export function setupAppEventListeners() {
         const d = e?.detail || {};
 
         // Optimistically remove charting line immediately
-        if (d.orderId && _orderLineRegistry.has(d.orderId)) {
-            try { S.candleSeries.removePriceLine(_orderLineRegistry.get(d.orderId)); } catch { }
-            _orderLineRegistry.delete(d.orderId);
+        if (d.clientOrderId && _orderLineRegistry.has(d.clientOrderId)) {
+            try { S.candleSeries.removePriceLine(_orderLineRegistry.get(d.clientOrderId)); } catch { }
+            _orderLineRegistry.delete(d.clientOrderId);
             // Request fresh labels too
             import('./positions-panel.js').then(m => m.refreshChartLeftAnnotationLabels());
         }
@@ -312,7 +314,6 @@ export function setupAppEventListeners() {
             openOrders: true,
             annotations: true,
             forceAnnotations: true,
-            account: true,
         }, 300);
     });
 
@@ -342,8 +343,8 @@ export function setupAppEventListeners() {
         S.set('_chartAnnotationFingerprint', null);
         loadChartAnnotations(true);
         scheduleTradingRefresh({
-            positions: true,
-            account: true,
+            annotations: true,
+            forceAnnotations: true,
         }, 50);
     });
 
@@ -373,18 +374,16 @@ export function setupAppEventListeners() {
         S.set('_chartAnnotationFingerprint', null);
         loadChartAnnotations(true);
         scheduleTradingRefresh({
-            positions: true,
-            account: true,
+            annotations: true,
+            forceAnnotations: true,
         }, 50);
     });
 
     mkHandler('position_reduced', () => {
         if (!S._tradingMounted) return;
         scheduleTradingRefresh({
-            positions: true,
             annotations: true,
             forceAnnotations: true,
-            account: true,
         }, 60);
     });
 
@@ -501,18 +500,18 @@ export function setupAppEventListeners() {
 
     mkHandler('twap_progress', (e) => {
         if (!S._tradingMounted) return;
-        scheduleTradingRefresh({ positions: true, openOrders: true, account: true },);
+        scheduleTradingRefresh({ openOrders: true });
         if (e.detail?.symbol === S.selectedSymbol) scheduleChartRiskRefresh();
     });
 
     mkHandler('twap_completed', () => {
         if (!S._tradingMounted) return;
-        scheduleTradingRefresh({ openOrders: true, positions: true, account: true, annotations: true }, 80);
+        scheduleTradingRefresh({ openOrders: true, annotations: true }, 80);
     });
 
     mkHandler('twap_cancelled', () => {
         if (!S._tradingMounted) return;
-        scheduleTradingRefresh({ positions: true, openOrders: true, account: true }, 30);
+        scheduleTradingRefresh({ openOrders: true }, 30);
     });
 
     // Trail stop events — live chart visualization
@@ -541,7 +540,7 @@ export function setupAppEventListeners() {
                 }
             } else {
                 // Row doesn't exist yet — schedule a full refresh
-                scheduleTradingRefresh({ positions: true, openOrders: true, account: true }, 30);
+                scheduleTradingRefresh({ openOrders: true }, 30);
             }
         }
     });
@@ -581,13 +580,13 @@ export function setupAppEventListeners() {
         import('./positions-panel.js').then(m => m.loadChartAnnotations(true));
 
         import('./order-form.js').then(m => m._refreshEquityUpnl());
-        scheduleTradingRefresh({ openOrders: true, positions: true, account: true, annotations: true, forceAnnotations: true }, 50);
+        scheduleTradingRefresh({ openOrders: true, annotations: true, forceAnnotations: true }, 50);
     });
 
     mkHandler('trail_stop_cancelled', () => {
         if (!S._tradingMounted) return;
         import('./trail-stop.js').then(m => m.clearAllTrailStopLines());
-        scheduleTradingRefresh({ positions: true, openOrders: true, account: true }, 30);
+        scheduleTradingRefresh({ openOrders: true }, 30);
     });
 
     mkHandler('chase_progress', (e) => {
@@ -603,9 +602,54 @@ export function setupAppEventListeners() {
                 if (priceEl && data.currentOrderPrice) priceEl.textContent = `$${formatPrice(data.currentOrderPrice)}`;
                 const repEl = row.querySelector('.chase-live-reprices');
                 if (repEl) repEl.textContent = `${data.repriceCount || 0} reprices`;
-            } else {
-                // Row doesn't exist yet — schedule a full refresh
-                scheduleTradingRefresh({ positions: true, openOrders: true, account: true }, 30);
+            } else if (!data.parentScalperId) {
+                // Standalone chase — create row inline from WS data (no HTTP poll)
+                const list = document.getElementById('open-orders-list');
+                if (list) {
+                    // Remove "No open orders" placeholder if present
+                    const noOrders = list.querySelector('div[style*="text-align:center"]');
+                    if (noOrders && list.children.length === 1) list.innerHTML = '';
+
+                    const isLong = data.side === 'LONG' || data.side === 'BUY';
+                    const sym = data.symbol ? data.symbol.split('/')[0] : '??';
+                    const tmp = document.createElement('div');
+                    tmp.innerHTML = `
+                      <div class="oo-row" data-chase-id="${data.chaseId}" style="border-left:3px solid #06b6d4; background:rgba(6,182,212,0.05);">
+                        <span class="oor-sym">
+                          <span class="oor-name" data-oo-symbol="${data.symbol || ''}">${sym}</span>
+                          <span class="oor-badge ${isLong ? 'cpr-long' : 'cpr-short'}">${isLong ? 'L' : 'S'}</span>
+                          <span style="font-size:9px; color:#06b6d4; font-weight:600; margin-left:2px;">CHASE</span>
+                        </span>
+                        <span class="oor-price" style="display:flex; flex-direction:column; align-items:flex-end; gap:1px;">
+                          <span class="chase-live-price" style="font-size:10px; font-weight:600;">$${data.currentOrderPrice ? formatPrice(data.currentOrderPrice) : '\u2014'}</span>
+                          <span style="font-size:9px; color:var(--text-muted);">${data.stalkOffsetPct > 0 ? `${data.stalkOffsetPct}%` : 'best quote'}</span>
+                        </span>
+                        <span class="oor-qty chase-live-reprices" style="min-width:60px; font-size:10px;">
+                          ${data.repriceCount || 0} reprices
+                        </span>
+                        <span class="oor-notional" style="font-size:10px; color:#06b6d4;">
+                          🎯 chasing
+                        </span>
+                        <span class="oor-age">now</span>
+                        <span class="oor-cancel" data-cancel-chase="${data.chaseId}" title="Cancel Chase">✕</span>
+                      </div>
+                    `;
+                    const newRow = tmp.firstElementChild;
+                    // Insert before plain limit orders (after TWAPs/trails/scalpers)
+                    const firstPlainOrder = list.querySelector('.oo-row:not([data-chase-id]):not([data-trail-id]):not([data-scalper-id]):not([style*="border-left"])');
+                    if (firstPlainOrder) {
+                        list.insertBefore(newRow, firstPlainOrder);
+                    } else {
+                        list.appendChild(newRow);
+                    }
+                    // Wire cancel button
+                    newRow.querySelector('[data-cancel-chase]')?.addEventListener('click', () => {
+                        import('./chase-limit.js').then(m => m.cancelChase(data.chaseId));
+                    });
+                    // Update count badge
+                    const countEl = document.getElementById('open-orders-count');
+                    if (countEl) countEl.textContent = String((parseInt(countEl.textContent) || 0) + 1);
+                }
             }
         }
         // Live-update chase price on matching compact position row
@@ -637,8 +681,12 @@ export function setupAppEventListeners() {
             if (tag) tag.remove();
         }
         const oor = document.querySelector(`[data-chase-id="${data.chaseId}"]`);
-        if (oor) oor.remove();
-        scheduleTradingRefresh({ account: true }, 500);
+        if (oor) {
+            oor.remove();
+            const countEl = document.getElementById('open-orders-count');
+            if (countEl) countEl.textContent = String(Math.max(0, (parseInt(countEl.textContent) || 1) - 1));
+        }
+        // margin_update WS event handles account state — no HTTP fetch needed
     });
 
     mkHandler('chase_cancelled', (e) => {
@@ -659,8 +707,12 @@ export function setupAppEventListeners() {
             if (tag) tag.remove();
         }
         const oor = document.querySelector(`[data-chase-id="${data?.chaseId}"]`);
-        if (oor) oor.remove();
-        scheduleTradingRefresh({ account: true }, 500);
+        if (oor) {
+            oor.remove();
+            const countEl = document.getElementById('open-orders-count');
+            if (countEl) countEl.textContent = String(Math.max(0, (parseInt(countEl.textContent) || 1) - 1));
+        }
+        // margin_update WS event handles account state — no HTTP fetch needed
     });
 
 
@@ -678,7 +730,7 @@ export function setupAppEventListeners() {
         const row = document.querySelector(`[data-scalper-id="${data.scalperId}"]`);
         if (row) {
             const fillEl = row.querySelector('.oor-price span:last-child');
-            if (fillEl) fillEl.textContent = `${data.fillCount || 0} fills`;
+            if (fillEl) fillEl.textContent = `${data.totalFillCount || 0} fills`;
         }
 
         // 2. Update per-slot badges in drawer (paused / retry countdown)
@@ -743,7 +795,7 @@ export function setupAppEventListeners() {
             showToast(`⚔️ Scalper ${data?.side} L${data?.layerIdx} filled @ $${formatPrice(data?.fillPrice || 0)} (${sym})`, 'info');
         }).catch(() => { });
         scheduleChartRiskRefresh();
-        scheduleTradingRefresh({ openOrders: true, account: true }, 500);
+        scheduleTradingRefresh({ openOrders: true }, 500);
     });
 
     mkHandler('scalper_cancelled', (e) => {
@@ -756,7 +808,7 @@ export function setupAppEventListeners() {
         import('../../core/index.js').then(({ showToast }) => {
             showToast(`⚔️ Scalper stopped: ${sym}`, 'info');
         }).catch(() => { });
-        scheduleTradingRefresh({ openOrders: true, positions: true, account: true }, 30);
+        scheduleTradingRefresh({ openOrders: true }, 30);
     });
 
     S.set('_compactPosListeners', compactListeners);
@@ -775,8 +827,12 @@ export function startCompactPoll() {
         _schedulePnlUiRefresh();
 
         const now = Date.now();
-        const wsStale = (now - S._lastTradingWsPnlTs) > 10000;
-        if (wsStale && (now - lastFallbackPositionSyncTs) > 15000) {
+        // WS is alive if we got a pnl_update or margin_update recently,
+        // OR if the WebSocket connection itself is open
+        const wsOpen = window.__pmsState?.ws?.readyState === 1;
+        const lastWsTs = S._lastTradingWsPnlTs || 0;
+        const wsStale = !wsOpen && (now - lastWsTs) > 20000;
+        if (wsStale && (now - lastFallbackPositionSyncTs) > 30000) {
             lastFallbackPositionSyncTs = now;
             scheduleTradingRefresh({ positions: true, account: true }, 0);
         }

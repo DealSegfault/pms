@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 # Binance error codes
 RETRYABLE_CODES = {-1003, -1015, 429}  # Too many requests, too many orders, rate limit
 FATAL_CODES = {-2019, -2022, -4003}     # Margin insufficient, reduce-only rejected, qty too small
+CANCEL_IGNORABLE_CODES = {-2011, -2021}  # Unknown order (already cancelled/filled), order would trigger
 
 
 class RateLimiter:
@@ -118,6 +119,26 @@ class ExchangeClient:
         self._max_retries = max_retries
         self._base_delay = base_delay
 
+    # ── Symbol / Side Normalization (exchange boundary) ──
+
+    _SIDE_MAP = {"LONG": "BUY", "SHORT": "SELL", "BUY": "BUY", "SELL": "SELL"}
+
+    @staticmethod
+    def _to_binance_symbol(symbol: str) -> str:
+        """Convert any format to Binance: 'RAVE/USDT:USDT' → 'RAVEUSDT'."""
+        s = symbol.replace("/", "").replace(":USDT", "").upper()
+        if not s.endswith("USDT"):
+            s += "USDT"
+        return s
+
+    @staticmethod
+    def _to_binance_side(side: str) -> str:
+        """Convert LONG→BUY, SHORT→SELL. Pass through BUY/SELL."""
+        mapped = ExchangeClient._SIDE_MAP.get(side.upper())
+        if not mapped:
+            raise ValueError(f"Invalid side: {side}")
+        return mapped
+
     # ── Order Methods ──
 
     async def create_market_order(
@@ -125,7 +146,9 @@ class ExchangeClient:
     ) -> dict:
         """Place a market order. Returns exchange response dict."""
         return await self._execute(
-            self._client.create_market_order, symbol, side, quantity, **kwargs
+            self._client.create_market_order,
+            self._to_binance_symbol(symbol), self._to_binance_side(side),
+            quantity, **kwargs
         )
 
     async def create_limit_order(
@@ -133,7 +156,9 @@ class ExchangeClient:
     ) -> dict:
         """Place a limit order (GTC). Returns exchange response dict."""
         return await self._execute(
-            self._client.create_limit_order, symbol, side, quantity, price, **kwargs
+            self._client.create_limit_order,
+            self._to_binance_symbol(symbol), self._to_binance_side(side),
+            quantity, price, **kwargs
         )
 
     async def create_stop_market_order(
@@ -142,7 +167,8 @@ class ExchangeClient:
         """Place a stop market order."""
         return await self._execute(
             self._client.create_stop_market_order,
-            symbol, side, quantity, stop_price, **kwargs,
+            self._to_binance_symbol(symbol), self._to_binance_side(side),
+            quantity, stop_price, **kwargs,
         )
 
     async def create_take_profit_market_order(
@@ -151,7 +177,8 @@ class ExchangeClient:
         """Place a take profit market order."""
         return await self._execute(
             self._client.create_take_profit_market_order,
-            symbol, side, quantity, stop_price, **kwargs,
+            self._to_binance_symbol(symbol), self._to_binance_side(side),
+            quantity, stop_price, **kwargs,
         )
 
     async def cancel_order(
@@ -160,31 +187,105 @@ class ExchangeClient:
         orderId: Optional[int] = None,
         origClientOrderId: Optional[str] = None,
     ) -> dict:
-        """Cancel an order by exchange ID or client order ID."""
-        return await self._execute(
-            self._client.cancel_order,
-            symbol,
-            orderId=orderId,
-            origClientOrderId=origClientOrderId,
-        )
+        """Cancel an order by exchange ID or client order ID.
+
+        Gracefully handles orders that are already gone on the exchange
+        (-2011 Unknown order) by returning a synthetic cancel response
+        instead of raising.
+        """
+        try:
+            return await self._execute(
+                self._client.cancel_order,
+                self._to_binance_symbol(symbol),
+                orderId=orderId,
+                origClientOrderId=origClientOrderId,
+            )
+        except ClientError as e:
+            if e.error_code in CANCEL_IGNORABLE_CODES:
+                logger.info(
+                    "Cancel ignored (code=%d, order already gone): %s",
+                    e.error_code, origClientOrderId or orderId,
+                )
+                return {"status": "CANCELED", "alreadyGone": True}
+            raise
 
     async def cancel_all_orders(self, symbol: str) -> dict:
         """Cancel all open orders for a symbol."""
-        return await self._execute(self._client.cancel_all_orders, symbol)
+        return await self._execute(
+            self._client.cancel_all_orders, self._to_binance_symbol(symbol)
+        )
+
+    async def create_batch_limit_orders(self, orders: list[dict]) -> list[dict]:
+        """Place multiple limit orders in batches of 5 (Binance batch API).
+        
+        Each order dict should have: symbol, side, quantity, price,
+        and optionally: newClientOrderId, reduceOnly.
+        
+        Returns list of exchange responses (same order as input).
+        """
+        results = []
+        # Chunk into batches of 5 (Binance limit)
+        for i in range(0, len(orders), 5):
+            chunk = orders[i:i + 5]
+            # Build Binance batch order params
+            batch_params = []
+            for o in chunk:
+                param = {
+                    "symbol": self._to_binance_symbol(o["symbol"]),
+                    "side": self._to_binance_side(o["side"]),
+                    "type": "LIMIT",
+                    "quantity": str(o["quantity"]),
+                    "price": str(o["price"]),
+                    "timeInForce": "GTC",
+                }
+                if o.get("newClientOrderId"):
+                    param["newClientOrderId"] = o["newClientOrderId"]
+                if o.get("reduceOnly"):
+                    param["reduceOnly"] = "true"
+                batch_params.append(param)
+            
+            batch_result = await self._execute(
+                self._client.create_batch_orders, batch_params
+            )
+            results.extend(batch_result)
+        
+        return results
+
+    async def cancel_batch_orders(
+        self, symbol: str, client_order_ids: list[str]
+    ) -> list[dict]:
+        """Cancel multiple orders by client order ID in batches of 5.
+        
+        Returns list of cancel responses.
+        """
+        results = []
+        for i in range(0, len(client_order_ids), 5):
+            chunk = client_order_ids[i:i + 5]
+            batch_result = await self._execute(
+                self._client.cancel_batch_orders,
+                self._to_binance_symbol(symbol),
+                orig_client_order_id_list=chunk,
+            )
+            results.extend(batch_result)
+        return results
 
     # ── Query Methods ──
 
     async def get_order(self, symbol: str, orderId: Optional[int] = None) -> dict:
         """Get order status."""
-        return await self._execute(self._client.get_order, symbol, orderId=orderId)
+        return await self._execute(
+            self._client.get_order, self._to_binance_symbol(symbol), orderId=orderId
+        )
 
     async def get_open_orders(self, symbol: Optional[str] = None) -> list:
         """Get all open orders, optionally filtered by symbol."""
-        return await self._execute(self._client.get_open_orders, symbol=symbol)
+        s = self._to_binance_symbol(symbol) if symbol else None
+        return await self._execute(self._client.get_open_orders, symbol=s)
 
     async def get_position_risk(self, symbol: Optional[str] = None) -> list:
         """Get position risk for a symbol or all symbols."""
-        return await self._execute(self._client.get_position_risk, symbol=symbol)
+        s = self._to_binance_symbol(symbol) if symbol else None
+        return await self._execute(self._client.get_position_risk, symbol=s)
 
     async def get_balance(self) -> list:
         """Get account balance."""
@@ -202,12 +303,14 @@ class ExchangeClient:
 
     async def change_leverage(self, symbol: str, leverage: int) -> dict:
         """Set leverage for a symbol."""
-        return await self._execute(self._client.change_leverage, symbol, leverage)
+        return await self._execute(
+            self._client.change_leverage, self._to_binance_symbol(symbol), leverage
+        )
 
     async def change_margin_type(self, symbol: str, margin_type: str) -> dict:
         """Set margin type (ISOLATED / CROSSED)."""
         return await self._execute(
-            self._client.change_margin_type, symbol, margin_type
+            self._client.change_margin_type, self._to_binance_symbol(symbol), margin_type
         )
 
     # ── Listen Key (for user stream) ──

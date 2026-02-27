@@ -69,6 +69,8 @@ class RiskEngine:
 
         # Track last risk snapshot write time per account (throttle)
         self._last_snapshot_ts: Dict[str, float] = {}
+        # Guard against concurrent liquidation tasks per account (#13)
+        self._liquidating: set = set()
 
     def set_order_manager(self, om: Any) -> None:
         """Wire up OrderManager for liquidation execution."""
@@ -81,10 +83,11 @@ class RiskEngine:
 
     async def _publish_event(self, event_type: str, payload: dict) -> None:
         """Publish a position/margin event to Redis PUB/SUB for WS forwarding."""
+        from contracts.common import RedisKey
         if not self._redis:
             return
         try:
-            await self._redis.publish(f"pms:events:{event_type}", json.dumps(payload))
+            await self._redis.publish(RedisKey.event_channel(event_type), json.dumps(payload))
         except Exception as e:
             logger.error("Failed to publish %s: %s", event_type, e)
 
@@ -218,6 +221,12 @@ class RiskEngine:
         if self._db:
             await self._persist_open_position(pos, order)
 
+        # Subscribe to L1 for new symbol if not already subscribed (#14)
+        if self._market_data and not self._book.get_accounts_for_symbol(symbol) - {sub_id}:
+            # First position for this symbol — start receiving price ticks
+            self._market_data.subscribe(symbol, self.on_price_tick)
+            logger.info("Subscribed RiskEngine to L1 for new symbol %s", symbol)
+
         # Publish position_updated + margin_update to frontend
         await self._publish_event("position_updated", {
             "subAccountId": sub_id,
@@ -281,16 +290,22 @@ class RiskEngine:
             old_notional = existing.notional
             new_notional = remaining * existing.entry_price
             new_margin = compute_margin(new_notional, existing.leverage)
+            new_liq = compute_liquidation_price(existing.side, existing.entry_price, remaining, new_margin)
 
             self._book.update_position(
                 existing.id, existing.sub_account_id,
                 quantity=remaining, notional=new_notional, margin=new_margin,
+                liquidation_price=new_liq,
             )
 
             # Credit partial PnL to balance
             account = self._book.get_account(existing.sub_account_id)
             new_balance = account.get("currentBalance", 0) + pnl
             self._book.update_balance(existing.sub_account_id, new_balance)
+
+            # DB: persist partial close (#5)
+            if self._db:
+                await self._persist_partial_close(existing, remaining, new_notional, new_margin, new_liq, pnl, fill_price, fill_qty, order)
 
             # Publish position_reduced + margin_update to frontend
             await self._publish_event("position_reduced", {
@@ -300,6 +315,7 @@ class RiskEngine:
                 "closedQty": fill_qty,
                 "remainingQty": remaining,
                 "realizedPnl": pnl,
+                "liquidationPrice": new_liq,
             })
             snapshot = self.get_account_snapshot(existing.sub_account_id)
             await self._publish_event("margin_update", {
@@ -327,6 +343,11 @@ class RiskEngine:
             notional=new_notional, margin=new_margin,
             liquidation_price=new_liq,
         )
+
+        # DB: persist add-to-position (#5)
+        if self._db:
+            await self._persist_add_to_position(existing, avg_entry, total_qty, new_notional, new_margin, new_liq, fill_price, fill_qty, order)
+
         logger.info("Added to position: %s qty→%.6f entry→%.2f", existing.id[:8], total_qty, avg_entry)
 
     # ── Price Tick Handler ──
@@ -355,15 +376,16 @@ class RiskEngine:
                     pos.mark_price = mid
                     pos.unrealized_pnl = compute_pnl(pos.side, pos.entry_price, mid, pos.quantity)
 
-            # Evaluate liquidation
+            # Evaluate liquidation (with in-flight guard #13)
             result = self._liquidation.evaluate_account(
                 sub_id,
                 price_lookup=lambda s: self._market_data.get_mid_price(s) if self._market_data else None,
             )
-            if result:
+            if result and sub_id not in self._liquidating:
+                self._liquidating.add(sub_id)
                 tier, ratio, positions = result
                 asyncio.create_task(
-                    self._liquidation.execute_liquidation(sub_id, tier, ratio, positions)
+                    self._guarded_liquidation(sub_id, tier, ratio, positions)
                 )
 
         # Write risk snapshot (throttled)
@@ -443,6 +465,10 @@ class RiskEngine:
         """
         Current account state for event-carried state.
         Called by OrderManager._publish_event() to include in Redis events.
+
+        Includes open limit orders from the in-memory OrderTracker so that
+        the risk snapshot (and positions endpoint) shows pending scale/limit
+        orders alongside positions.
         """
         positions = self._book.get_by_sub_account(sub_account_id)
         account = self._book.get_account(sub_account_id)
@@ -451,6 +477,33 @@ class RiskEngine:
         margin_used = sum(p.margin for p in positions)
         unrealized_pnl = sum(p.unrealized_pnl for p in positions)
         equity = balance + unrealized_pnl
+
+        # Include active limit orders from OrderManager tracker
+        open_orders = []
+        if hasattr(self, "_om") and self._om:
+            try:
+                active = self._om.get_active_orders(sub_account_id=sub_account_id)
+                open_orders = [
+                    {
+                        "clientOrderId": o.client_order_id,
+                        "exchangeOrderId": o.exchange_order_id,
+                        "symbol": o.symbol,
+                        "side": o.side,
+                        "orderType": o.order_type,
+                        "price": o.price,
+                        "quantity": o.quantity,
+                        "filledQty": o.filled_qty,
+                        "origin": o.origin,
+                        "leverage": o.leverage,
+                        "reduceOnly": o.reduce_only,
+                        "state": o.state,
+                        "createdAt": o.created_at,
+                    }
+                    for o in active
+                    if o.order_type == "LIMIT"
+                ]
+            except Exception as e:
+                logger.debug("Failed to get open orders for snapshot: %s", e)
 
         return {
             "balance": balance,
@@ -475,6 +528,7 @@ class RiskEngine:
                 }
                 for p in positions
             ],
+            "openOrders": open_orders,
         }
 
     # ── Redis Snapshots ──
@@ -596,6 +650,109 @@ class RiskEngine:
                 )
         except Exception as e:
             logger.error("Failed to persist close position: %s", e)
+
+    async def _persist_partial_close(
+        self, pos: VirtualPos, remaining: float, new_notional: float,
+        new_margin: float, new_liq: float, pnl: float, fill_price: float, fill_qty: float, order: Any
+    ) -> None:
+        """Persist partial close: update position fields + write trade + update balance."""
+        if not self._db:
+            return
+        try:
+            now_ms = int(time.time() * 1000)
+            sig = create_trade_signature(pos.sub_account_id, "PARTIAL_CLOSE", pos.id)
+
+            # Update position with reduced quantity + new liquidation price
+            await self._db.execute(
+                "UPDATE virtual_positions SET quantity=?, notional=?, margin=?, liquidation_price=? WHERE id=?",
+                (remaining, new_notional, new_margin, new_liq, pos.id),
+            )
+
+            # Trade execution record
+            trade_id = str(uuid.uuid4())
+            side = "SELL" if pos.side == "LONG" else "BUY"
+            await self._db.execute(
+                """INSERT INTO trade_executions
+                   (id, sub_account_id, position_id, exchange_order_id, client_order_id,
+                    symbol, side, type, price, quantity, notional, fee, realized_pnl,
+                    action, origin_type, status, signature, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'CLOSE', ?, 'FILLED', ?, ?)""",
+                (trade_id, pos.sub_account_id, pos.id,
+                 getattr(order, 'exchange_order_id', ''),
+                 getattr(order, 'client_order_id', ''),
+                 pos.symbol, side, getattr(order, 'order_type', 'MARKET'),
+                 fill_price, fill_qty, fill_qty * fill_price, pnl,
+                 getattr(order, 'origin', 'MANUAL'), sig, now_ms),
+            )
+
+            # Update balance
+            acct = await self._db.fetch_one(
+                "SELECT current_balance FROM sub_accounts WHERE id=?",
+                (pos.sub_account_id,),
+            )
+            if acct:
+                old_balance = acct["current_balance"]
+                new_balance = old_balance + pnl
+                await self._db.execute(
+                    "UPDATE sub_accounts SET current_balance=?, updated_at=? WHERE id=?",
+                    (new_balance, now_ms, pos.sub_account_id),
+                )
+                await self._db.execute(
+                    """INSERT INTO balance_logs
+                       (id, sub_account_id, balance_before, balance_after, change_amount,
+                        reason, trade_id, timestamp)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (str(uuid.uuid4()), pos.sub_account_id, old_balance, new_balance,
+                     pnl, f"PARTIAL_CLOSE:{pos.symbol}:{pos.side}", trade_id, now_ms),
+                )
+        except Exception as e:
+            logger.error("Failed to persist partial close: %s", e)
+
+    async def _persist_add_to_position(
+        self, pos: VirtualPos, avg_entry: float, total_qty: float,
+        new_notional: float, new_margin: float, new_liq: float,
+        fill_price: float, fill_qty: float, order: Any
+    ) -> None:
+        """Persist add-to-position: update position fields + write trade."""
+        if not self._db:
+            return
+        try:
+            now_ms = int(time.time() * 1000)
+            sig = create_trade_signature(pos.sub_account_id, "ADD", pos.id)
+
+            # Update position with new avg entry and total qty
+            await self._db.execute(
+                """UPDATE virtual_positions
+                   SET entry_price=?, quantity=?, notional=?, margin=?, liquidation_price=?
+                   WHERE id=?""",
+                (avg_entry, total_qty, new_notional, new_margin, new_liq, pos.id),
+            )
+
+            # Trade execution record
+            trade_id = str(uuid.uuid4())
+            side = "BUY" if pos.side == "LONG" else "SELL"
+            await self._db.execute(
+                """INSERT INTO trade_executions
+                   (id, sub_account_id, position_id, exchange_order_id, client_order_id,
+                    symbol, side, type, price, quantity, notional, fee,
+                    action, origin_type, status, signature, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'ADD', ?, 'FILLED', ?, ?)""",
+                (trade_id, pos.sub_account_id, pos.id,
+                 getattr(order, 'exchange_order_id', ''),
+                 getattr(order, 'client_order_id', ''),
+                 pos.symbol, side, getattr(order, 'order_type', 'MARKET'),
+                 fill_price, fill_qty, fill_qty * fill_price,
+                 getattr(order, 'origin', 'MANUAL'), sig, now_ms),
+            )
+        except Exception as e:
+            logger.error("Failed to persist add-to-position: %s", e)
+
+    async def _guarded_liquidation(self, sub_id: str, tier: str, ratio: float, positions: list) -> None:
+        """Execute liquidation with in-flight guard (#13)."""
+        try:
+            await self._liquidation.execute_liquidation(sub_id, tier, ratio, positions)
+        finally:
+            self._liquidating.discard(sub_id)
 
     def __repr__(self) -> str:
         return f"RiskEngine(book={self._book!r})"

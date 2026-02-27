@@ -21,6 +21,20 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from contracts.common import ts_ms, EventType, RedisKey
+from contracts.events import (
+    TrailStopProgressEvent, TrailStopTriggeredEvent, TrailStopCancelledEvent,
+)
+from contracts.state import TrailStopRedisState
+from contracts.invariants import (
+    InvariantViolation, assert_trail_stop_state, assert_trail_stop_extreme_monotone,
+)
+from contracts.state_machines import TRAIL_STOP_FSM
+from contracts.pure_logic import (
+    trail_stop_update_extreme, trail_stop_is_triggered,
+    trail_stop_compute_trigger, trail_stop_close_side,
+)
+
 logger = logging.getLogger(__name__)
 
 TRAIL_STOP_REDIS_TTL = 86400
@@ -39,7 +53,9 @@ class TrailStopState:
     trigger_price: float = 0.0      # Market close price
     activated: bool = False
     status: str = "ACTIVE"          # ACTIVE, TRIGGERED, CANCELLED
+    position_id: Optional[str] = None  # DB position ID (for frontend linkage)
     created_at: float = field(default_factory=time.time)
+    _last_progress: float = 0.0     # Throttle progress events (~1/sec)
 
 
 class TrailStopEngine:
@@ -61,14 +77,18 @@ class TrailStopEngine:
         """Start a new trailing stop. Returns trail stop ID."""
         ts_id = f"ts_{uuid.uuid4().hex[:12]}"
 
+        # Accept callbackPct as alias for trailPct (frontend sends callbackPct)
+        trail_pct = float(params.get("trailPct", params.get("callbackPct", 1)))
+
         state = TrailStopState(
             id=ts_id,
             sub_account_id=params["subAccountId"],
             symbol=params["symbol"],
             side=params.get("positionSide", "LONG"),
             quantity=float(params["quantity"]),
-            trail_pct=float(params["trailPct"]),
+            trail_pct=trail_pct,
             activation_price=float(params["activationPrice"]) if params.get("activationPrice") else None,
+            position_id=params.get("positionId"),
         )
 
         # Initialize extreme with current L1
@@ -83,6 +103,12 @@ class TrailStopEngine:
                 state.activated = True
             elif state.side == "SHORT" and l1["mid"] <= state.activation_price:
                 state.activated = True
+
+        # ── Invariant check: validate state at creation ──
+        try:
+            assert_trail_stop_state(state)
+        except InvariantViolation as e:
+            logger.error("Trail stop %s invariant violation at creation: %s", ts_id, e)
 
         self._active[ts_id] = state
 
@@ -103,6 +129,12 @@ class TrailStopEngine:
         state = self._active.get(trail_stop_id)
         if not state:
             return False
+
+        # ── FSM guard ──
+        try:
+            TRAIL_STOP_FSM.validate_transition(state.status, "USER_CANCEL")
+        except InvariantViolation as e:
+            logger.error("Trail stop %s FSM violation on cancel: %s", trail_stop_id, e)
 
         state.status = "CANCELLED"
         await self._cleanup(state)
@@ -132,26 +164,33 @@ class TrailStopEngine:
                     logger.info("Trail stop %s activated at %.2f", state.id, mid)
             return
 
-        # Update extreme price
-        if state.side == "LONG":
-            if mid > state.extreme_price:
-                state.extreme_price = mid
-                state.trigger_price = self._compute_trigger(state)
-        else:
-            if mid < state.extreme_price:
-                state.extreme_price = mid
-                state.trigger_price = self._compute_trigger(state)
+        # Update extreme price using pure function
+        old_extreme = state.extreme_price
+        new_extreme, changed = trail_stop_update_extreme(state.side, state.extreme_price, mid)
+        if changed:
+            # ── Monotonicity assertion ──
+            try:
+                assert_trail_stop_extreme_monotone(state.side, old_extreme, new_extreme)
+            except InvariantViolation as e:
+                logger.error("Trail stop %s monotonicity violation: %s", state.id, e)
+            state.extreme_price = new_extreme
+            state.trigger_price = self._compute_trigger(state)
 
-        # Check trigger
-        triggered = False
-        if state.side == "LONG" and mid <= state.trigger_price:
-            triggered = True
-        elif state.side == "SHORT" and mid >= state.trigger_price:
-            triggered = True
+        # Publish progress event (throttled ~1/sec)
+        if changed:
+            await self._publish_progress(state)
+
+        # Check trigger using pure function
+        triggered = trail_stop_is_triggered(state.side, mid, state.trigger_price)
 
         if triggered:
+            # ── FSM guard ──
+            try:
+                TRAIL_STOP_FSM.validate_transition(state.status, "TRIGGER")
+            except InvariantViolation as e:
+                logger.error("Trail stop %s FSM violation on trigger: %s", state.id, e)
             state.status = "TRIGGERED"
-            close_side = "SELL" if state.side == "LONG" else "BUY"
+            close_side = trail_stop_close_side(state.side)
 
             logger.warning(
                 "Trail stop TRIGGERED: %s %s mid=%.2f extreme=%.2f trigger=%.2f",
@@ -175,10 +214,8 @@ class TrailStopEngine:
             await self._publish_event("trail_stop_triggered", state, triggerMid=mid)
 
     def _compute_trigger(self, state: TrailStopState) -> float:
-        """Compute trigger price from extreme and trail percentage."""
-        if state.side == "LONG":
-            return state.extreme_price * (1 - state.trail_pct / 100.0)
-        return state.extreme_price * (1 + state.trail_pct / 100.0)
+        """Compute trigger price from extreme and trail percentage (delegates to pure function)."""
+        return trail_stop_compute_trigger(state.side, state.extreme_price, state.trail_pct)
 
     async def _cleanup(self, state: TrailStopState) -> None:
         self._active.pop(state.id, None)
@@ -186,38 +223,87 @@ class TrailStopEngine:
         if handler and self._md:
             self._md.unsubscribe(state.symbol, handler)
         if self._redis:
-            await self._redis.delete(f"pms:trailstop:{state.id}")
-            await self._redis.hdel(f"pms:active_trail_stop:{state.sub_account_id}", state.id)
+            await self._redis.delete(RedisKey.trail_stop(state.id))
+            await self._redis.hdel(RedisKey.active_trail_stop(state.sub_account_id), state.id)
 
     async def _save_state(self, state: TrailStopState) -> None:
+        """Persist state to Redis using TrailStopRedisState DTO."""
         if not self._redis:
             return
-        data = {
-            "id": state.id, "subAccountId": state.sub_account_id,
-            "symbol": state.symbol, "side": state.side,
-            "quantity": state.quantity, "trailPct": state.trail_pct,
-            "activationPrice": state.activation_price,
-            "extremePrice": state.extreme_price, "triggerPrice": state.trigger_price,
-            "activated": state.activated, "status": state.status,
-        }
-        data_json = json.dumps(data)
-        await self._redis.set(f"pms:trailstop:{state.id}", data_json, ex=TRAIL_STOP_REDIS_TTL)
-        acct_key = f"pms:active_trail_stop:{state.sub_account_id}"
+        dto = TrailStopRedisState(
+            trail_stop_id=state.id,
+            sub_account_id=state.sub_account_id,
+            symbol=state.symbol,
+            side=state.side,
+            quantity=state.quantity,
+            callback_pct=state.trail_pct,
+            activation_price=state.activation_price,
+            extreme_price=state.extreme_price,
+            trigger_price=state.trigger_price,
+            activated=state.activated,
+            status=state.status,
+            position_id=state.position_id,
+        )
+        data_json = json.dumps(dto.to_dict())
+        await self._redis.set(RedisKey.trail_stop(state.id), data_json, ex=TRAIL_STOP_REDIS_TTL)
+        acct_key = RedisKey.active_trail_stop(state.sub_account_id)
         await self._redis.hset(acct_key, state.id, data_json)
         await self._redis.expire(acct_key, TRAIL_STOP_REDIS_TTL)
 
+    async def _publish_progress(self, state: TrailStopState) -> None:
+        """Publish progress event, throttled to ~1/second."""
+        now = time.time()
+        if now - state._last_progress < 1.0:
+            return
+        state._last_progress = now
+        await self._publish_event(EventType.TRAIL_STOP_PROGRESS, state)
+        await self._save_state(state)
+
     async def _publish_event(self, event_type: str, state: TrailStopState, **extra) -> None:
+        """Publish trail stop event to Redis using typed event DTOs."""
         if not self._redis:
             return
-        payload = {
-            "type": event_type, "trailStopId": state.id,
-            "symbol": state.symbol, "side": state.side,
-            "trailPct": state.trail_pct, "extremePrice": state.extreme_price,
-            "triggerPrice": state.trigger_price, "status": state.status,
-            "timestamp": time.time(), **extra,
-        }
+
+        if event_type == EventType.TRAIL_STOP_TRIGGERED:
+            payload = TrailStopTriggeredEvent(
+                trail_stop_id=state.id,
+                sub_account_id=state.sub_account_id,
+                symbol=state.symbol,
+                side=state.side,
+                callback_pct=state.trail_pct,
+                extreme_price=state.extreme_price,
+                triggered_price=extra.get("triggerMid", state.trigger_price),
+                position_id=state.position_id,
+                quantity=state.quantity,
+            ).to_dict()
+        elif event_type == EventType.TRAIL_STOP_CANCELLED:
+            payload = TrailStopCancelledEvent(
+                trail_stop_id=state.id,
+                sub_account_id=state.sub_account_id,
+                symbol=state.symbol,
+                side=state.side,
+                callback_pct=state.trail_pct,
+            ).to_dict()
+        else:
+            # trail_stop_progress / trail_stop_started
+            payload = TrailStopProgressEvent(
+                trail_stop_id=state.id,
+                sub_account_id=state.sub_account_id,
+                symbol=state.symbol,
+                side=state.side,
+                callback_pct=state.trail_pct,
+                extreme_price=state.extreme_price,
+                trigger_price=state.trigger_price,
+                activated=state.activated,
+                position_id=state.position_id,
+                quantity=state.quantity,
+                status=state.status,
+            ).to_dict()
+            if event_type not in (EventType.TRAIL_STOP_PROGRESS,):
+                payload["type"] = event_type
+
         try:
-            await self._redis.publish(f"pms:events:{event_type}", json.dumps(payload))
+            await self._redis.publish(RedisKey.event_channel(event_type), json.dumps(payload))
         except Exception as e:
             logger.error("Failed to publish trail stop event: %s", e)
 

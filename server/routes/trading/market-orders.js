@@ -26,20 +26,79 @@ router.post('/', requireOwnership('body'), proxyToRedis('pms:cmd:trade', (req) =
 // POST /api/trade/close/:positionId — Close a position via Python
 router.post('/close/:positionId', requirePositionOwnership(), async (req, res) => {
     try {
+        const positionId = req.params.positionId;
         const position = await prisma.virtualPosition.findUnique({
-            where: { id: req.params.positionId },
+            where: { id: positionId },
         });
         if (!position || position.status !== 'OPEN') {
             return res.status(404).json({ error: 'Position not found or already closed' });
         }
 
         const closeSide = position.side === 'LONG' ? 'SELL' : 'BUY';
-        const result = await pushAndWait('pms:cmd:close', {
-            subAccountId: position.subAccountId,
-            symbol: position.symbol,
-            side: closeSide,
-            quantity: position.quantity,
-        });
+        let result;
+        try {
+            result = await pushAndWait('pms:cmd:close', {
+                subAccountId: position.subAccountId,
+                symbol: position.symbol,
+                side: closeSide,
+                quantity: position.quantity,
+                positionId,
+            });
+        } catch (cmdErr) {
+            // pushAndWait timed out or Python not running —
+            // check if position actually exists in the live snapshot
+            const snapshot = await getRiskSnapshot(position.subAccountId);
+            const livePositions = snapshot?.positions || [];
+            const existsLive = livePositions.some(p =>
+                (p.id === positionId || p.positionId === positionId)
+            );
+
+            if (!existsLive) {
+                // Ghost: in DB but not in Python's live book
+                await prisma.virtualPosition.update({
+                    where: { id: positionId },
+                    data: { status: 'CLOSED', closedAt: new Date(), realizedPnl: 0 },
+                });
+                console.warn(`[close] Force-closed ghost position ${positionId.slice(0, 8)} (Python unreachable, not in live snapshot)`);
+                try {
+                    const { getRedis } = await import('../../redis.js');
+                    await (getRedis()).del(`pms:risk:${position.subAccountId}`);
+                } catch (_) { /* non-fatal */ }
+                return res.json({ success: true, staleCleanup: true, positionId });
+            }
+            // Position exists live but Python timed out — real error
+            return res.status(500).json({ error: cmdErr.message });
+        }
+
+        // Python successfully cleaned the ghost position from its side
+        if (result.staleCleanup) {
+            return res.json({ success: true, staleCleanup: true, positionId });
+        }
+
+        // Python failed to close AND failed to find the position in its book.
+        if (!result.success) {
+            const errorStr = (result.error || '').toLowerCase();
+            const isGhost = errorStr.includes('reduceonly')
+                || errorStr.includes('reduce only')
+                || errorStr.includes('no position found')
+                || errorStr.includes('close order failed');
+
+            if (isGhost) {
+                await prisma.virtualPosition.update({
+                    where: { id: positionId },
+                    data: { status: 'CLOSED', closedAt: new Date(), realizedPnl: 0 },
+                });
+                console.warn(`[close] Force-closed ghost position ${positionId.slice(0, 8)} from DB (not on exchange)`);
+                try {
+                    const { getRedis } = await import('../../redis.js');
+                    await (getRedis()).del(`pms:risk:${position.subAccountId}`);
+                } catch (_) { /* non-fatal */ }
+                return res.json({ success: true, staleCleanup: true, positionId });
+            }
+
+            return res.status(400).json(result);
+        }
+
         res.json(result);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -68,10 +127,12 @@ router.get('/positions/:subAccountId', requireOwnership(), async (req, res) => {
             const marginUsed = snapshot.marginUsed || 0;
             const equity = snapshot.equity || balance;
             const positions = snapshot.positions || [];
+            const openOrders = snapshot.openOrders || [];
             const totalExposure = positions.reduce((s, p) => s + (p.quantity * (p.markPrice || p.entryPrice)), 0);
             const unrealizedPnl = positions.reduce((s, p) => s + (p.unrealizedPnl || 0), 0);
             return res.json({
                 positions,
+                openOrders,
                 summary: {
                     balance,
                     equity,
@@ -107,8 +168,10 @@ router.get('/positions/:subAccountId', requireOwnership(), async (req, res) => {
         const availableMargin = Math.max(0, equity - marginUsed);
         const marginRatio = equity > 0 ? marginUsed / equity : 0;
 
+        // Align with PositionSnapshot.to_dict() shape
         const mappedPositions = positions.map(p => ({
             id: p.id,
+            subAccountId: p.subAccountId,
             symbol: p.symbol,
             side: p.side,
             entryPrice: p.entryPrice,
@@ -239,45 +302,29 @@ router.get('/chart-data/:subAccountId', requireOwnership(), async (req, res) => 
         // Also create a slash form for matching snapshot positions: 'RAVE/USDT'
         const slashSymbol = normSymbol.replace('USDT', '/USDT');
 
-        // 1. Positions from Redis risk snapshot
+        // 1. Positions from Redis risk snapshot — passthrough
         let positions = [];
         const { getRiskSnapshot } = await import('../../redis.js');
         const snapshot = await getRiskSnapshot(subAccountId);
         if (snapshot && Array.isArray(snapshot.positions)) {
-            positions = snapshot.positions
-                .filter(p => {
-                    // Match any format: RAVEUSDT, RAVE/USDT, RAVE/USDT:USDT
-                    const pNorm = (p.symbol || '').replace('/', '').replace(':USDT', '').toUpperCase();
-                    return pNorm === normSymbol;
-                })
-                .map(p => ({
-                    id: p.id, symbol: p.symbol, side: p.side,
-                    entryPrice: p.entryPrice, markPrice: p.markPrice,
-                    quantity: p.quantity, notional: p.notional,
-                    leverage: p.leverage, margin: p.margin,
-                    liquidationPrice: p.liquidationPrice,
-                    unrealizedPnl: p.unrealizedPnl, pnlPercent: p.pnlPercent,
-                    status: 'OPEN', openedAt: p.openedAt,
-                }));
+            positions = snapshot.positions.filter(p => {
+                const pNorm = (p.symbol || '').replace('/', '').replace(':USDT', '').toUpperCase();
+                return pNorm === normSymbol;
+            });
         }
 
-        // 2. Open orders from Redis hash (same source as loadOpenOrders)
+        // 2. Open orders from Redis hash — passthrough (Python to_event_dict() shape)
         const redis = getRedis();
         const rawOrders = await redis.hgetall(`pms:open_orders:${subAccountId}`);
         const openOrders = Object.values(rawOrders || {}).map(v => {
             try {
                 const o = JSON.parse(v);
-                // Compare normalized: RAVEUSDT === RAVEUSDT
                 const oNorm = (o.symbol || '').replace('/', '').replace(':USDT', '').toUpperCase();
                 if (oNorm !== normSymbol) return null;
-                return {
-                    id: o.clientOrderId,
-                    symbol: slashSymbol,
-                    side: o.side === 'BUY' ? 'LONG' : 'SHORT',
-                    type: o.orderType || 'LIMIT',
-                    price: o.price || 0,
-                    quantity: o.quantity || 0,
-                };
+                // Filter out terminal-state ghosts (filled orders stuck in Redis)
+                const st = (o.state || o.status || '').toLowerCase();
+                if (st === 'filled' || st === 'cancelled' || st === 'expired' || st === 'failed') return null;
+                return o;
             } catch { return null; }
         }).filter(Boolean);
 

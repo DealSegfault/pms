@@ -103,14 +103,17 @@ class UserStreamService:
 
     async def start(self) -> None:
         """Start with supervisor (auto-reconnect with exponential backoff)."""
+        self._running = True  # Initialize before loop (#12)
         attempt = 0
         max_delay = 60.0
 
-        while True:
+        while self._running:  # Stop gate — stop() sets _running=False (#12)
             try:
                 attempt = 0
                 await self._run()
             except Exception as e:
+                if not self._running:
+                    break  # Clean shutdown, don't reconnect
                 attempt += 1
                 delay = min(5.0 * (2 ** min(attempt - 1, 4)), max_delay)
                 logger.warning(

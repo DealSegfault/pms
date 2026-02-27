@@ -5,7 +5,6 @@ import { state, api, showToast, formatPrice } from '../../core/index.js';
 import { cuteConfirm } from '../../lib/cute-confirm.js';
 import * as S from './state.js';
 import { showTradeError } from './order-form.js';
-import { scheduleTradingRefresh } from './refresh-scheduler.js';
 
 // ── Chart line management ───────────────────────
 
@@ -134,7 +133,7 @@ export function drawLiveChase(data) {
     };
 
     _renderOneChase(entry, data.currentOrderPrice,
-        data.side === 'LONG' ? data.bid : data.ask);
+        (data.side === 'LONG' || data.side === 'BUY') ? data.bid : data.ask);
 }
 
 /**
@@ -289,8 +288,7 @@ export async function submitChase() {
             if (result.currentOrderPrice) {
                 drawLiveChase(result);
             }
-
-            scheduleTradingRefresh({ positions: true, openOrders: true }, 30);
+            // Chase row will appear via chase_progress WS event — no HTTP poll needed
         }
     } catch (err) {
         if (err.errors && Array.isArray(err.errors)) {
@@ -307,7 +305,13 @@ export async function cancelChase(chaseId) {
         const result = await api(`/trade/chase-limit/${chaseId}`, { method: 'DELETE' });
         showToast(`Chase cancelled (${result.symbol?.split('/')[0] || ''})`, 'success');
         removeChase(chaseId);
-        scheduleTradingRefresh({ positions: true, openOrders: true }, 30);
+        // Optimistically remove DOM row immediately (WS event is backup)
+        const row = document.querySelector(`[data-chase-id="${chaseId}"]`);
+        if (row) {
+            row.remove();
+            const countEl = document.getElementById('open-orders-count');
+            if (countEl) countEl.textContent = String(Math.max(0, (parseInt(countEl.textContent) || 1) - 1));
+        }
     } catch (err) {
         showToast(`${err.message}`, 'error');
     }

@@ -311,16 +311,175 @@ def test_twap_lots():
     lots = [(w / total_w) * 1.0 for w in weights]
     assert abs(sum(lots) - 1.0) < 1e-10
 
-@test("scalper slot creation")
-def test_scalper_slots():
+@test("scalper state creation with new fields")
+def test_scalper_state():
     from trading_engine_python.algos.scalper import ScalperState, ScalperSlot
-    state = ScalperState(id="sc1", sub_account_id="s1", symbol="BTCUSDT",
-                         num_layers=3, base_quantity=0.001, layer_spread_bps=10)
+    state = ScalperState(
+        id="sc1", sub_account_id="s1", symbol="BTCUSDT",
+        start_side="LONG", child_count=3, long_offset_pct=0.05,
+        short_offset_pct=0.05, long_size_usd=50, short_size_usd=50,
+    )
     for i in range(3):
-        state.long_slots.append(ScalperSlot(layer_idx=i, side="BUY"))
-        state.short_slots.append(ScalperSlot(layer_idx=i, side="SELL"))
+        state.long_slots.append(ScalperSlot(layer_idx=i, side="BUY", qty=0.001, offset_pct=0.05))
+        state.short_slots.append(ScalperSlot(layer_idx=i, side="SELL", qty=0.001, offset_pct=0.05))
     assert len(state.long_slots) == 3
     assert len(state.short_slots) == 3
+    assert state.status == "active"
+    assert state.start_side == "LONG"
+
+
+@test("scalper layer geometry — exponential offsets")
+def test_scalper_offsets():
+    from trading_engine_python.algos.scalper import _generate_layer_offsets, _generate_skew_weights
+    offsets = _generate_layer_offsets(0.05, 3)
+    assert len(offsets) == 3
+    assert offsets[0] < offsets[1] < offsets[2]  # Exponentially increasing
+    # Single layer = base offset
+    assert _generate_layer_offsets(0.1, 1) == [0.1]
+    # Skew weights sum to 1
+    w = _generate_skew_weights(3, 0)
+    assert abs(sum(w) - 1.0) < 1e-10
+    # Positive skew → last weight is largest
+    wp = _generate_skew_weights(3, 50)
+    assert wp[2] > wp[0]
+
+
+@test("scalper child chase fill → slot re-arm")
+async def test_scalper_fill_flow():
+    from trading_engine_python.algos.scalper import ScalperEngine
+    # Mock deps
+    mock_om = AsyncMock()
+    mock_md = MagicMock()
+    mock_md.get_l1.return_value = {"bid": 65000, "ask": 65001, "mid": 65000.5}
+    mock_md.subscribe = MagicMock()
+
+    # Mock chase engine: track start_chase calls
+    chase_id_counter = [0]
+    def _next_chase_id(p):
+        cid = f"chase_{chase_id_counter[0]}"
+        chase_id_counter[0] += 1
+        return cid
+    async def _batch_chase(params_list):
+        ids = []
+        for p in params_list:
+            ids.append(_next_chase_id(p))
+        return ids
+    mock_chase = AsyncMock()
+    mock_chase.start_chase = AsyncMock(side_effect=_next_chase_id)
+    mock_chase.start_chase_batch = AsyncMock(side_effect=_batch_chase)
+    mock_chase.cancel_chase = AsyncMock(return_value=True)
+
+    engine = ScalperEngine(mock_om, mock_md, mock_chase, redis_client=None)
+
+    scalper_id = await engine.start_scalper({
+        "subAccountId": "s1", "symbol": "BTCUSDT",
+        "startSide": "LONG", "leverage": 10,
+        "longOffsetPct": 0.05, "shortOffsetPct": 0.05,
+        "childCount": 2, "skew": 0,
+        "longSizeUsd": 100, "shortSizeUsd": 100,
+    })
+
+    state = engine.get_state(scalper_id)
+    assert state is not None
+    assert state.status == "active"
+    assert len(state.long_slots) == 2  # Opening leg
+    assert len(state.short_slots) == 0  # Deferred (not neutral)
+    assert state.long_slots[0].chase_id is not None
+    assert state.long_slots[1].chase_id is not None
+
+    # Simulate child chase fill on slot 0
+    slot0 = state.long_slots[0]
+    old_chase_id = slot0.chase_id
+    await engine._on_child_fill(state, slot0, 65000.0, 0.001)
+
+    # Verify: slot was filled and re-armed
+    assert slot0.fills == 1
+    assert state.fill_count == 1
+    # Reduce-only leg should now be armed (first opening fill)
+    assert state.reduce_only_armed is True
+    assert len(state.short_slots) == 2  # Now armed!
+
+
+@test("scalper cancel cancels all child chases")
+async def test_scalper_cancel():
+    from trading_engine_python.algos.scalper import ScalperEngine
+    mock_om = AsyncMock()
+    mock_md = MagicMock()
+    mock_md.get_l1.return_value = {"bid": 65000, "ask": 65001, "mid": 65000.5}
+    mock_md.subscribe = MagicMock()
+
+    chase_id_counter = [0]
+    def _next_chase_id(p):
+        cid = f"chase_{chase_id_counter[0]}"
+        chase_id_counter[0] += 1
+        return cid
+    async def _batch_chase(params_list):
+        ids = []
+        for p in params_list:
+            ids.append(_next_chase_id(p))
+        return ids
+    mock_chase = AsyncMock()
+    mock_chase.start_chase = AsyncMock(side_effect=_next_chase_id)
+    mock_chase.start_chase_batch = AsyncMock(side_effect=_batch_chase)
+    mock_chase.cancel_chase = AsyncMock(return_value=True)
+
+    engine = ScalperEngine(mock_om, mock_md, mock_chase, redis_client=None)
+
+    scalper_id = await engine.start_scalper({
+        "subAccountId": "s1", "symbol": "BTCUSDT",
+        "startSide": "LONG", "leverage": 10,
+        "longOffsetPct": 0.05, "shortOffsetPct": 0.05,
+        "childCount": 2, "longSizeUsd": 100, "shortSizeUsd": 100,
+        "neutralMode": True,
+    })
+
+    state = engine.get_state(scalper_id)
+    assert len(state.long_slots) == 2
+    assert len(state.short_slots) == 2  # Neutral mode: both legs active
+
+    ok = await engine.cancel_scalper(scalper_id)
+    assert ok is True
+    assert engine.get_state(scalper_id) is None
+    # All chases should have been cancelled
+    assert mock_chase.cancel_chase.call_count >= 4
+
+
+@test("chase callback invocation on fill")
+async def test_chase_fill_callback():
+    from trading_engine_python.algos.chase import ChaseEngine, ChaseState
+    callback_data = {}
+
+    async def on_fill(price, qty):
+        callback_data["price"] = price
+        callback_data["qty"] = qty
+
+    mock_om = AsyncMock()
+    mock_order = MagicMock()
+    mock_order.client_order_id = "test_order"
+    mock_order.avg_fill_price = 65500.0
+    mock_order.filled_qty = 0.001
+    mock_om.place_limit_order = AsyncMock(return_value=mock_order)
+
+    mock_md = MagicMock()
+    mock_md.get_l1.return_value = {"bid": 65000, "ask": 65001, "mid": 65000.5}
+    mock_md.subscribe = MagicMock()
+
+    engine = ChaseEngine(mock_om, mock_md, redis_client=None)
+
+    chase_id = await engine.start_chase({
+        "subAccountId": "s1", "symbol": "BTCUSDT",
+        "side": "BUY", "quantity": 0.001,
+        "stalkMode": "none",
+        "onFill": on_fill,
+    })
+
+    state = engine._active.get(chase_id)
+    assert state is not None
+    # Simulate fill
+    await engine._on_fill(state, mock_order)
+    assert callback_data.get("price") == 65500.0
+    assert callback_data.get("qty") == 0.001
+    assert state.status == "FILLED"
 
 
 # ── 7. Module Import Verification ──
