@@ -279,8 +279,9 @@ class ExchangeClient:
 
     async def get_open_orders(self, symbol: Optional[str] = None) -> list:
         """Get all open orders, optionally filtered by symbol."""
-        s = self._to_binance_symbol(symbol) if symbol else None
-        return await self._execute(self._client.get_open_orders, symbol=s)
+        if symbol:
+            return await self._execute(self._client.get_open_orders, symbol=self._to_binance_symbol(symbol))
+        return await self._execute(self._client.get_open_orders)
 
     async def get_position_risk(self, symbol: Optional[str] = None) -> list:
         """Get position risk for a symbol or all symbols."""

@@ -187,6 +187,13 @@ class RiskEngine:
         if existing:
             # Closing or flipping existing position
             await self._close_position(existing, fill_price, fill_qty, order)
+        elif getattr(order, 'reduce_only', False):
+            # ── Guard: reduceOnly order should NEVER open a new position ──
+            # This prevents flips when position was already closed by another event
+            logger.warning(
+                "ReduceOnly fill with no matching %s position for %s — ignoring (prevents flip)",
+                opposite_side, symbol,
+            )
         else:
             # Opening new position or adding to existing same-side
             same_side = self._book.find_position(sub_id, symbol, position_side)
@@ -753,6 +760,61 @@ class RiskEngine:
             await self._liquidation.execute_liquidation(sub_id, tier, ratio, positions)
         finally:
             self._liquidating.discard(sub_id)
+
+    # ── Position Reconciliation (on UserStream reconnect) ──
+
+    async def reconcile_positions(self, exchange_client: Any) -> dict:
+        """Compare PositionBook with exchange positions. Close ghosts.
+
+        Called by OrderManager.reconcile_on_reconnect() after reconnecting.
+
+        Note: can only detect ghosts (we have position, exchange doesn't).
+        Cannot auto-create positions from exchange data because exchange has
+        one aggregate position and we have sub-accounts.
+        """
+        logger.info("Position reconciliation: fetching exchange positions")
+
+        try:
+            exchange_positions = await exchange_client.get_position_risk()
+        except Exception as e:
+            logger.error("Position reconciliation: failed to fetch positions: %s", e)
+            return {"ghosts_closed": 0, "errors": 1}
+
+        # Build set of symbols with non-zero positions on exchange
+        # Exchange returns Binance format: LYNUSDT → normalize to uppercase
+        exchange_symbols = set()
+        for ep in (exchange_positions or []):
+            amt = float(ep.get("positionAmt", 0))
+            if abs(amt) > 0:
+                exchange_symbols.add(ep.get("symbol", "").upper())
+
+        # Check each virtual position against exchange
+        ghosts_closed = 0
+        for sub_id in list(self._book._entries.keys()):
+            positions = self._book.get_by_sub_account(sub_id)
+            for pos in list(positions):
+                # Convert ccxt symbol to Binance: 'LYN/USDT:USDT' → 'LYNUSDT'
+                binance_sym = pos.symbol.replace("/", "").replace(":USDT", "").upper()
+                if not binance_sym.endswith("USDT"):
+                    binance_sym += "USDT"
+
+                if binance_sym not in exchange_symbols:
+                    # Ghost: we have position, exchange doesn't
+                    logger.warning(
+                        "RECONCILE GHOST: position %s %s %s qty=%.6f exists in PositionBook "
+                        "but NOT on exchange — force closing",
+                        pos.id[:8], pos.symbol, pos.side, pos.quantity,
+                    )
+                    await self.force_close_stale_position(pos)
+                    ghosts_closed += 1
+
+        if ghosts_closed:
+            logger.warning("Position reconciliation: closed %d ghost positions", ghosts_closed)
+        else:
+            logger.info("Position reconciliation: no ghosts found (%d exchange positions, %d virtual)",
+                        len(exchange_symbols), sum(len(self._book.get_by_sub_account(s)) for s in self._book._entries))
+
+        return {"ghosts_closed": ghosts_closed, "errors": 0}
 
     def __repr__(self) -> str:
         return f"RiskEngine(book={self._book!r})"

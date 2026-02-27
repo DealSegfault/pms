@@ -4,17 +4,23 @@
  * PROXY VERSION: Instead of wiring to riskEngine directly, subscribes to
  * Redis pms:events:* channels from Python engine and forwards to clients.
  *
- * Auth, subscriptions, and backpressure handling are unchanged.
+ * Supports two subscription modes:
+ *   1. PMS events (default) — normalized events scoped by subAccountId
+ *   2. User stream — raw Binance user data events (for bot consumers)
+ *
+ * Auth: JWT token OR API key (X-PMS-Key style, passed in subscribe message)
  */
 import { WebSocketServer } from 'ws';
 import prisma from './db/prisma.js';
-import { verifyToken } from './auth.js';
+import { verifyToken, lookupApiKey } from './auth.js';
 import { subscribeToPmsEvents } from './redis-proxy.js';
 
 let wss = null;
 
 // ── Indexed routing: O(1) lookup by subAccountId ──
 const subAccountSockets = new Map();
+// ── User stream subscribers (raw Binance events) ──
+const userStreamSockets = new Set();
 
 function indexSocket(ws, subAccountId) {
     if (!subAccountSockets.has(subAccountId)) {
@@ -31,6 +37,7 @@ function unindexSocket(ws) {
             if (sockets.size === 0) subAccountSockets.delete(ws.subscribedAccount);
         }
     }
+    userStreamSockets.delete(ws);
 }
 
 // ── Backpressure-safe send ──
@@ -60,6 +67,7 @@ export function initWebSocket(server) {
         ws.isAlive = true;
         ws.userId = null;
         ws.subscribedAccount = null;
+        ws.subscribedUserStream = false;
         ws.on('pong', () => { ws.isAlive = true; });
 
         ws.on('message', async (data) => {
@@ -68,7 +76,10 @@ export function initWebSocket(server) {
                 if (msg.type === 'subscribe') {
                     const subAccountId = msg.subAccountId || null;
                     const token = msg.token || null;
+                    const apiKey = msg.apiKey || null;
+                    const streamType = msg.streamType || 'pms'; // 'pms' or 'user_stream'
 
+                    // ── Auth: JWT token ──
                     if (token) {
                         const payload = verifyToken(token);
                         if (payload) {
@@ -77,6 +88,31 @@ export function initWebSocket(server) {
                         }
                     }
 
+                    // ── Auth: API key (for bots) ──
+                    if (!ws.userId && apiKey) {
+                        try {
+                            const user = await lookupApiKey(apiKey);
+                            if (user && user.status === 'APPROVED') {
+                                ws.userId = user.id;
+                                ws.userRole = user.role;
+                            } else {
+                                ws.send(JSON.stringify({ type: 'error', message: 'Invalid or unapproved API key' }));
+                            }
+                        } catch (err) {
+                            console.error('[WS] API key lookup error:', err.message);
+                            ws.send(JSON.stringify({ type: 'error', message: 'Authentication failed' }));
+                        }
+                    }
+
+                    // ── Subscribe to user stream (raw Binance events) ──
+                    if (streamType === 'user_stream' && ws.userId) {
+                        userStreamSockets.add(ws);
+                        ws.subscribedUserStream = true;
+                        ws.send(JSON.stringify({ type: 'subscribed', streamType: 'user_stream' }));
+                        console.log(`[WS] Client subscribed to user_stream (userId: ${ws.userId})`);
+                    }
+
+                    // ── Subscribe to PMS events (scoped by subAccountId) ──
                     if (subAccountId && ws.userId) {
                         unindexSocket(ws);
 
@@ -126,6 +162,19 @@ export function initWebSocket(server) {
 
 function broadcast(type, data) {
     if (!wss) return;
+
+    // ── User stream events: forward raw to user_stream subscribers ──
+    if (type === 'user_stream') {
+        if (userStreamSockets.size === 0) return;
+        const message = JSON.stringify({ type: 'user_stream_event', data, timestamp: Date.now() });
+        console.log(`[WS] ▶ user_stream → ${userStreamSockets.size} bot clients`);
+        for (const ws of userStreamSockets) {
+            safeSend(ws, message);
+        }
+        return;
+    }
+
+    // ── PMS events: route by subAccountId ──
     const message = JSON.stringify({ type, data, timestamp: Date.now() });
 
     if (data.subAccountId) {
@@ -146,3 +195,4 @@ function broadcast(type, data) {
 }
 
 export { broadcast };
+

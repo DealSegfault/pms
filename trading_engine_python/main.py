@@ -68,11 +68,12 @@ async def main() -> None:
     await redis_client.ping()
     logger.info("Redis connected: %s", redis_url)
 
-    # ── 2b. Clean stale order/algo state from previous session ──
+    # ── 2b. Clean stale active indexes from previous session ──
+    # NOTE: only clean the active indexes (rebuilt by resume). Keep pms:chase:*,
+    # pms:scalper:*, pms:twap:*, pms:trail_stop:* — those are needed for resume.
     stale_patterns = [
         "pms:open_orders:*", "pms:active_chase:*", "pms:active_scalper:*",
         "pms:active_twap:*", "pms:active_trail_stop:*",
-        "pms:chase:*", "pms:scalper:*", "pms:twap:*", "pms:trail_stop:*",
     ]
     stale_count = 0
     for pattern in stale_patterns:
@@ -89,12 +90,24 @@ async def main() -> None:
     logger.info("DB connected")
 
     # ── 4. ExchangeClient ──
-    from trading_engine_python.orders.exchange_client import ExchangeClient
-    exchange = ExchangeClient(
-        api_key=api_key,
-        api_secret=api_secret,
-    )
-    logger.info("ExchangeClient created")
+    paper_mode = os.getenv("PAPER_TRADING", "0") == "1"
+    if paper_mode:
+        from trading_engine_python.paper.exchange import PaperExchangeClient
+        exchange = PaperExchangeClient(api_key=api_key, api_secret=api_secret)
+        logger.warning("")
+        logger.warning("  ╔══════════════════════════════════════════════╗")
+        logger.warning("  ║  🧻 PAPER TRADING MODE                      ║")
+        logger.warning("  ║  No real orders — simulated execution only   ║")
+        logger.warning("  ║  Real market data • Virtual balance          ║")
+        logger.warning("  ╚══════════════════════════════════════════════╝")
+        logger.warning("")
+    else:
+        from trading_engine_python.orders.exchange_client import ExchangeClient
+        exchange = ExchangeClient(
+            api_key=api_key,
+            api_secret=api_secret,
+        )
+    logger.info("ExchangeClient created (%s)", "PAPER" if paper_mode else "LIVE")
 
     # ── 4b. Exchange Info (tick sizes, step sizes, min notional) ──
     from trading_engine_python.feeds.symbol_info import SymbolInfoCache
@@ -140,7 +153,7 @@ async def main() -> None:
     logger.info("RiskEngine loaded %d positions", pos_count)
 
     # ── 7b. Reconcile with exchange — close ghost positions ──
-    if pos_count > 0:
+    if not paper_mode and pos_count > 0:
         try:
             exchange_positions = await exchange.get_position_risk()
             # Build set of (symbol, side) that actually exist on exchange
@@ -169,16 +182,11 @@ async def main() -> None:
                 logger.info("Reconciliation: all %d positions verified on exchange", pos_count)
         except Exception as e:
             logger.error("Position reconciliation failed (non-fatal): %s", e)
+    elif paper_mode:
+        logger.info("Skipping exchange reconciliation (paper mode)")
 
-    # ── 7c. Recover open orders from exchange ──
-    try:
-        recovered = await order_manager.load_open_orders_from_exchange()
-        if recovered:
-            logger.info("Recovered %d open orders from exchange", recovered)
-        else:
-            logger.info("No open orders to recover from exchange")
-    except Exception as e:
-        logger.error("Open order recovery failed (non-fatal): %s", e)
+    # NOTE: Open order recovery is handled by UserStreamService._init_state() on first connect.
+    # No need to duplicate it here.
 
     # ── 8. Algo Engines ──
     from trading_engine_python.algos.chase import ChaseEngine
@@ -192,6 +200,21 @@ async def main() -> None:
     twap = TWAPEngine(order_manager, market_data, redis_client)
     trail_stop = TrailStopEngine(order_manager, market_data, redis_client)
     logger.info("Algo engines created (Chase, Scalper, TWAP, TrailStop)")
+
+    # ── 8b. Resume active algos from Redis (crash recovery) ──
+    try:
+        resumed_chases = await chase.resume_from_redis()
+        resumed_scalpers = await scalper.resume_from_redis()
+        resumed_trail_stops = await trail_stop.resume_from_redis(risk_engine=risk_engine)
+        resumed_twaps = await twap.resume_from_redis()
+        total_resumed = resumed_chases + resumed_scalpers + resumed_trail_stops + resumed_twaps
+        if total_resumed:
+            logger.warning("Resumed %d algo(s) from Redis: %d chases, %d scalpers, %d trail stops, %d TWAPs",
+                          total_resumed, resumed_chases, resumed_scalpers, resumed_trail_stops, resumed_twaps)
+        else:
+            logger.info("No active algos to resume from Redis")
+    except Exception as e:
+        logger.error("Algo resume from Redis failed (non-fatal): %s", e)
 
     # ── 9. CommandHandler ──
     from trading_engine_python.commands.handler import CommandHandler
@@ -208,15 +231,31 @@ async def main() -> None:
     logger.info("CommandHandler wired to all engines")
 
     # ── 10. UserStreamService ──
-    from trading_engine_python.feeds.user_stream import UserStreamService
+    if paper_mode:
+        from trading_engine_python.paper.feed import PaperUserStream
+        user_stream = PaperUserStream(
+            order_manager=order_manager,
+            risk_engine=risk_engine,
+            matching_engine=exchange.matching_engine,
+            market_data=market_data,
+        )
+        logger.info("PaperUserStream created (paper mode)")
+    else:
+        from trading_engine_python.feeds.user_stream import UserStreamService
+        user_stream = UserStreamService(
+            api_key=api_key,
+            api_secret=api_secret,
+            order_manager=order_manager,
+            risk_engine=risk_engine,
+            redis_client=redis_client,
+        )
+        logger.info("UserStreamService created")
 
-    user_stream = UserStreamService(
-        api_key=api_key,
-        api_secret=api_secret,
-        order_manager=order_manager,
-        risk_engine=risk_engine,
-    )
-    logger.info("UserStreamService created")
+    # Wire WS health flag → ChaseEngine adaptive fill checker
+    if paper_mode:
+        chase.set_ws_health_checker(lambda: True)  # Always "connected" in paper mode
+    else:
+        chase.set_ws_health_checker(lambda: user_stream._ws_connected)
 
     # ── 11. Subscribe RiskEngine to L1 for all active position symbols ──
     for symbol in position_book._symbol_accounts:
@@ -240,7 +279,7 @@ async def main() -> None:
         async with asyncio.TaskGroup() as tg:
             # Core services
             tg.create_task(cmd_handler.run())
-            if api_key:
+            if api_key or paper_mode:
                 tg.create_task(user_stream.start())
 
             # Periodic cleanup — expires stale orders + reclaims terminal order memory

@@ -540,3 +540,104 @@ class TWAPEngine:
     @property
     def active_count(self) -> int:
         return len(self._active)
+
+    # ── Resume from Redis ──
+
+    async def resume_from_redis(self) -> int:
+        """Resume active TWAPs from Redis on startup/reconnect.
+
+        Scans pms:twap:* keys, adjusts filled_lots for elapsed time,
+        reconstructs TWAPState, and resumes the async loop.
+
+        Returns count of resumed TWAPs.
+        """
+        if not self._redis:
+            return 0
+
+        resumed = 0
+        now = time.time()
+
+        try:
+            keys = await self._redis.keys("pms:twap:*")
+        except Exception as e:
+            logger.error("TWAP resume: failed to scan Redis keys: %s", e)
+            return 0
+
+        for key in keys:
+            try:
+                raw = await self._redis.get(key)
+                if not raw:
+                    continue
+                data = json.loads(raw)
+
+                twap_id = data.get("twapId", "")
+                if not twap_id:
+                    continue
+
+                # Skip if already active
+                if twap_id in self._active:
+                    continue
+
+                # Skip non-active
+                status = data.get("status", "")
+                if status not in ("ACTIVE",):
+                    await self._redis.delete(key)
+                    continue
+
+                # Compute elapsed and adjust for missed lots
+                started_at = data.get("startedAt", 0) / 1000.0 if data.get("startedAt") else now
+                interval_seconds = float(data.get("intervalSeconds", 60))
+                num_lots = int(data.get("numLots", 10))
+                filled_lots = int(data.get("filledLots", 0))
+
+                elapsed = now - started_at
+                expected_lots = min(num_lots, int(elapsed / interval_seconds)) if interval_seconds > 0 else filled_lots
+                adjusted_filled = max(filled_lots, expected_lots)
+
+                if adjusted_filled >= num_lots:
+                    logger.info("TWAP resume: %s — all %d lots should be complete, cleaning up", twap_id, num_lots)
+                    await self._redis.delete(key)
+                    sub_id = data.get("subAccountId", "")
+                    if sub_id:
+                        await self._redis.hdel(RedisKey.active_twap(sub_id), twap_id)
+                    continue
+
+                # Reconstruct lot_sizes (if not stored, use equal distribution)
+                lot_sizes = data.get("lotSizes", [])
+                total_qty = float(data.get("totalQuantity", 0))
+                if not lot_sizes and total_qty > 0 and num_lots > 0:
+                    lot_sizes = [total_qty / num_lots] * num_lots
+
+                skipped = adjusted_filled - filled_lots
+
+                state = TWAPState(
+                    id=twap_id,
+                    sub_account_id=data.get("subAccountId", ""),
+                    symbol=data.get("symbol", ""),
+                    side=data.get("side", "BUY"),
+                    total_quantity=total_qty,
+                    num_lots=num_lots,
+                    interval_seconds=interval_seconds,
+                    leverage=int(data.get("leverage", 1)),
+                    lot_sizes=lot_sizes,
+                    filled_lots=adjusted_filled,
+                    filled_quantity=float(data.get("filledQuantity", 0)),
+                    basket_id=data.get("basketId"),
+                    created_at=started_at,
+                )
+
+                self._active[twap_id] = state
+                state._task = asyncio.create_task(self._run_twap(state))
+
+                await self._save_state(state)
+
+                resumed += 1
+                logger.info("TWAP resumed: %s %s %s %d/%d lots (skipped %d missed)",
+                           twap_id, state.symbol, state.side, adjusted_filled, num_lots, skipped)
+
+            except Exception as e:
+                logger.error("TWAP resume: failed to restore %s: %s", key, e)
+
+        if resumed:
+            logger.warning("TWAP engine: resumed %d active TWAP(s) from Redis", resumed)
+        return resumed

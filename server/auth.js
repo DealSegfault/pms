@@ -74,7 +74,7 @@ export function adminMiddleware(req, res, next) {
 const API_KEY_CACHE_TTL_MS = 60_000; // 60 seconds
 const apiKeyCache = new Map(); // apiKey → { user, expires }
 
-async function lookupApiKey(apiKey) {
+export async function lookupApiKey(apiKey) {
     const cached = apiKeyCache.get(apiKey);
     if (cached && cached.expires > Date.now()) {
         return cached.user;

@@ -486,11 +486,17 @@ class OrderManager:
             client_order_id=client_order_id,
         )
         if not order:
-            logger.debug(
-                "on_order_update: unknown order (coid=%s, eid=%s, status=%s) — not ours",
-                client_order_id, exchange_order_id, status,
-            )
-            return
+            # ── External bot order: PMS-tagged but not tracked ──
+            # Happens when a bot places orders directly on Binance with a PMS clientOrderId.
+            # Create an ad-hoc OrderState so the fill flows through the full chain
+            # (RiskEngine → VirtualPosition → DB → events).
+            order = await self._create_bot_order_from_feed(data)
+            if not order:
+                logger.debug(
+                    "on_order_update: unresolvable order (coid=%s, eid=%s, status=%s) — ignoring",
+                    client_order_id, exchange_order_id, status,
+                )
+                return
 
         old_state = order.state
 
@@ -780,16 +786,123 @@ class OrderManager:
         return count
 
     def _resolve_sub_account(self, prefix: str) -> Optional[str]:
-        """Resolve 8-char sub-account prefix to full ID using PositionBook."""
-        if not self._risk:
+        """Resolve 8-char sub-account prefix to full ID.
+
+        Checks PositionBook first (fast, in-memory), falls back to
+        cached DB lookup for sub-accounts that don't yet have positions.
+        """
+        if not prefix:
             return None
-        book = getattr(self._risk, 'position_book', None) or getattr(self._risk, '_book', None)
-        if not book:
-            return None
-        for sub_id in book._entries:
-            if sub_id.startswith(prefix):
-                return sub_id
+
+        # 1. Check PositionBook (has all accounts loaded at startup)
+        if self._risk:
+            book = getattr(self._risk, 'position_book', None) or getattr(self._risk, '_book', None)
+            if book:
+                for sub_id in book._entries:
+                    if sub_id.startswith(prefix):
+                        return sub_id
+
+        # 2. Check local cache (populated from DB on misses)
+        if hasattr(self, '_sub_account_cache'):
+            cached = self._sub_account_cache.get(prefix)
+            if cached:
+                return cached
+
         return None
+
+    async def _resolve_sub_account_async(self, prefix: str) -> Optional[str]:
+        """Resolve sub-account prefix with async DB fallback."""
+        # Try synchronous resolution first
+        result = self._resolve_sub_account(prefix)
+        if result:
+            return result
+
+        # DB fallback: find sub-account whose ID starts with this prefix
+        if self._db:
+            try:
+                row = await self._db.fetch_one(
+                    "SELECT id FROM sub_accounts WHERE id LIKE ? AND status = 'ACTIVE' LIMIT 1",
+                    (f"{prefix}%",),
+                )
+                if row:
+                    full_id = row["id"]
+                    # Cache for future lookups
+                    if not hasattr(self, '_sub_account_cache'):
+                        self._sub_account_cache = {}
+                    self._sub_account_cache[prefix] = full_id
+                    logger.info("Resolved sub-account prefix %s → %s (DB fallback)", prefix, full_id[:12])
+                    return full_id
+            except Exception as e:
+                logger.error("DB sub-account lookup failed for prefix %s: %s", prefix, e)
+
+        return None
+
+    async def _create_bot_order_from_feed(self, data: dict) -> Optional[OrderState]:
+        """
+        Create an ad-hoc OrderState for an external bot order.
+
+        Called when on_order_update receives a PMS-tagged clientOrderId
+        that is NOT in the in-memory tracker (i.e. the order was placed
+        directly on Binance by an external bot, not through our CommandHandler).
+
+        Parses the clientOrderId prefix to resolve the sub-account,
+        creates an OrderState with origin='BOT', and registers it so
+        the fill flows through the full chain.
+        """
+        client_order_id = data.get("client_order_id", "")
+        exchange_order_id = str(data.get("order_id", ""))
+        status = data.get("order_status", "")
+
+        if not client_order_id.startswith("PMS"):
+            return None
+
+        # Parse: PMS{sub8}_{type}_{uid} → extract sub-account prefix
+        stripped = client_order_id[3:]  # Remove 'PMS'
+        parts = stripped.split("_", 2)
+        if len(parts) < 1 or not parts[0]:
+            logger.warning("Bot order %s: cannot parse sub-account prefix", client_order_id)
+            return None
+
+        sub_prefix = parts[0]
+        sub_account_id = await self._resolve_sub_account_async(sub_prefix)
+        if not sub_account_id:
+            logger.warning(
+                "Bot order %s: could not resolve sub-account prefix '%s'",
+                client_order_id, sub_prefix,
+            )
+            return None
+
+        # Determine initial state based on incoming status
+        # Bot orders arrive from the feed, so they're already on the exchange.
+        if status in ("FILLED",):
+            initial_state = "active"  # Will transition to "filled" in the main handler
+        elif status in ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED"):
+            initial_state = "active"  # Will transition to terminal in the main handler
+        else:
+            initial_state = "active"
+
+        order = OrderState(
+            client_order_id=client_order_id,
+            sub_account_id=sub_account_id,
+            exchange_order_id=exchange_order_id if exchange_order_id else None,
+            symbol=data.get("symbol", ""),
+            side=data.get("side", ""),
+            order_type=data.get("order_type", "MARKET"),
+            quantity=float(data.get("orig_qty", 0)),
+            price=float(data.get("price", 0)) if data.get("price") else None,
+            state=initial_state,
+            origin="BOT",
+            leverage=1,  # Bot manages its own leverage
+            reduce_only=data.get("reduce_only", False),
+        )
+
+        self._tracker.register(order)
+        logger.info(
+            "Created bot order from feed: %s %s %s qty=%.6f (sub=%s)",
+            client_order_id, order.symbol, order.side,
+            order.quantity, sub_account_id[:8],
+        )
+        return order
 
     # ── DB Persistence for Pending Orders ──
 
@@ -854,15 +967,19 @@ class OrderManager:
         # 3. Purge ghost entries from Redis open_orders hashes
         ghost_count = await self._reconcile_redis_open_orders()
 
-        # 4. Observability
-        if cleaned or stale_count or ghost_count:
+        # 4. Exchange-level fill reconciliation — catch missed WS events
+        reconciled = await self._reconcile_active_orders()
+
+        # 5. Observability
+        total = cleaned + stale_count + ghost_count + reconciled
+        if total:
             logger.info(
-                "OrderTracker: total=%d active=%d (cleaned=%d stale=%d ghosts=%d)",
+                "OrderTracker: total=%d active=%d (cleaned=%d stale=%d ghosts=%d reconciled=%d)",
                 self._tracker.total_count, self._tracker.active_count,
-                cleaned, stale_count, ghost_count,
+                cleaned, stale_count, ghost_count, reconciled,
             )
 
-        return cleaned + stale_count + ghost_count
+        return total
 
     async def _reconcile_redis_open_orders(self) -> int:
         """Scan all pms:open_orders:* hashes and remove entries with terminal state.
@@ -905,6 +1022,261 @@ class OrderManager:
             logger.error("Redis open_orders reconciliation error: %s", e)
 
         return ghost_count
+
+    # ── Exchange-Level Fill Reconciliation ──
+
+    _RECONCILE_STALE_THRESHOLD = 15.0   # seconds before checking exchange
+    _RECONCILE_MAX_PER_CYCLE = 3        # limit REST calls per cleanup cycle
+
+    async def _reconcile_active_orders(self) -> int:
+        """Safety net: verify stale active orders against exchange REST API.
+
+        Catches fills that the UserStream WebSocket dropped. For orders in
+        non-terminal state for > 15s, queries the exchange for actual status.
+        If exchange says FILLED but our tracker says 'active' → inject a
+        synthetic fill event to trigger the full chain (risk engine, algo
+        callbacks, virtual positions).
+
+        Limited to 3 orders per cycle to avoid REST rate limit pressure.
+        """
+        now = time.time()
+        reconciled = 0
+        checked = 0
+
+        for order in list(self._tracker._by_client_id.values()):
+            if checked >= self._RECONCILE_MAX_PER_CYCLE:
+                break
+
+            # Only check orders that have been active for a while
+            if order.is_terminal:
+                continue
+            if order.state not in ("active", "cancelling"):
+                continue
+            if (now - order.updated_at) < self._RECONCILE_STALE_THRESHOLD:
+                continue
+            if not order.exchange_order_id:
+                continue
+
+            checked += 1
+            try:
+                exchange_data = await self._exchange.get_order(
+                    order.symbol,
+                    orderId=int(order.exchange_order_id),
+                )
+            except Exception as e:
+                err_str = str(e)
+                if "-2013" in err_str:  # Order does not exist
+                    logger.warning(
+                        "Reconcile: order %s not found on exchange — marking expired",
+                        order.client_order_id,
+                    )
+                    order.transition("expired")
+                    await self._redis_remove_open_order(order)
+                    reconciled += 1
+                else:
+                    logger.debug("Reconcile: query failed for %s: %s", order.client_order_id, e)
+                continue
+
+            exchange_status = exchange_data.get("status", "")
+
+            if exchange_status == "FILLED":
+                # ── Critical: exchange filled but we missed it ──
+                logger.warning(
+                    "RECONCILE: order %s FILLED on exchange but tracker state=%s — injecting fill",
+                    order.client_order_id, order.state,
+                )
+                # Inject as a synthetic on_order_update event so the full chain fires:
+                # risk engine → virtual position → algo callbacks → scalper unwind
+                synthetic = {
+                    "order_id": order.exchange_order_id,
+                    "client_order_id": order.client_order_id,
+                    "symbol": exchange_data.get("symbol", order.symbol),
+                    "side": exchange_data.get("side", order.side),
+                    "order_status": "FILLED",
+                    "last_filled_qty": str(exchange_data.get("executedQty", order.quantity)),
+                    "last_filled_price": str(exchange_data.get("avgPrice", "0")),
+                    "accumulated_filled_qty": str(exchange_data.get("executedQty", "0")),
+                    "avg_price": str(exchange_data.get("avgPrice", "0")),
+                    "orig_qty": str(exchange_data.get("origQty", order.quantity)),
+                }
+                await self.on_order_update(synthetic)
+                reconciled += 1
+
+            elif exchange_status in ("CANCELED", "EXPIRED", "REJECTED"):
+                logger.warning(
+                    "RECONCILE: order %s %s on exchange but tracker state=%s — syncing",
+                    order.client_order_id, exchange_status, order.state,
+                )
+                synthetic = {
+                    "order_id": order.exchange_order_id,
+                    "client_order_id": order.client_order_id,
+                    "symbol": exchange_data.get("symbol", order.symbol),
+                    "side": exchange_data.get("side", order.side),
+                    "order_status": exchange_status,
+                }
+                await self.on_order_update(synthetic)
+                reconciled += 1
+
+            else:
+                # Order still alive on exchange — touch updated_at to avoid
+                # re-checking every cycle
+                order.updated_at = now
+
+        if reconciled:
+            logger.info("Reconciled %d orders with exchange (checked %d)", reconciled, checked)
+
+        return reconciled
+
+    # ── Full State Reconciliation (on UserStream reconnect) ──
+
+    async def reconcile_on_reconnect(self) -> dict:
+        """Full state sync after UserStream WS reconnects.
+
+        Unlike the periodic _reconcile_active_orders (limited to 3/cycle),
+        this runs a complete sweep of ALL tracked orders + detects orphans.
+
+        Returns summary dict with counts.
+        """
+        logger.warning("═══ RECONCILE ON RECONNECT — full state sync ═══")
+        t0 = time.time()
+
+        fills_recovered = 0
+        cancels_recovered = 0
+        orphans_registered = 0
+        errors = 0
+
+        # ── Step 1: Sync ALL tracked active orders with exchange ──
+        active_orders = [
+            o for o in self._tracker._by_client_id.values()
+            if not o.is_terminal and o.exchange_order_id
+        ]
+        logger.info("Reconcile: checking %d tracked active orders against exchange", len(active_orders))
+
+        for order in active_orders:
+            try:
+                exchange_data = await self._exchange.get_order(
+                    order.symbol,
+                    orderId=int(order.exchange_order_id),
+                )
+            except Exception as e:
+                err_str = str(e)
+                if "-2013" in err_str:
+                    logger.warning("Reconcile: order %s not found on exchange — marking expired", order.client_order_id)
+                    order.transition("expired")
+                    await self._redis_remove_open_order(order)
+                    cancels_recovered += 1
+                else:
+                    logger.error("Reconcile: query failed for %s: %s", order.client_order_id, e)
+                    errors += 1
+                continue
+
+            exchange_status = exchange_data.get("status", "")
+
+            if exchange_status == "FILLED" and order.state != "filled":
+                logger.warning(
+                    "RECONCILE: order %s FILLED on exchange (tracker=%s) — injecting fill",
+                    order.client_order_id, order.state,
+                )
+                synthetic = {
+                    "order_id": order.exchange_order_id,
+                    "client_order_id": order.client_order_id,
+                    "symbol": exchange_data.get("symbol", order.symbol),
+                    "side": exchange_data.get("side", order.side),
+                    "order_status": "FILLED",
+                    "last_filled_qty": str(exchange_data.get("executedQty", order.quantity)),
+                    "last_filled_price": str(exchange_data.get("avgPrice", "0")),
+                    "accumulated_filled_qty": str(exchange_data.get("executedQty", "0")),
+                    "avg_price": str(exchange_data.get("avgPrice", "0")),
+                    "orig_qty": str(exchange_data.get("origQty", order.quantity)),
+                }
+                await self.on_order_update(synthetic)
+                fills_recovered += 1
+
+            elif exchange_status in ("CANCELED", "EXPIRED", "REJECTED") and not order.is_terminal:
+                logger.warning(
+                    "RECONCILE: order %s %s on exchange (tracker=%s) — syncing",
+                    order.client_order_id, exchange_status, order.state,
+                )
+                synthetic = {
+                    "order_id": order.exchange_order_id,
+                    "client_order_id": order.client_order_id,
+                    "symbol": exchange_data.get("symbol", order.symbol),
+                    "side": exchange_data.get("side", order.side),
+                    "order_status": exchange_status,
+                }
+                await self.on_order_update(synthetic)
+                cancels_recovered += 1
+
+        # ── Step 2: Detect orphan PMS orders on exchange we lost track of ──
+        try:
+            exchange_orders = await self._exchange.get_open_orders()
+            tracked_eids = set(self._tracker._by_exchange_id.keys())
+
+            for eo in (exchange_orders or []):
+                coid = eo.get("clientOrderId", "")
+                eid = str(eo.get("orderId", ""))
+                if not coid.startswith("PMS"):
+                    continue
+                if eid in tracked_eids:
+                    continue  # Already tracked
+
+                # Orphan: on exchange but not in our tracker
+                logger.warning(
+                    "RECONCILE: orphan PMS order on exchange: %s (eid=%s, %s %s)",
+                    coid, eid, eo.get("symbol"), eo.get("side"),
+                )
+                # Try to resolve sub-account from client order ID
+                parts = coid[3:].split("_", 2)
+                sub_prefix = parts[0] if len(parts) >= 1 else ""
+                sub_account_id = self._resolve_sub_account(sub_prefix)
+                if not sub_account_id:
+                    logger.warning("Reconcile: cannot resolve sub-account for orphan %s", coid)
+                    continue
+
+                order = OrderState(
+                    client_order_id=coid,
+                    sub_account_id=sub_account_id,
+                    exchange_order_id=eid,
+                    symbol=eo.get("symbol", ""),
+                    side=eo.get("side", ""),
+                    order_type=eo.get("type", "LIMIT"),
+                    quantity=float(eo.get("origQty", 0)),
+                    price=float(eo.get("price", 0)),
+                    state="active",
+                    filled_qty=float(eo.get("executedQty", 0)),
+                    origin="RECOVERED",
+                    reduce_only=eo.get("reduceOnly", False),
+                )
+                self._tracker.register(order)
+                await self._redis_set_open_order(order)
+                orphans_registered += 1
+                logger.info("Reconcile: registered orphan order %s", coid)
+
+        except Exception as e:
+            logger.error("Reconcile: failed to fetch open orders: %s", e)
+            errors += 1
+
+        # ── Step 3: Position reconciliation (delegate to RiskEngine) ──
+        if self._risk:
+            try:
+                await self._risk.reconcile_positions(self._exchange)
+            except Exception as e:
+                logger.error("Reconcile: position reconciliation failed: %s", e)
+                errors += 1
+
+        elapsed_ms = (time.time() - t0) * 1000
+        summary = {
+            "fills_recovered": fills_recovered,
+            "cancels_recovered": cancels_recovered,
+            "orphans_registered": orphans_registered,
+            "errors": errors,
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+        logger.warning(
+            "═══ RECONCILE COMPLETE in %.1fms: fills=%d cancels=%d orphans=%d errors=%d ═══",
+            elapsed_ms, fills_recovered, cancels_recovered, orphans_registered, errors,
+        )
+        return summary
 
     def __repr__(self) -> str:
         return f"OrderManager(tracker={self._tracker!r})"

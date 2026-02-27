@@ -310,3 +310,96 @@ class TrailStopEngine:
     @property
     def active_count(self) -> int:
         return len(self._active)
+
+    # ── Resume from Redis ──
+
+    async def resume_from_redis(self, risk_engine: Any = None) -> int:
+        """Resume active trail stops from Redis on startup/reconnect.
+
+        Scans pms:trail_stop:* keys, validates position still exists,
+        reconstructs TrailStopState, re-subscribes to L1.
+
+        Args:
+            risk_engine: RiskEngine instance to check if position still exists
+
+        Returns count of resumed trail stops.
+        """
+        if not self._redis:
+            return 0
+
+        resumed = 0
+        try:
+            keys = await self._redis.keys("pms:trail_stop:*")
+        except Exception as e:
+            logger.error("Trail stop resume: failed to scan Redis keys: %s", e)
+            return 0
+
+        for key in keys:
+            try:
+                raw = await self._redis.get(key)
+                if not raw:
+                    continue
+                data = json.loads(raw)
+
+                ts_id = data.get("trailStopId", "")
+                if not ts_id:
+                    continue
+
+                # Skip if already active
+                if ts_id in self._active:
+                    continue
+
+                # Skip non-active
+                status = data.get("status", "")
+                if status not in ("ACTIVE",):
+                    await self._redis.delete(key)
+                    continue
+
+                # Validate position still exists
+                position_id = data.get("positionId")
+                sub_account_id = data.get("subAccountId", "")
+                if position_id and risk_engine:
+                    pos = risk_engine.position_book.get_position(sub_account_id, position_id)
+                    if not pos:
+                        logger.info("Trail stop resume: %s — position %s no longer open, cleaning up",
+                                   ts_id, position_id)
+                        await self._redis.delete(key)
+                        if sub_account_id:
+                            await self._redis.hdel(RedisKey.active_trail_stop(sub_account_id), ts_id)
+                        continue
+
+                # Reconstruct TrailStopState
+                state = TrailStopState(
+                    id=ts_id,
+                    sub_account_id=sub_account_id,
+                    symbol=data.get("symbol", ""),
+                    side=data.get("side", "LONG"),
+                    quantity=float(data.get("quantity", 0)),
+                    trail_pct=float(data.get("callbackPct", 1.0)),
+                    activation_price=data.get("activationPrice"),
+                    extreme_price=float(data.get("extremePrice", 0)),
+                    trigger_price=float(data.get("triggerPrice", 0)),
+                    activated=bool(data.get("activated", False)),
+                    status="ACTIVE",
+                    position_id=position_id,
+                    created_at=data.get("startedAt", 0) / 1000.0 if data.get("startedAt") else time.time(),
+                )
+
+                self._active[ts_id] = state
+
+                # Subscribe to L1 ticks
+                if self._md:
+                    handler = self._make_tick_handler(state)
+                    self._tick_handlers[ts_id] = handler
+                    self._md.subscribe(state.symbol, handler)
+
+                resumed += 1
+                logger.info("Trail stop resumed: %s %s %s trail=%.1f%% extreme=%.2f",
+                           ts_id, state.symbol, state.side, state.trail_pct, state.extreme_price)
+
+            except Exception as e:
+                logger.error("Trail stop resume: failed to restore %s: %s", key, e)
+
+        if resumed:
+            logger.warning("Trail stop engine: resumed %d active trail stop(s) from Redis", resumed)
+        return resumed

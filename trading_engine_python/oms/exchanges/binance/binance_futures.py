@@ -363,7 +363,7 @@ class BinanceFutures:
             orderId (int, optional): Order ID
             origClientOrderId (str, optional): Original client order ID
         """
-        return self.client.get_order(symbol=symbol, orderId=orderId, origClientOrderId=origClientOrderId)
+        return self.client.query_order(symbol=symbol, orderId=orderId, origClientOrderId=origClientOrderId)
     
     def get_open_orders(self, symbol=None):
         """Get open orders
@@ -371,10 +371,10 @@ class BinanceFutures:
         Args:
             symbol (str, optional): Trading pair symbol
         """
-        kwargs = {}
         if symbol:
-            kwargs["symbol"] = symbol
-        return self.client.get_open_orders(**kwargs)
+            return self.client.get_open_orders(symbol=symbol)
+        # UMFutures.get_open_orders requires symbol — use get_orders for all-symbols query
+        return self.client.get_orders()
     
     def get_all_orders(self, symbol, **kwargs):
         """Get all orders
@@ -547,7 +547,7 @@ class BinanceFutures:
         Args:
             symbol (str, optional): Trading pair symbol
         """
-        return self.client.get_position(symbol=symbol)
+        return self.client.get_position_risk(symbol=symbol)
     
     # ===== User Data Stream Methods =====
     

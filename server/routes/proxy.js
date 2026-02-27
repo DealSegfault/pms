@@ -432,24 +432,62 @@ router.get('/v1/exchangeInfo', async (req, res) => {
     }
 });
 
-// ── POST /fapi/v1/listenKey — User stream listen key ──
+// ── POST /fapi/v1/listenKey — Create user stream listen key ──
+// Returns a PMS listen key that maps to the user's sub-account.
+// Bot connects to ws://pms-host/ws and subscribes with this key.
 
 router.post('/v1/listenKey',
     botApiKeyMiddleware(),
+    resolveSubAccount,
     async (req, res) => {
-        // Return a PMS-specific listen key (the user's API key hash)
-        const listenKey = crypto.createHash('sha256')
-            .update(req.user.id)
-            .digest('hex').substring(0, 60);
-        res.json({ listenKey });
+        try {
+            const listenKey = crypto.randomBytes(30).toString('hex'); // 60 chars
+            const mapping = JSON.stringify({
+                userId: req.user.id,
+                subAccountId: req.subAccount.id,
+                createdAt: Date.now(),
+            });
+
+            // Store in Redis with 60-min TTL (matches Binance behavior)
+            const { getRedis } = await import('../redis.js');
+            const redis = getRedis();
+            if (redis) {
+                await redis.set(`pms:listen_key:${listenKey}`, mapping, 'EX', 3600);
+            }
+
+            res.json({ listenKey });
+        } catch (err) {
+            res.status(500).json({ code: -1, msg: err.message });
+        }
     },
 );
 
-router.put('/v1/listenKey', botApiKeyMiddleware(), (req, res) => {
+router.put('/v1/listenKey', botApiKeyMiddleware(), async (req, res) => {
+    // Keepalive — extend TTL by 60 minutes
+    try {
+        const { listenKey } = req.body;
+        if (listenKey) {
+            const { getRedis } = await import('../redis.js');
+            const redis = getRedis();
+            if (redis) {
+                await redis.expire(`pms:listen_key:${listenKey}`, 3600);
+            }
+        }
+    } catch { /* non-critical */ }
     res.json({});
 });
 
-router.delete('/v1/listenKey', botApiKeyMiddleware(), (req, res) => {
+router.delete('/v1/listenKey', botApiKeyMiddleware(), async (req, res) => {
+    try {
+        const { listenKey } = req.body;
+        if (listenKey) {
+            const { getRedis } = await import('../redis.js');
+            const redis = getRedis();
+            if (redis) {
+                await redis.del(`pms:listen_key:${listenKey}`);
+            }
+        }
+    } catch { /* non-critical */ }
     res.json({});
 });
 

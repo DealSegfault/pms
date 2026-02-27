@@ -300,6 +300,10 @@ export function setupAppEventListeners() {
         // Margin is updated by the separate margin_update WS event
         // Only refresh chart annotations for the filled order's price line removal
         loadChartAnnotations(true);
+
+        // Safety net: delayed positions reconciliation to catch desync
+        // (e.g., ghost positions from flip bugs, missed WS events)
+        scheduleTradingRefresh({ positions: true }, 2000);
     });
 
     mkHandler('order_cancelled', (e) => {

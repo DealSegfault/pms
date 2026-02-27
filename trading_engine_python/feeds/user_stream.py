@@ -60,6 +60,7 @@ class UserStreamService:
         api_secret: str,
         order_manager: Any,
         risk_engine: Any = None,
+        redis_client: Any = None,
         testnet: bool = False,
         proxy_http: Optional[str] = None,
         proxy_https: Optional[str] = None,
@@ -68,6 +69,7 @@ class UserStreamService:
         self._api_secret = api_secret
         self._order_manager = order_manager
         self._risk_engine = risk_engine
+        self._redis = redis_client
 
         # Binance endpoints
         if testnet:
@@ -94,6 +96,9 @@ class UserStreamService:
         # Binance server time drift (ms) — synced on first signed request
         self._time_drift: int = 0
         self._drift_synced: bool = False
+
+        # WS health flag — read by fill checker for adaptive polling rate
+        self._ws_connected: bool = False
 
     def set_risk_engine(self, risk_engine: Any) -> None:
         """Wire up risk engine after creation (Step 7)."""
@@ -155,9 +160,11 @@ class UserStreamService:
         try:
             async with websockets.connect(ws_url) as ws:
                 self._ws = ws
+                self._ws_connected = True
                 logger.info("User stream WebSocket connected")
                 await self._handle_messages(ws)
         finally:
+            self._ws_connected = False
             self._running = False
             if self._keepalive_task:
                 self._keepalive_task.cancel()
@@ -197,6 +204,9 @@ class UserStreamService:
             o.q = origQty, o.p = price, o.l = lastFilledQty
             o.L = lastFilledPrice, o.z = cumFilledQty, o.ap = avgPrice
         """
+        # Re-broadcast raw event for bot consumers (before normalization)
+        await self._publish_raw_event(message)
+
         raw = message.get("o", {})
 
         mapped = {
@@ -235,6 +245,9 @@ class UserStreamService:
         ACCOUNT_UPDATE → route to RiskEngine (Step 7).
         Contains balance changes and position updates from the exchange.
         """
+        # Re-broadcast raw event for bot consumers (before normalization)
+        await self._publish_raw_event(message)
+
         if self._risk_engine:
             try:
                 data = message.get("a", {})
@@ -262,11 +275,28 @@ class UserStreamService:
             except Exception as e:
                 logger.error("Error handling ACCOUNT_UPDATE: %s", e)
 
+    async def _publish_raw_event(self, raw_message: dict) -> None:
+        """Publish raw Binance user stream event to Redis for bot WS forwarding.
+
+        Bots connecting to the PMS WebSocket receive these events in native
+        Binance format — no normalization, no sub-account resolution.
+        This is purely a relay so bots don't need their own WS connection
+        (Binance allows only one per API key).
+        """
+        if not self._redis:
+            return
+        try:
+            await self._redis.publish("pms:events:user_stream", json.dumps(raw_message))
+        except Exception as e:
+            logger.error("Failed to publish raw user stream event: %s", e)
+
     async def _on_trade_lite(self, data: dict) -> None:
         """
         TRADE_LITE → fast fill notification. Route to OrderManager.
         TRADE_LITE arrives faster than ORDER_TRADE_UPDATE but has less data.
         """
+        # Re-broadcast raw event for bot consumers
+        await self._publish_raw_event(data)
         mapped = {
             "order_id": str(data.get("i", "")),
             "client_order_id": data.get("c", ""),
@@ -289,28 +319,40 @@ class UserStreamService:
 
         await self._order_manager.on_order_update(mapped)
 
-    # ── Init State (on startup) ──
+    # ── Reconnect State Sync ──
 
     async def _init_state(self) -> None:
+        """On (re)connect, run full state reconciliation.
+
+        First connect: recover open orders from exchange into OrderTracker.
+        Reconnect: full sweep — sync all tracked orders, detect orphans,
+        reconcile positions against exchange.
+
+        This is the safety net for fills missed during WS downtime.
         """
-        On startup, sync open orders from exchange into OrderTracker.
-        This handles the orphan recovery case (Python crashed mid-trade).
-        """
+        is_reconnect = hasattr(self, "_has_connected_before") and self._has_connected_before
+        self._has_connected_before = True
+
+        if is_reconnect:
+            logger.warning("UserStream reconnected — running full state reconciliation")
+        else:
+            logger.info("UserStream first connect — recovering open orders")
+
         try:
-            open_orders = await asyncio.to_thread(
-                self._send_request, "GET", "fapi/v1/openOrders", {}, True
-            )
-            pms_orders = [
-                o for o in open_orders
-                if str(o.get("clientOrderId", "")).startswith("PMS")
-            ]
-            logger.info(
-                "Init state: %d open orders (%d PMS)",
-                len(open_orders), len(pms_orders),
-            )
-            # TODO: Register PMS orders in OrderTracker for orphan recovery
+            # Both first connect and reconnect benefit from full reconciliation
+            summary = await self._order_manager.reconcile_on_reconnect()
+            logger.info("Reconnect reconciliation: %s", summary)
         except Exception as e:
-            logger.error("Failed to init state from exchange: %s", e)
+            logger.error("Reconnect reconciliation failed: %s", e)
+
+        # Also recover open orders from exchange (startup path)
+        if not is_reconnect:
+            try:
+                count = await self._order_manager.load_open_orders_from_exchange()
+                if count:
+                    logger.info("Recovered %d open orders from exchange on startup", count)
+            except Exception as e:
+                logger.error("Failed to load open orders on startup: %s", e)
 
     # ── Fill Price Cache ──
 

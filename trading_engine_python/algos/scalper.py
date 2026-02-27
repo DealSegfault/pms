@@ -29,7 +29,7 @@ import math
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from contracts.common import normalize_side, ts_ms, ts_s_to_ms, EventType, RedisKey
 from contracts.events import (
@@ -217,6 +217,7 @@ class ScalperEngine:
         self._active: Dict[str, ScalperState] = {}
         # Timer handles for slot retries: key = f"{scalperId}:{side}:{layerIdx}"
         self._slot_tasks: Dict[str, asyncio.Task] = {}
+        self._price_handlers: Dict[str, Callable] = {}  # scalper_id → L1 handler ref
 
     # ── Public API ──
 
@@ -233,9 +234,49 @@ class ScalperEngine:
         short_size_usd = max(0, float(params.get("shortSizeUsd", long_size_usd)))
         neutral_mode = bool(params.get("neutralMode", False))
 
-        # Get current price for qty conversion
+        # Subscribe to market data FIRST — this starts the depth stream for
+        # the symbol so L1 data becomes available. Without this, get_l1()
+        # returns None if no other component has subscribed yet.
+        if self._md:
+            self._md.subscribe(params["symbol"], self._make_price_handler(scalper_id))
+
+        # Pre-warm: if MarketData has no L1 yet, seed it from bookTicker REST
+        # (takes ~50ms vs ~3.5s for the full depth pipeline).
         l1 = self._md.get_l1(params["symbol"]) if self._md else None
-        price = l1["mid"] if l1 else 0
+        if not l1 and self._md:
+            try:
+                import aiohttp
+                binance_sym = params["symbol"].split(":")[0].replace("/", "").upper()
+                url = f"https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol={binance_sym}"
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            bid = float(data.get("bidPrice", 0))
+                            ask = float(data.get("askPrice", 0))
+                            if bid > 0 and ask > 0:
+                                mid = (bid + ask) / 2
+                                import time as _t
+                                self._md._last_l1[params["symbol"]] = {
+                                    "bid": bid, "ask": ask, "mid": mid, "ts": _t.time()
+                                }
+                                logger.info("Pre-warmed L1 for %s from bookTicker: bid=%.6f ask=%.6f", params["symbol"], bid, ask)
+            except Exception as e:
+                logger.debug("bookTicker pre-warm failed for %s: %s", params["symbol"], e)
+
+        # Retry getting L1 price — depth stream needs time to connect + seed.
+        # Try up to 10 times with 500ms waits (~5s total). The depth pipeline
+        # (WS connect + REST snapshot) typically takes 3-4s, so 2s was too short
+        # for any coin, and particularly for low-liquidity ones.
+        price = 0
+        for attempt in range(10):
+            l1 = self._md.get_l1(params["symbol"]) if self._md else None
+            if l1 and l1.get("mid", 0) > 0:
+                price = l1["mid"]
+                break
+            if attempt < 9:
+                logger.debug("Scalper %s: waiting for L1 price (attempt %d/10)", scalper_id, attempt + 1)
+            await asyncio.sleep(0.5)
 
         state = ScalperState(
             id=scalper_id,
@@ -266,8 +307,12 @@ class ScalperEngine:
         self._active[scalper_id] = state
 
         if not price:
-            logger.error("Scalper %s: cannot get price for %s", scalper_id, state.symbol)
+            logger.error("Scalper %s: cannot get price for %s after 5s — stopping (never proceed with dummy price)", scalper_id, state.symbol)
             state.status = "stopped"
+            # Unsubscribe since we're not going to use this handler
+            handler = self._price_handlers.pop(scalper_id, None)
+            if handler and self._md:
+                self._md.unsubscribe(state.symbol, handler)
             return scalper_id
 
         # ── Compute layer offsets and quantities ──
@@ -346,6 +391,12 @@ class ScalperEngine:
         # because cancel_chase → cancel_order triggers feed events
         # that cause the frontend to refetch pms:active_scalper.
         self._active.pop(scalper_id, None)
+
+        # Unsubscribe the scalper's own L1 price handler
+        handler = self._price_handlers.pop(scalper_id, None)
+        if handler and self._md:
+            self._md.unsubscribe(state.symbol, handler)
+
         if self._redis:
             try:
                 await self._redis.delete(RedisKey.scalper(scalper_id))
@@ -398,6 +449,15 @@ class ScalperEngine:
 
     def get_state(self, scalper_id: str) -> Optional[ScalperState]:
         return self._active.get(scalper_id)
+
+    def _make_price_handler(self, scalper_id: str):
+        """Create a bound L1 handler that updates last_known_price for a scalper."""
+        async def handler(symbol: str, bid: float, ask: float, mid: float):
+            state = self._active.get(scalper_id)
+            if state and state.status == "active" and mid > 0:
+                state.last_known_price = mid
+        self._price_handlers[scalper_id] = handler
+        return handler
 
     # ── Leg Management ──
 
@@ -851,6 +911,146 @@ class ScalperEngine:
     @property
     def active_count(self) -> int:
         return len(self._active)
+
+    # ── Resume from Redis ──
+
+    async def resume_from_redis(self) -> int:
+        """Resume active scalpers from Redis on startup/reconnect.
+
+        Scans pms:scalper:* keys, reconstructs ScalperState, re-subscribes
+        to market data, and re-creates child chases for all slots.
+
+        Returns count of resumed scalpers.
+        """
+        if not self._redis:
+            return 0
+
+        resumed = 0
+        try:
+            keys = await self._redis.keys("pms:scalper:*")
+        except Exception as e:
+            logger.error("Scalper resume: failed to scan Redis keys: %s", e)
+            return 0
+
+        for key in keys:
+            try:
+                raw = await self._redis.get(key)
+                if not raw:
+                    continue
+                data = json.loads(raw)
+
+                scalper_id = data.get("scalperId", "")
+                if not scalper_id:
+                    continue
+
+                # Skip if already active
+                if scalper_id in self._active:
+                    continue
+
+                # Skip non-active
+                status = data.get("status", "").lower()
+                if status not in ("active",):
+                    await self._redis.delete(key)
+                    continue
+
+                # Reconstruct ScalperState
+                start_side = data.get("startSide", "LONG")
+                child_count = int(data.get("childCount", 1))
+                long_offset = float(data.get("longOffsetPct", 0.3))
+                short_offset = float(data.get("shortOffsetPct", 0.3))
+                long_size_usd = float(data.get("longSizeUsd", 0))
+                short_size_usd = float(data.get("shortSizeUsd", 0))
+                symbol = data.get("symbol", "")
+                leverage = int(data.get("leverage", 1))
+
+                state = ScalperState(
+                    id=scalper_id,
+                    sub_account_id=data.get("subAccountId", ""),
+                    symbol=symbol,
+                    start_side=start_side,
+                    leverage=leverage,
+                    child_count=child_count,
+                    skew=int(data.get("skew", 0)),
+                    long_offset_pct=long_offset,
+                    short_offset_pct=short_offset,
+                    long_size_usd=long_size_usd,
+                    short_size_usd=short_size_usd,
+                    neutral_mode=bool(data.get("neutralMode", False)),
+                    min_fill_spread_pct=float(data.get("minFillSpreadPct", 0)),
+                    fill_decay_half_life_ms=float(data.get("fillDecayHalfLifeMs", 30000)),
+                    min_refill_delay_ms=float(data.get("minRefillDelayMs", 0)),
+                    allow_loss=data.get("allowLoss", True) not in (False, "false"),
+                    fill_count=int(data.get("totalFillCount", 0)),
+                    reduce_only_armed=bool(data.get("reduceOnlyArmed", False)),
+                    created_at=data.get("startedAt", 0) / 1000.0 if data.get("startedAt") else time.time(),
+                )
+
+                # Subscribe to market data
+                if self._md:
+                    self._md.subscribe(symbol, self._make_price_handler(scalper_id))
+
+                # Wait for L1 price seed
+                price = 0
+                for attempt in range(5):
+                    await asyncio.sleep(0.4)
+                    l1 = self._md.get_l1(symbol) if self._md else None
+                    if l1 and l1.get("mid", 0) > 0:
+                        price = l1["mid"]
+                        break
+
+                if not price:
+                    logger.error("Scalper resume %s: cannot get price for %s — skipping", scalper_id, symbol)
+                    handler = self._price_handlers.pop(scalper_id, None)
+                    if handler and self._md:
+                        self._md.unsubscribe(symbol, handler)
+                    continue
+
+                state.last_known_price = price
+                self._active[scalper_id] = state
+
+                # Re-create child chases for opening leg
+                opening_side = _to_exchange_side(start_side)
+                opening_offset = long_offset if start_side == "LONG" else short_offset
+                opening_size_usd = long_size_usd if start_side == "LONG" else short_size_usd
+                offsets = _generate_layer_offsets(opening_offset, child_count)
+                weights = _generate_skew_weights(child_count, state.skew)
+                qtys = [(opening_size_usd * w) / price for w in weights]
+
+                opening_slots = await self._start_leg(state, opening_side, offsets, qtys,
+                                                      reduce_only=False)
+                if opening_side == "BUY":
+                    state.long_slots = opening_slots
+                else:
+                    state.short_slots = opening_slots
+
+                # Neutral mode: start closing leg too
+                if state.neutral_mode:
+                    other_side = "SELL" if opening_side == "BUY" else "BUY"
+                    other_offset = short_offset if start_side == "LONG" else long_offset
+                    other_size_usd = short_size_usd if start_side == "LONG" else long_size_usd
+                    other_offsets = _generate_layer_offsets(other_offset, child_count)
+                    other_qtys = [(other_size_usd * w) / price for w in weights]
+                    other_slots = await self._start_leg(state, other_side, other_offsets, other_qtys,
+                                                        reduce_only=False)
+                    if other_side == "BUY":
+                        state.long_slots = other_slots
+                    else:
+                        state.short_slots = other_slots
+
+                # Schedule restart for any failed slots
+                for slot in state.long_slots + state.short_slots:
+                    if not slot.chase_id and slot.qty > 0:
+                        await self._schedule_restart(state, slot, delay=2.0)
+
+                resumed += 1
+                logger.info("Scalper resumed: %s %s %s (child_count=%d)", scalper_id, symbol, start_side, child_count)
+
+            except Exception as e:
+                logger.error("Scalper resume: failed to restore %s: %s", key, e)
+
+        if resumed:
+            logger.warning("Scalper engine: resumed %d active scalper(s) from Redis", resumed)
+        return resumed
 
 
 def _parse_opt_float(val) -> Optional[float]:

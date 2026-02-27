@@ -85,6 +85,12 @@ class ChaseEngine:
         self._redis = redis_client
         self._active: Dict[str, ChaseState] = {}
         self._fill_checker_task: Optional[asyncio.Task] = None
+        # WS health check — set via set_ws_health_checker() after UserStream is created
+        self._ws_healthy: Optional[Callable[[], bool]] = None
+
+    def set_ws_health_checker(self, checker: Callable[[], bool]) -> None:
+        """Set a callable that returns True when UserStream WS is connected."""
+        self._ws_healthy = checker
 
     # ── Background tasks ──
 
@@ -92,7 +98,7 @@ class ChaseEngine:
         """Start fill checker loop. Call after event loop is running."""
         if not self._fill_checker_task:
             self._fill_checker_task = asyncio.create_task(self._fill_checker_loop())
-            logger.info("Chase fill checker started (polling every 5s)")
+            logger.info("Chase fill checker started (adaptive: 1s when WS down, 5s when up)")
 
     async def stop(self) -> None:
         """Stop background tasks."""
@@ -105,26 +111,102 @@ class ChaseEngine:
             self._fill_checker_task = None
 
     async def _fill_checker_loop(self) -> None:
-        """Poll active chase orders for missed fills (JS startFillChecker pattern).
+        """Poll active chase orders for missed fills.
+
+        Adaptive rate:
+          - WS UP:   5s interval, only query orders stale > 15s (normal)
+          - WS DOWN: 1s interval, query ALL active orders (breaking period)
 
         UserStream is the primary fill detection, but it can miss fills during
-        the cancel→replace window. This background loop catches those.
+        the cancel→replace window or due to WS disconnections. This loop is
+        the safety net that catches those via REST.
         """
         while True:
             try:
-                await asyncio.sleep(5)
+                ws_up = self._ws_healthy() if self._ws_healthy else True
+                poll_interval = 5.0 if ws_up else 1.0
+                stale_threshold = 15.0 if ws_up else 0.0  # check ALL orders when WS is down
+
+                await asyncio.sleep(poll_interval)
+                now = time.time()
+
+                if not ws_up and self._active:
+                    logger.debug("Fill checker: WS DOWN — polling %d orders at 1req/s", len(self._active))
+
                 for state in list(self._active.values()):
                     if state.status != "ACTIVE" or not state.current_order_id:
                         continue
                     order = self._om.get_order(state.current_order_id)
-                    if order and order.state == "filled":
+                    if not order:
+                        continue
+
+                    # Fast path: order already marked filled in tracker
+                    if order.state == "filled":
                         logger.info("Chase %s: fill detected by checker (order %s)",
                                     state.id, state.current_order_id)
                         await self._on_fill(state, order)
+                        continue
+
+                    # Exchange query: check if order is stale enough
+                    if (order.state == "active"
+                            and order.exchange_order_id
+                            and (now - order.updated_at) > stale_threshold):
+                        try:
+                            exch_data = await self._om._exchange.get_order(
+                                order.symbol,
+                                orderId=int(order.exchange_order_id),
+                            )
+                            exch_status = exch_data.get("status", "")
+                            if exch_status == "FILLED":
+                                logger.warning(
+                                    "Chase %s: fill detected by exchange query (order %s was %s)%s",
+                                    state.id, state.current_order_id, exch_status,
+                                    " [WS DOWN]" if not ws_up else "",
+                                )
+                                # Inject synthetic fill via OrderManager so full chain fires
+                                synthetic = {
+                                    "order_id": order.exchange_order_id,
+                                    "client_order_id": order.client_order_id,
+                                    "symbol": exch_data.get("symbol", order.symbol),
+                                    "side": exch_data.get("side", order.side),
+                                    "order_status": "FILLED",
+                                    "last_filled_qty": str(exch_data.get("executedQty", order.quantity)),
+                                    "last_filled_price": str(exch_data.get("avgPrice", "0")),
+                                    "accumulated_filled_qty": str(exch_data.get("executedQty", "0")),
+                                    "avg_price": str(exch_data.get("avgPrice", "0")),
+                                    "orig_qty": str(exch_data.get("origQty", order.quantity)),
+                                }
+                                await self._om.on_order_update(synthetic)
+                            elif exch_status in ("CANCELED", "EXPIRED"):
+                                logger.warning(
+                                    "Chase %s: order %s %s on exchange — syncing%s",
+                                    state.id, state.current_order_id, exch_status,
+                                    " [WS DOWN]" if not ws_up else "",
+                                )
+                                synthetic = {
+                                    "order_id": order.exchange_order_id,
+                                    "client_order_id": order.client_order_id,
+                                    "symbol": exch_data.get("symbol", order.symbol),
+                                    "side": exch_data.get("side", order.side),
+                                    "order_status": exch_status,
+                                }
+                                await self._om.on_order_update(synthetic)
+                            else:
+                                # Still alive — touch to avoid rechecking next cycle
+                                order.updated_at = now
+                        except Exception as e:
+                            logger.debug("Chase fill checker exchange query failed for %s: %s",
+                                        state.current_order_id, e)
+
+                        # Rate limit: 1 req/s during breaking period
+                        if not ws_up:
+                            await asyncio.sleep(1.0)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Fill checker error: %s", e)
+                await asyncio.sleep(5)
 
 
     async def start_chase(self, params: dict) -> str:
@@ -706,3 +788,111 @@ class ChaseEngine:
     @property
     def active_count(self) -> int:
         return len(self._active)
+
+    # ── Resume from Redis ──
+
+    async def resume_from_redis(self) -> int:
+        """Resume active chases from Redis on startup/reconnect.
+
+        Scans pms:chase:* keys, reconstructs ChaseState, re-subscribes to
+        market data, and re-places limit orders.
+
+        Skips child chases (parent_scalper_id set) — scalper engine handles those.
+
+        Returns count of resumed chases.
+        """
+        if not self._redis:
+            return 0
+
+        resumed = 0
+        try:
+            keys = await self._redis.keys("pms:chase:*")
+        except Exception as e:
+            logger.error("Chase resume: failed to scan Redis keys: %s", e)
+            return 0
+
+        for key in keys:
+            try:
+                raw = await self._redis.get(key)
+                if not raw:
+                    continue
+                data = json.loads(raw)
+
+                chase_id = data.get("chaseId", "")
+                if not chase_id:
+                    continue
+
+                # Skip if already active
+                if chase_id in self._active:
+                    continue
+
+                # Skip child chases — scalper engine will re-create them
+                if data.get("parentScalperId"):
+                    logger.debug("Chase resume: skipping child chase %s (scalper-owned)", chase_id)
+                    continue
+
+                # Skip non-active
+                status = data.get("status", "")
+                if status not in ("ACTIVE",):
+                    # Clean up stale Redis entry
+                    await self._redis.delete(key)
+                    continue
+
+                # Reconstruct ChaseState
+                state = ChaseState(
+                    id=chase_id,
+                    sub_account_id=data.get("subAccountId", ""),
+                    symbol=data.get("symbol", ""),
+                    side=data.get("side", ""),
+                    quantity=float(data.get("quantity", 0)),
+                    leverage=int(data.get("leverage", 1)),
+                    stalk_mode=data.get("stalkMode", "maintain"),
+                    stalk_offset_pct=float(data.get("stalkOffsetPct", 0)),
+                    max_distance_pct=float(data.get("maxDistancePct", 2.0)),
+                    status="ACTIVE",
+                    reprice_count=int(data.get("repriceCount", 0)),
+                    reduce_only=bool(data.get("reduceOnly", False)),
+                    created_at=data.get("startedAt", 0) / 1000.0 if data.get("startedAt") else time.time(),
+                )
+
+                # Subscribe to L1 ticks
+                if self._md:
+                    self._md.subscribe(state.symbol, self._make_tick_handler(state))
+
+                # Brief yield for L1 seed
+                await asyncio.sleep(0.1)
+
+                # Try to place initial order
+                l1 = self._md.get_l1(state.symbol) if self._md else None
+                if l1:
+                    state.initial_price = l1["mid"]
+
+                price = self._compute_chase_price(state, l1)
+                if price:
+                    order = await self._om.place_limit_order(
+                        sub_account_id=state.sub_account_id,
+                        symbol=state.symbol,
+                        side=state.side,
+                        quantity=state.quantity,
+                        price=price,
+                        leverage=state.leverage,
+                        origin="CHASE",
+                        parent_id=chase_id,
+                        on_fill=lambda o, _s=state: self._on_fill(_s, o),
+                        on_cancel=lambda o, r, _s=state: self._on_cancel(_s, o, r),
+                        reduce_only=state.reduce_only,
+                    )
+                    if order.state != "failed":
+                        state.current_order_id = order.client_order_id
+                        state.current_order_price = price
+
+                self._active[chase_id] = state
+                resumed += 1
+                logger.info("Chase resumed: %s %s %s qty=%.6f", chase_id, state.symbol, state.side, state.quantity)
+
+            except Exception as e:
+                logger.error("Chase resume: failed to restore %s: %s", key, e)
+
+        if resumed:
+            logger.warning("Chase engine: resumed %d active chase(s) from Redis", resumed)
+        return resumed

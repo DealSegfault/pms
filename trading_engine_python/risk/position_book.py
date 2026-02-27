@@ -80,9 +80,32 @@ class PositionBook:
         entry = self._entries.get(sub_account_id)
         if not entry:
             return None
+
+        # Primary: exact match
         for pos in entry["positions"].values():
             if pos.symbol == symbol and pos.side == side:
                 return pos
+
+        # Fallback: match by base symbol (handles ccxt vs Binance format mismatch)
+        # e.g., 'BTC/USDT:USDT' → 'BTC', 'BTCUSDT' → 'BTC'
+        def _extract_base(s: str) -> str:
+            if '/' in s:
+                return s.split('/')[0]
+            # Binance format: remove USDT/BUSD suffix
+            for suffix in ('USDT', 'BUSD', 'USDC', 'BTC', 'ETH', 'BNB'):
+                if s.endswith(suffix) and len(s) > len(suffix):
+                    return s[:-len(suffix)]
+            return s
+
+        target_base = _extract_base(symbol).upper()
+        for pos in entry["positions"].values():
+            if _extract_base(pos.symbol).upper() == target_base and pos.side == side:
+                logger.warning(
+                    "find_position: symbol format mismatch — searched '%s' matched '%s' (base='%s')",
+                    symbol, pos.symbol, target_base,
+                )
+                return pos
+
         return None
 
     @property

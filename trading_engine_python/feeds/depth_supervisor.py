@@ -205,6 +205,17 @@ class DepthSupervisor:
                                 update_buffer.pop(0)
                             continue
 
+                        # Replay buffer FIRST, before processing any new message.
+                        # This matches binance.py's fetch_orderbook_snapshot() which
+                        # replays the entire buffer before returning to the WS loop.
+                        # Without this, the new msg advances last_update_id and all
+                        # buffered msgs fail sequence validation → orderbook corruption
+                        # for thin-book coins (LYN, etc.).
+                        if update_buffer:
+                            for buffered in update_buffer:
+                                self._process_depth_update(sub, buffered)
+                            update_buffer.clear()
+
                         self._process_depth_update(sub, data)
 
                         # Check reconnect flag set by _process_depth_update (#11)
@@ -215,12 +226,6 @@ class DepthSupervisor:
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         logger.warning("DepthSupervisor [%s]: WS %s", sub.symbol, msg.type)
                         break
-
-                    # After snapshot, replay buffer once
-                    if sub.snapshot_received and update_buffer:
-                        for buffered in update_buffer:
-                            self._process_depth_update(sub, buffered)
-                        update_buffer.clear()
 
             except asyncio.CancelledError:
                 logger.info("DepthSupervisor [%s]: cancelled", sub.symbol)
@@ -317,15 +322,18 @@ class DepthSupervisor:
         # Validate orderbook
         best_bid, _ = sub.orderbook.get_best_bid()
         best_ask, _ = sub.orderbook.get_best_ask()
-        if best_bid and best_ask and best_bid >= best_ask:
+        crossed = best_bid and best_ask and best_bid >= best_ask
+        if crossed:
             if (best_bid - best_ask) / best_ask > Decimal("0.005"):
                 logger.error("DepthSupervisor [%s]: severely crossed book, reconnecting", sub.symbol)
                 sub._needs_reconnect = True  # Signal reconnect without killing supervisor (#11)
                 return
-            return  # Skip mildly crossed update
+            # Mildly crossed — common on low-liquidity coins (LYN, etc.)
+            # Still dispatch L1 so algos get a price instead of timing out.
+            # Use ask as effective price (conservative for BUY side).
 
         # Store in Redis (sync, non-blocking for the event loop)
-        if sub.redis_store:
+        if sub.redis_store and not crossed:
             try:
                 sub.redis_store.store_orderbook("binance", sub.symbol.upper(), {
                     "bids": list(sub.orderbook.bids.items()),
@@ -334,7 +342,7 @@ class DepthSupervisor:
             except Exception as e:
                 logger.debug("Redis store failed for %s: %s", sub.symbol, e)
 
-        # Extract and dispatch L1
+        # Extract and dispatch L1 (even on mildly crossed books)
         self._extract_and_dispatch_l1(sub)
 
     def _extract_and_dispatch_l1(self, sub: _DepthSubscription) -> None:
