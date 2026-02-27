@@ -55,10 +55,11 @@ async function resolveSubAccount(req, res, next) {
 
 // ── Helper: generate PMS-tagged clientOrderId ──
 
-function tagClientOrderId(subAccountId, originalId) {
+function tagClientOrderId(subAccountId, orderType, originalId) {
     const prefix = subAccountId.substring(0, 8);
-    const id = originalId || crypto.randomBytes(8).toString('hex');
-    return `PMS${prefix}_${id}`;
+    const typePrefix = { MARKET: 'MKT', LIMIT: 'LMT', STOP_MARKET: 'STP', TAKE_PROFIT_MARKET: 'TPM' }[orderType] || 'ORD';
+    const uid = originalId || crypto.randomBytes(6).toString('hex');
+    return `PMS${prefix}_${typePrefix}_${uid}`;
 }
 
 function parseClientOrderId(clientOrderId) {
@@ -105,7 +106,7 @@ router.post('/v1/order',
             const qty = parseFloat(quantity);
             const prc = price ? parseFloat(price) : null;
             const ccxtSymbol = rawToCcxt(symbol);
-            const taggedClientId = tagClientOrderId(req.subAccount.id, newClientOrderId);
+            const taggedClientId = tagClientOrderId(req.subAccount.id, type?.toUpperCase(), newClientOrderId);
 
             // If not reduceOnly, run risk checks
             if (!reduceOnly) {

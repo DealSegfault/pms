@@ -18,3 +18,5 @@ sdk
 pg_local
 logic-money/
 ~/Work/logic-money
+prisma/pms.db-shm
+prisma/pms.db-wal

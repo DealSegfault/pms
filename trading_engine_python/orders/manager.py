@@ -63,6 +63,7 @@ class OrderManager:
         self._db = db  # Database for pending_orders persistence
         self._tracker = OrderTracker()
         self._seq: int = 0  # Monotonic event sequence number
+        self._ignored_prefixes: set = set()  # sub-account prefixes we can't resolve (other server)
 
     def set_risk_engine(self, risk_engine: Any) -> None:
         """Wire up the risk engine after it's created (Step 7)."""
@@ -864,11 +865,17 @@ class OrderManager:
             return None
 
         sub_prefix = parts[0]
+
+        # Fast path: skip prefixes we already know don't exist on this server
+        if sub_prefix in self._ignored_prefixes:
+            return None
+
         sub_account_id = await self._resolve_sub_account_async(sub_prefix)
         if not sub_account_id:
-            logger.warning(
-                "Bot order %s: could not resolve sub-account prefix '%s'",
-                client_order_id, sub_prefix,
+            self._ignored_prefixes.add(sub_prefix)
+            logger.info(
+                "Ignoring orders for unknown sub-account prefix '%s' (different server?)",
+                sub_prefix,
             )
             return None
 
@@ -1230,7 +1237,12 @@ class OrderManager:
                 sub_prefix = parts[0] if len(parts) >= 1 else ""
                 sub_account_id = self._resolve_sub_account(sub_prefix)
                 if not sub_account_id:
-                    logger.warning("Reconcile: cannot resolve sub-account for orphan %s", coid)
+                    if sub_prefix not in self._ignored_prefixes:
+                        self._ignored_prefixes.add(sub_prefix)
+                        logger.info(
+                            "Ignoring orphan orders for unknown sub-account prefix '%s' (different server?)",
+                            sub_prefix,
+                        )
                     continue
 
                 order = OrderState(
