@@ -32,11 +32,11 @@ if ! command -v node &>/dev/null; then
 fi
 
 # ── 2. Start Docker containers ─────────────────────────
-info "Starting Docker containers (PostgreSQL + Redis)..."
-docker compose up -d
+info "Starting PostgreSQL container..."
+docker compose up -d --force-recreate
 
 # ── 3. Wait for PostgreSQL to be ready ──────────────────
-info "Waiting for PostgreSQL to be ready..."
+info "Waiting for PostgreSQL to be ready (container-internal)..."
 MAX_WAIT=30
 WAITED=0
 until docker compose exec -T postgres pg_isready -U postgres &>/dev/null; do
@@ -47,20 +47,32 @@ until docker compose exec -T postgres pg_isready -U postgres &>/dev/null; do
         exit 1
     fi
 done
-info "PostgreSQL is ready (waited ${WAITED}s)"
+info "PostgreSQL container ready (waited ${WAITED}s)"
 
-# ── 4. Wait for Redis to be ready ──────────────────────
-info "Waiting for Redis to be ready..."
+# Verify host-side port mapping (localhost:55432) is reachable
+info "Verifying PostgreSQL is reachable on localhost:55432..."
 WAITED=0
-until docker compose exec -T redis redis-cli ping &>/dev/null; do
+until docker compose exec -T postgres psql -U postgres -h localhost -c "SELECT 1" &>/dev/null && \
+      (echo >/dev/tcp/localhost/55432) 2>/dev/null; do
     sleep 1
     WAITED=$((WAITED + 1))
     if [ "$WAITED" -ge "$MAX_WAIT" ]; then
-        error "Redis did not become ready within ${MAX_WAIT}s"
+        # Fallback: try nc or pg_isready on host if /dev/tcp not available
+        warn "Could not verify via /dev/tcp, trying direct connection..."
+        if command -v pg_isready &>/dev/null; then
+            pg_isready -h localhost -p 55432 -U postgres &>/dev/null && break
+        fi
+        if command -v nc &>/dev/null; then
+            nc -z localhost 55432 &>/dev/null && break
+        fi
+        error "PostgreSQL port 55432 not reachable from host after ${MAX_WAIT}s"
+        error "Check: docker compose ps  and  docker compose logs postgres"
         exit 1
     fi
 done
-info "Redis is ready"
+info "PostgreSQL host port verified (localhost:55432)"
+
+
 
 # ── 5. Install npm dependencies ────────────────────────
 if [ ! -d "node_modules" ]; then
@@ -97,7 +109,6 @@ info "════════════════════════�
 info "  ✅ PMS setup complete!"
 info ""
 info "  PostgreSQL: localhost:55432  (user: postgres)"
-info "  Redis:      localhost:6379"
 info ""
 info "  Start the server:  npm run dev"
 info "════════════════════════════════════════════════════"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────
-# SQLite → PostgreSQL data migration via pgloader
+# SQLite → PostgreSQL data migration via pgloader (Docker)
 # Idempotent: skips if .sqlite_migrated sentinel exists.
 # ─────────────────────────────────────────────────────────
 set -euo pipefail
@@ -21,7 +21,7 @@ error() { echo -e "${RED}[migrate]${NC} $*"; }
 
 SQLITE_DB="$PROJECT_DIR/prisma/pms.db"
 SENTINEL="$PROJECT_DIR/.sqlite_migrated"
-PG_URL="postgresql://postgres:postgres@localhost:55432/postgres"
+PG_URL="postgresql://postgres:postgres@host.docker.internal:55432/postgres"
 
 # ── Guard checks ────────────────────────────────────────
 if [ -f "$SENTINEL" ]; then
@@ -34,28 +34,29 @@ if [ ! -f "$SQLITE_DB" ]; then
     exit 0
 fi
 
-# ── Install pgloader if missing ─────────────────────────
-if ! command -v pgloader &>/dev/null; then
-    info "pgloader not found, installing..."
-    if command -v apt-get &>/dev/null; then
-        sudo apt-get update -qq && sudo apt-get install -y -qq pgloader
-    elif command -v brew &>/dev/null; then
-        brew install pgloader
-    else
-        error "Cannot install pgloader automatically. Install it manually and re-run."
-        exit 1
-    fi
+# ── Detect host gateway for Docker ──────────────────────
+# On Linux, host.docker.internal may not work — use host network mode instead
+DOCKER_EXTRA_ARGS=""
+PG_HOST="host.docker.internal"
+
+if [ "$(uname)" = "Linux" ]; then
+    DOCKER_EXTRA_ARGS="--network host"
+    PG_HOST="localhost"
 fi
 
-info "pgloader version: $(pgloader --version 2>&1 | head -1)"
+PG_URL="postgresql://postgres:postgres@${PG_HOST}:55432/postgres"
+
+info "Using pgloader via Docker (dimitri/pgloader)"
+info "SQLite: $SQLITE_DB"
+info "Target: $PG_URL"
 
 # ── Create pgloader command file ────────────────────────
 PGLOADER_CMD=$(mktemp /tmp/pms-pgloader-XXXXXX.load)
 
 cat > "$PGLOADER_CMD" <<EOF
 LOAD DATABASE
-    FROM sqlite://$SQLITE_DB
-    INTO postgresql://postgres:postgres@localhost:55432/postgres
+    FROM sqlite:///data/pms.db
+    INTO ${PG_URL}
 
 WITH include no drop,
      create no tables,
@@ -72,7 +73,6 @@ CAST type integer to integer drop typemod,
      type real to double precision,
      type text to text
 
--- Map all tables (Prisma uses @@map names)
 INCLUDING ONLY TABLE NAMES MATCHING
     'users',
     'sub_accounts',
@@ -108,22 +108,29 @@ AFTER LOAD DO
 ;
 EOF
 
+# ── Run pgloader via Docker ─────────────────────────────
 info "Running pgloader..."
-pgloader "$PGLOADER_CMD" 2>&1 | tee /tmp/pms-pgloader.log
+docker run --rm \
+    $DOCKER_EXTRA_ARGS \
+    -v "$PROJECT_DIR/prisma:/data:ro" \
+    -v "$PGLOADER_CMD:/tmp/migrate.load:ro" \
+    dimitri/pgloader:latest \
+    pgloader /tmp/migrate.load 2>&1 | tee /tmp/pms-pgloader.log
 
-# Check exit status
-if [ "${PIPESTATUS[0]}" -eq 0 ]; then
+RESULT=${PIPESTATUS[0]}
+
+if [ "$RESULT" -eq 0 ]; then
     info "pgloader completed successfully"
-    
+
     # Verify row counts
     info "Verifying migrated data..."
     TABLES=("users" "sub_accounts" "risk_rules" "virtual_positions" "trade_executions" "balance_logs" "pending_orders" "bot_configs" "webauthn_credentials")
-    
+
     for TABLE in "${TABLES[@]}"; do
         COUNT=$(docker compose exec -T postgres psql -U postgres -t -c "SELECT COUNT(*) FROM \"$TABLE\";" 2>/dev/null | tr -d ' ' || echo "?")
         info "  $TABLE: $COUNT rows"
     done
-    
+
     # Mark as done
     touch "$SENTINEL"
     info "Migration complete! Sentinel file created at $SENTINEL"
