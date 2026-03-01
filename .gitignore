@@ -16,6 +16,9 @@ notes
 sdk
 .wip
 pg_local
+pg_data
+redis_data
+.sqlite_migrated
 logic-money/
 ~/Work/logic-money
 prisma/pms.db-shm

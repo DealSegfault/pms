@@ -425,12 +425,17 @@ class ScalperEngine:
             return False
         state.status = "stopped"
 
-        # Clear all pending retry tasks
+        # Clear all pending retry tasks and await their termination
+        # to prevent in-flight restarts from spawning orphan chases
         keys_to_cancel = [k for k in self._slot_tasks if k.startswith(f"{scalper_id}:")]
+        tasks_to_await = []
         for key in keys_to_cancel:
             task = self._slot_tasks.pop(key, None)
             if task and not task.done():
                 task.cancel()
+                tasks_to_await.append(task)
+        if tasks_to_await:
+            await asyncio.gather(*tasks_to_await, return_exceptions=True)
 
         # Clean up Redis state BEFORE cancelling child chases,
         # because cancel_chase → cancel_order triggers feed events
@@ -604,6 +609,8 @@ class ScalperEngine:
 
     async def _place_chase_for_slot(self, state: ScalperState, slot: ScalperSlot) -> Optional[str]:
         """Place a chase order for a single slot. Returns chase ID or None."""
+        if state.status != "active":
+            return None
         try:
             chase_params = {
                 "subAccountId": state.sub_account_id,
@@ -694,6 +701,24 @@ class ScalperEngine:
 
         if reason == "cancelled":
             return  # Cancelled by us (cancel_scalper) — don't restart
+
+        # For reduce-only slots with terminal rejection, check if position still exists
+        # Prevents infinite 30s retry loop when position is already gone/dust
+        if slot.reduce_only and is_terminal:
+            try:
+                pos_side = "LONG" if slot.side == "SELL" else "SHORT"
+                actual_pos = self._om._risk.position_book.find_position(
+                    state.sub_account_id, state.symbol, pos_side
+                )
+                if not actual_pos or actual_pos.quantity <= 0:
+                    logger.info("Scalper %s: %s reduce-only slot disabled — no position left",
+                                state.id, slot.side)
+                    slot.paused = True
+                    slot.pause_reason = "no_position"
+                    await self._broadcast_progress(state)
+                    return
+            except Exception as e:
+                logger.debug("Scalper %s: position check failed: %s", state.id, e)
 
         delay = 30.0 if is_terminal else 2.0
         logger.info("Scalper %s: %s layer %d auto-cancelled (%s), restarting in %.0fs",
@@ -809,6 +834,25 @@ class ScalperEngine:
             # Final status check
             if state.status != "active":
                 return
+
+            # Clamp reduce-only qty to actual exchange position
+            if slot.reduce_only:
+                try:
+                    pos_side = "LONG" if slot.side == "SELL" else "SHORT"
+                    actual_pos = self._om._risk.position_book.find_position(
+                        state.sub_account_id, state.symbol, pos_side
+                    )
+                    if not actual_pos or actual_pos.quantity <= 0:
+                        slot.paused = True
+                        slot.pause_reason = "no_position"
+                        await self._broadcast_progress(state)
+                        return
+                    if slot.qty > actual_pos.quantity:
+                        logger.info("Scalper %s: clamping %s reduce-only qty %.6f → %.6f (actual position)",
+                                    state.id, slot.side, slot.qty, actual_pos.quantity)
+                        slot.qty = actual_pos.quantity
+                except Exception as e:
+                    logger.debug("Scalper %s: position clamp check failed: %s", state.id, e)
 
             # Place new chase
             chase_id = await self._place_chase_for_slot(state, slot)

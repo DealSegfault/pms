@@ -402,14 +402,11 @@ class ChaseEngine:
         await self._cleanup(state)
         await self._publish_event("chase_cancelled", state)
 
-        # Proactively remove the underlying limit order from Redis open orders
-        # so it disappears from the UI immediately, regardless of exchange timing.
+        # Best-effort cancel on exchange (feed will confirm)
+        # DON'T remove from Redis open_orders here — let the feed's
+        # CANCELED event do it via on_order_update → _redis_remove_open_order.
+        # This prevents ghost orders when cancel REST fails.
         if state.current_order_id:
-            order = self._om._tracker.lookup(client_order_id=state.current_order_id)
-            if order:
-                await self._om._redis_remove_open_order(order)
-
-            # Best-effort cancel on exchange (feed will confirm)
             try:
                 await self._om.cancel_order(state.current_order_id)
             except Exception as e:
@@ -698,11 +695,9 @@ class ChaseEngine:
             await self._redis.delete(RedisKey.chase(state.id))
             await self._redis.hdel(RedisKey.active_chase(state.sub_account_id), state.id)
 
-        # Remove underlying limit order from Redis open orders (prevents stale row)
-        if state.current_order_id:
-            order = self._om.get_order(state.current_order_id)
-            if order:
-                await self._om._redis_remove_open_order(order)
+        # NOTE: Don't remove from Redis open_orders here — let the feed's
+        # CANCELED/FILLED event do it via on_order_update → _redis_remove_open_order.
+        # Proactive removal caused ghost orders when exchange cancel failed silently.
 
     async def _save_state(self, state: ChaseState) -> None:
         """Persist state to Redis using ChaseRedisState DTO."""
