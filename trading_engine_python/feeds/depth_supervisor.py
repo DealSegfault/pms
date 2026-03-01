@@ -139,12 +139,15 @@ class DepthSupervisor:
         """Create OrderBookRedisStore without flushdb()."""
         try:
             import redis as sync_redis
-            from config import REDIS_HOST, REDIS_PORT, REDIS_DB
             from exchanges.reddis_store import OrderBookRedisStore
+
+            redis_host = os.getenv("REDIS_HOST", "127.0.0.1")
+            redis_port = int(os.getenv("REDIS_PORT", "6379"))
+            redis_db = int(os.getenv("REDIS_DB", "0"))
 
             store = object.__new__(OrderBookRedisStore)
             store.redis_client = sync_redis.StrictRedis(
-                host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB
+                host=redis_host, port=redis_port, db=redis_db
             )
             return store
         except Exception as e:

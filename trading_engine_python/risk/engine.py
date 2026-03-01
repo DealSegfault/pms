@@ -13,6 +13,7 @@ This is the beating heart of the risk system.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import json
 import logging
 import time
@@ -31,6 +32,25 @@ from .validator import TradeValidator
 from .liquidation import LiquidationEngine
 
 logger = logging.getLogger(__name__)
+
+
+def _db_timestamp_to_seconds(value: Any) -> Optional[float]:
+    """Normalize SQLite/PostgreSQL timestamp values to epoch seconds."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, (int, float)):
+        return float(value) / 1000.0 if value > 10_000_000_000 else float(value)
+    if isinstance(value, str):
+        if value.isdigit():
+            numeric = float(value)
+            return numeric / 1000.0 if numeric > 10_000_000_000 else numeric
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
 
 
 class RiskEngine:
@@ -142,7 +162,7 @@ class RiskEngine:
                         "leverage": int(p["leverage"]),
                         "margin": p["margin"],
                         "liquidationPrice": p["liquidation_price"],
-                        "openedAt": p["opened_at"] / 1000.0 if p.get("opened_at") else None,
+                        "openedAt": _db_timestamp_to_seconds(p.get("opened_at")),
                     }
                     for p in positions
                 ],
