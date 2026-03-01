@@ -97,6 +97,8 @@ class ScalperState:
     created_at: float = field(default_factory=time.time)
     reduce_only_armed: bool = False
     last_known_price: float = 0.0
+    pin_long_to_entry: bool = False
+    pin_short_to_entry: bool = False
     # Per-side fill tracking for spread/burst guards
     _last_fill_price: Dict[str, float] = field(default_factory=dict)
     _last_fill_time: Dict[str, float] = field(default_factory=dict)
@@ -180,15 +182,56 @@ def _fill_refill_delay_s(state: ScalperState, leg_side: str) -> float:
     return delay_ms / 1000.0
 
 
-def _is_price_allowed(state: ScalperState, leg_side: str) -> bool:
-    """Check if current price is within bounds for this leg side."""
+def _is_price_allowed(state: ScalperState, leg_side: str,
+                      get_entry_fn=None) -> bool:
+    """Check if current price is within bounds for this leg side.
+
+    When pin_long_to_entry is True, the LONG leg's max price is clamped to
+    the current long/short position entry price (whichever is applicable).
+    When pin_short_to_entry is True, the SHORT leg's min price is clamped to
+    the current long/short position entry price.
+
+    This matches the archived JS isPriceAllowed() logic.
+    """
     price = state.last_known_price
     if not price:
         return True
 
-    if leg_side == "BUY" and state.long_max_price and price > state.long_max_price:
+    effective_long_max = state.long_max_price
+    effective_short_min = state.short_min_price
+
+    # Look up position entries if we have the getter
+    long_entry = None
+    short_entry = None
+    if get_entry_fn and (state.pin_long_to_entry or state.pin_short_to_entry
+                         or not state.allow_loss):
+        long_entry = get_entry_fn(state, "LONG")
+        short_entry = get_entry_fn(state, "SHORT")
+
+    # Pin LONG bounds — restrict buying above the position entry
+    if state.pin_long_to_entry:
+        if short_entry and short_entry > 0:
+            effective_long_max = min(effective_long_max, short_entry) if effective_long_max else short_entry
+        if long_entry and long_entry > 0:
+            effective_long_max = min(effective_long_max, long_entry) if effective_long_max else long_entry
+
+    # Pin SHORT bounds — restrict selling below the position entry
+    if state.pin_short_to_entry:
+        if long_entry and long_entry > 0:
+            effective_short_min = max(effective_short_min, long_entry) if effective_short_min else long_entry
+        if short_entry and short_entry > 0:
+            effective_short_min = max(effective_short_min, short_entry) if effective_short_min else short_entry
+
+    # Legacy fallback: allowLoss=false
+    if not state.allow_loss:
+        if leg_side == "BUY" and short_entry and short_entry > 0:
+            effective_long_max = min(effective_long_max, short_entry) if effective_long_max else short_entry
+        if leg_side == "SELL" and long_entry and long_entry > 0:
+            effective_short_min = max(effective_short_min, long_entry) if effective_short_min else long_entry
+
+    if leg_side == "BUY" and effective_long_max and price > effective_long_max:
         return False
-    if leg_side == "SELL" and state.short_min_price and price < state.short_min_price:
+    if leg_side == "SELL" and effective_short_min and price < effective_short_min:
         return False
     return True
 
@@ -302,6 +345,8 @@ class ScalperEngine:
             pnl_feedback_mode=params.get("pnlFeedbackMode", "off"),
             last_known_price=price,
             reduce_only_armed=neutral_mode,
+            pin_long_to_entry=bool(params.get("pinLongToEntry", False)),
+            pin_short_to_entry=bool(params.get("pinShortToEntry", False)),
         )
 
         self._active[scalper_id] = state
@@ -458,6 +503,25 @@ class ScalperEngine:
                 state.last_known_price = mid
         self._price_handlers[scalper_id] = handler
         return handler
+
+    def _get_position_entry(self, state: ScalperState, side: str) -> Optional[float]:
+        """Get the position entry price for a given side from the risk engine.
+
+        Used by _is_price_allowed for pin-to-entry clamping.
+        Returns entry_price or None.
+        """
+        try:
+            book = getattr(self._om, '_risk', None)
+            if book:
+                book = getattr(book, 'position_book', None)
+            if not book:
+                return None
+            pos = book.find_position(state.sub_account_id, state.symbol, side)
+            if pos and pos.entry_price and pos.entry_price > 0:
+                return pos.entry_price
+        except Exception:
+            pass
+        return None
 
     # ── Leg Management ──
 
@@ -729,7 +793,8 @@ class ScalperEngine:
                     return
 
             # ── Price filter ──
-            if not _is_price_allowed(state, slot.side):
+            if not _is_price_allowed(state, slot.side,
+                                     get_entry_fn=self._get_position_entry):
                 slot.paused = True
                 slot.pause_reason = "price_filter"
                 slot.retry_at = time.time() + 30.0
@@ -896,6 +961,8 @@ class ScalperEngine:
             fill_decay_half_life_ms=state.fill_decay_half_life_ms,
             min_refill_delay_ms=state.min_refill_delay_ms,
             allow_loss=state.allow_loss,
+            pin_long_to_entry=state.pin_long_to_entry,
+            pin_short_to_entry=state.pin_short_to_entry,
             started_at=ts_s_to_ms(state.created_at),
             reduce_only_armed=state.reduce_only_armed,
         )
@@ -982,6 +1049,8 @@ class ScalperEngine:
                     allow_loss=data.get("allowLoss", True) not in (False, "false"),
                     fill_count=int(data.get("totalFillCount", 0)),
                     reduce_only_armed=bool(data.get("reduceOnlyArmed", False)),
+                    pin_long_to_entry=bool(data.get("pinLongToEntry", False)),
+                    pin_short_to_entry=bool(data.get("pinShortToEntry", False)),
                     created_at=data.get("startedAt", 0) / 1000.0 if data.get("startedAt") else time.time(),
                 )
 

@@ -482,6 +482,47 @@ async def test_chase_fill_callback():
     assert state.status == "FILLED"
 
 
+@test("scalper pin-to-entry blocks slot when price > entry")
+def test_scalper_pin_entry():
+    from trading_engine_python.algos.scalper import ScalperState, _is_price_allowed
+    # Simulate: startSide=LONG, pin short to entry, price above entry
+    state = ScalperState(
+        id="sc_pin", sub_account_id="s1", symbol="BTCUSDT",
+        start_side="LONG", last_known_price=66000,
+        pin_short_to_entry=True,
+    )
+    # With no position entry getter, pin has no effect → allowed
+    assert _is_price_allowed(state, "SELL") is True
+
+    # With a long entry at 65000, selling below 65000 should be blocked
+    def mock_entry(st, side):
+        if side == "LONG":
+            return 65000.0
+        return None
+
+    state.last_known_price = 64000  # below entry
+    assert _is_price_allowed(state, "SELL", get_entry_fn=mock_entry) is False
+
+    state.last_known_price = 66000  # above entry → ok
+    assert _is_price_allowed(state, "SELL", get_entry_fn=mock_entry) is True
+
+    # Pin long to entry: buying above entry should be blocked
+    state2 = ScalperState(
+        id="sc_pin2", sub_account_id="s1", symbol="BTCUSDT",
+        start_side="SHORT", last_known_price=66000,
+        pin_long_to_entry=True,
+    )
+    def mock_entry2(st, side):
+        if side == "SHORT":
+            return 65000.0
+        return None
+
+    assert _is_price_allowed(state2, "BUY", get_entry_fn=mock_entry2) is False
+
+    state2.last_known_price = 64500  # below entry → ok
+    assert _is_price_allowed(state2, "BUY", get_entry_fn=mock_entry2) is True
+
+
 # ── 7. Module Import Verification ──
 
 @test("all 18 modules importable")

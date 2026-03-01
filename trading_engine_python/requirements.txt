@@ -10,6 +10,7 @@ requests==2.32.3
 # Database
 sqlalchemy==2.0.34
 aiosqlite==0.22.1
+asyncpg>=0.29.0
 
 # Redis
 redis==7.1.0

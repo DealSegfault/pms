@@ -125,6 +125,8 @@ class ScalperRedisState:
     fill_decay_half_life_ms: float = 30000
     min_refill_delay_ms: float = 0
     allow_loss: bool = True
+    pin_long_to_entry: bool = False
+    pin_short_to_entry: bool = False
     started_at: int = 0                 # ms (always!)
     reduce_only_armed: bool = False
 
@@ -150,6 +152,8 @@ class ScalperRedisState:
             "fillDecayHalfLifeMs": self.fill_decay_half_life_ms,
             "minRefillDelayMs": self.min_refill_delay_ms,
             "allowLoss": self.allow_loss,
+            "pinLongToEntry": self.pin_long_to_entry,
+            "pinShortToEntry": self.pin_short_to_entry,
             "startedAt": self.started_at,
         }
 

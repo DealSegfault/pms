@@ -110,15 +110,23 @@ class TWAPEngine:
         symbol = params["symbol"]  # Keep ccxt format — convert at exchange boundary only
         side = _normalize_side(params["side"])
 
-        # Resolve quantity — support both coin amount and USD amount
+        # Resolve quantity — support coin amount, USD amount, or frontend totalSize (USD)
         if "sizeUsdt" in params and params["sizeUsdt"]:
             size_usdt = float(params["sizeUsdt"])
             price = self._md.get_mid_price(symbol) if self._md else None
             if not price or price <= 0:
                 raise ValueError(f"Cannot get price for {symbol} to convert sizeUsdt to quantity")
             total_qty = size_usdt / price
-        else:
+        elif "totalSize" in params and params["totalSize"]:
+            size_usdt = float(params["totalSize"])
+            price = self._md.get_mid_price(symbol) if self._md else None
+            if not price or price <= 0:
+                raise ValueError(f"Cannot get price for {symbol} to convert totalSize to quantity")
+            total_qty = size_usdt / price
+        elif "quantity" in params and params["quantity"]:
             total_qty = float(params["quantity"])
+        else:
+            raise ValueError("Missing required field: quantity, sizeUsdt, or totalSize")
 
         num_lots = int(params.get("numLots", params.get("lots", 10)))
         irregular = bool(params.get("irregular", False))

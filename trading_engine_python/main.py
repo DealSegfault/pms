@@ -152,32 +152,71 @@ async def main() -> None:
     pos_count = await risk_engine.load_positions()
     logger.info("RiskEngine loaded %d positions", pos_count)
 
-    # ── 7b. Reconcile with exchange — close ghost positions ──
+    # ── 7b. Reconcile with exchange — close ghosts + fix quantity drift ──
     if not paper_mode and pos_count > 0:
         try:
             exchange_positions = await exchange.get_position_risk()
-            # Build set of (symbol, side) that actually exist on exchange
-            exchange_set = set()
+            # Build dict of (symbol, side) → {qty, entryPrice} for exchange positions
+            exchange_map = {}
             for ep in (exchange_positions or []):
                 amt = float(ep.get("positionAmt", 0))
                 if amt != 0:
                     side = "LONG" if amt > 0 else "SHORT"
-                    exchange_set.add((ep.get("symbol", ""), side))
+                    exchange_map[(ep.get("symbol", ""), side)] = {
+                        "qty": abs(amt),
+                        "entryPrice": float(ep.get("entryPrice", 0)),
+                    }
 
             # Check each virtual position
             stale_closed = 0
+            qty_corrected = 0
             for sub_id, entry in list(position_book._entries.items()):
                 for pos_id, pos in list(entry["positions"].items()):
-                    if (pos.symbol, pos.side) not in exchange_set:
+                    # Convert ccxt symbol to Binance for comparison
+                    binance_sym = pos.symbol.replace("/", "").replace(":USDT", "").upper()
+                    if not binance_sym.endswith("USDT"):
+                        binance_sym += "USDT"
+
+                    exch_data = exchange_map.get((binance_sym, pos.side))
+                    if not exch_data:
                         logger.warning(
                             "Ghost position %s %s %s — not on exchange, force-closing",
                             pos.id[:8], pos.symbol, pos.side,
                         )
                         await risk_engine.force_close_stale_position(pos)
                         stale_closed += 1
+                    else:
+                        # Check quantity drift
+                        exch_qty = exch_data["qty"]
+                        drift_pct = abs(pos.quantity - exch_qty) / max(pos.quantity, exch_qty, 1e-10) * 100
+                        if drift_pct > 1.0:
+                            from trading_engine_python.risk.math import compute_margin, compute_liquidation_price
+                            old_qty = pos.quantity
+                            new_entry = exch_data["entryPrice"] if exch_data["entryPrice"] > 0 else pos.entry_price
+                            new_notional = exch_qty * new_entry
+                            new_margin = compute_margin(new_notional, pos.leverage)
+                            new_liq = compute_liquidation_price(pos.side, new_entry, exch_qty, new_margin)
+                            position_book.update_position(
+                                pos.id, pos.sub_account_id,
+                                entry_price=new_entry, quantity=exch_qty,
+                                notional=new_notional, margin=new_margin,
+                                liquidation_price=new_liq,
+                            )
+                            if db:
+                                await db.execute(
+                                    """UPDATE virtual_positions
+                                       SET entry_price=?, quantity=?, notional=?, margin=?, liquidation_price=?
+                                       WHERE id=?""",
+                                    (new_entry, exch_qty, new_notional, new_margin, new_liq, pos.id),
+                                )
+                            logger.warning(
+                                "STARTUP RECONCILE: %s %s qty %.6f → %.6f (drift=%.1f%%, exchange is truth)",
+                                pos.symbol, pos.side, old_qty, exch_qty, drift_pct,
+                            )
+                            qty_corrected += 1
 
-            if stale_closed:
-                logger.info("Reconciliation: closed %d ghost positions", stale_closed)
+            if stale_closed or qty_corrected:
+                logger.info("Reconciliation: closed %d ghosts, corrected %d positions", stale_closed, qty_corrected)
             else:
                 logger.info("Reconciliation: all %d positions verified on exchange", pos_count)
         except Exception as e:

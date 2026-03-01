@@ -4,6 +4,7 @@ from binance.um_futures import UMFutures
 from binance.lib.utils import config_logging
 from binance.error import ClientError
 import os
+import time
 
 # Proxy config — read from env vars instead of config module
 HTTP_PROXY = os.getenv("HTTP_PROXY", "")
@@ -93,6 +94,42 @@ class BinanceFutures:
         self.client = UMFutures(key=api_key, secret=api_secret, proxies=self.proxies)
         config_logging(logging, logging.INFO)
         self.logger = logging.getLogger(__name__)
+
+        # ── Time sync: compute offset from Binance server ──
+        # Binance rejects requests with -1021 if local clock drifts >1s.
+        # We fetch server time once, compute the delta, and patch
+        # sign_request to use corrected timestamps + a 10s recvWindow.
+        self._time_offset_ms = 0
+        try:
+            local_before = int(time.time() * 1000)
+            server_data = self.client.time()
+            local_after = int(time.time() * 1000)
+            server_time = server_data.get("serverTime", 0)
+            local_mid = (local_before + local_after) // 2
+            self._time_offset_ms = server_time - local_mid
+            if abs(self._time_offset_ms) > 500:
+                self.logger.warning(
+                    "Clock drift detected: local is %+dms vs Binance. Auto-correcting.",
+                    -self._time_offset_ms,
+                )
+        except Exception as e:
+            self.logger.warning("Failed to sync time with Binance: %s — using local clock", e)
+
+        # Monkey-patch sign_request to inject corrected timestamp + recvWindow
+        _original_sign = self.client.sign_request
+        _offset = self._time_offset_ms
+
+        def _patched_sign_request(http_method, url_path, payload=None, special=False):
+            if payload is None:
+                payload = {}
+            payload["timestamp"] = int(time.time() * 1000) + _offset
+            payload["recvWindow"] = 10000  # 10s window (default is 5s)
+            from binance.lib.utils import cleanNoneValue
+            query_string = self.client._prepare_params(payload, special)
+            payload["signature"] = self.client._get_sign(query_string)
+            return self.client.send_request(http_method, url_path, payload, special)
+
+        self.client.sign_request = _patched_sign_request
     
     # ===== Market Data Methods =====
     

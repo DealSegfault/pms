@@ -403,15 +403,113 @@ class RiskEngine:
     async def on_account_update(self, data: dict) -> None:
         """
         Called by UserStreamService on ACCOUNT_UPDATE.
-        Handles external position changes (reconciliation).
+
+        Binance sends this on EVERY fill with the authoritative exchange position
+        data. We use it to reconcile virtual positions — if ORDER_TRADE_UPDATE fills
+        were missed (WS glitch, race condition), this corrects the drift.
+
+        For each position in the update:
+          - Exchange has position, we don't → log warning (can't auto-create, no sub-account info)
+          - Both have position, quantities differ >1% → update PositionBook to match exchange
+          - We have position, exchange shows 0 → force-close the ghost
         """
         positions = data.get("positions", [])
+        if not positions:
+            return
+
         for pos_data in positions:
-            symbol = pos_data.get("symbol", "")
-            position_amount = pos_data.get("position_amount", 0)
-            # TODO: Reconcile with PositionBook — if exchange closed position externally,
-            # update our virtual position state.
-            logger.debug("ACCOUNT_UPDATE: %s amount=%.6f", symbol, position_amount)
+            binance_symbol = pos_data.get("symbol", "")
+            if not binance_symbol:
+                continue
+
+            exchange_qty = pos_data.get("position_amount", 0)  # signed: +long, -short
+            entry_price = pos_data.get("entry_price", 0)
+            exchange_side = "LONG" if exchange_qty > 0 else "SHORT"
+            abs_qty = abs(exchange_qty)
+
+            # Search all sub-accounts for a matching position
+            # (ACCOUNT_UPDATE doesn't carry sub-account info — it's exchange-level)
+            matched = False
+            for sub_id in list(self._book._entries.keys()):
+                # Try both sides — exchange might have closed one side
+                for side in ("LONG", "SHORT"):
+                    pos = self._book.find_position(sub_id, binance_symbol, side)
+                    if not pos:
+                        continue
+                    matched = True
+
+                    if abs_qty == 0:
+                        # Exchange has no position but we do → ghost
+                        logger.warning(
+                            "ACCOUNT_UPDATE RECONCILE: %s %s qty=%.6f is GONE on exchange — force closing",
+                            pos.symbol, pos.side, pos.quantity,
+                        )
+                        await self.force_close_stale_position(pos)
+                        continue
+
+                    # Only reconcile if exchange side matches
+                    if side != exchange_side:
+                        continue
+
+                    # Compare quantities
+                    qty_diff_pct = abs(pos.quantity - abs_qty) / max(pos.quantity, abs_qty, 1e-10) * 100
+                    if qty_diff_pct > 1.0:
+                        old_qty = pos.quantity
+                        new_notional = abs_qty * (entry_price if entry_price > 0 else pos.entry_price)
+                        new_entry = entry_price if entry_price > 0 else pos.entry_price
+                        new_margin = compute_margin(new_notional, pos.leverage)
+                        new_liq = compute_liquidation_price(pos.side, new_entry, abs_qty, new_margin)
+
+                        self._book.update_position(
+                            pos.id, pos.sub_account_id,
+                            entry_price=new_entry, quantity=abs_qty,
+                            notional=new_notional, margin=new_margin,
+                            liquidation_price=new_liq,
+                        )
+
+                        # Persist to DB
+                        if self._db:
+                            try:
+                                await self._db.execute(
+                                    """UPDATE virtual_positions
+                                       SET entry_price=?, quantity=?, notional=?, margin=?, liquidation_price=?
+                                       WHERE id=?""",
+                                    (new_entry, abs_qty, new_notional, new_margin, new_liq, pos.id),
+                                )
+                            except Exception as e:
+                                logger.error("ACCOUNT_UPDATE DB update failed for %s: %s", pos.id[:8], e)
+
+                        # Publish correction to frontend
+                        await self._publish_event("position_updated", {
+                            "subAccountId": pos.sub_account_id,
+                            "positionId": pos.id,
+                            "symbol": pos.symbol,
+                            "side": pos.side,
+                            "entryPrice": new_entry,
+                            "quantity": abs_qty,
+                            "notional": new_notional,
+                            "margin": new_margin,
+                            "leverage": pos.leverage,
+                            "liquidationPrice": new_liq,
+                            "reconciled": True,
+                        })
+                        snapshot = self.get_account_snapshot(pos.sub_account_id)
+                        await self._publish_event("margin_update", {
+                            "subAccountId": pos.sub_account_id,
+                            "update": snapshot,
+                            **snapshot,
+                        })
+
+                        logger.warning(
+                            "ACCOUNT_UPDATE RECONCILE: %s %s qty %.6f → %.6f (exchange is source of truth, diff=%.1f%%)",
+                            pos.symbol, pos.side, old_qty, abs_qty, qty_diff_pct,
+                        )
+
+            if not matched and abs_qty > 0:
+                logger.debug(
+                    "ACCOUNT_UPDATE: exchange has %s %s qty=%.6f but no matching virtual position",
+                    binance_symbol, exchange_side, abs_qty,
+                )
 
     # ── Validation ──
 
@@ -429,7 +527,6 @@ class RiskEngine:
                     "UPDATE virtual_positions SET status='CLOSED', closed_at=?, close_price=?, realized_pnl=0 WHERE id=?",
                     (int(time.time() * 1000), pos.entry_price, pos.id),
                 )
-                await self._db.commit()
             except Exception as e:
                 logger.error("Failed to DB-close stale position %s: %s", pos.id[:8], e)
 
