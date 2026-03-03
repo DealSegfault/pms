@@ -64,10 +64,20 @@ class OrderManager:
         self._tracker = OrderTracker()
         self._seq: int = 0  # Monotonic event sequence number
         self._ignored_prefixes: set = set()  # sub-account prefixes we can't resolve (other server)
+        self._managed_accounts: Optional[set] = None  # sub-account IDs this server manages (None = all)
 
     def set_risk_engine(self, risk_engine: Any) -> None:
         """Wire up the risk engine after it's created (Step 7)."""
         self._risk = risk_engine
+
+    def set_managed_accounts(self, sub_ids: set) -> None:
+        """Set the sub-account IDs this server manages.
+
+        When set, fills for non-managed sub-accounts are ignored.
+        When None, all PMS-tagged fills are processed (single-server mode).
+        """
+        self._managed_accounts = sub_ids
+        logger.info("OrderManager: managing %d sub-accounts", len(sub_ids))
 
     def set_symbol_info(self, symbol_info: Any) -> None:
         """Wire up the symbol info cache."""
@@ -108,6 +118,7 @@ class OrderManager:
 
         Returns: OrderState (state="placing", fills arrive async via feed)
         """
+        skip_symbol_rounding = bool(kwargs.pop("_skip_symbol_rounding", False))
         order = OrderState(
             client_order_id=generate_client_order_id(sub_account_id, "MKT"),
             sub_account_id=sub_account_id,
@@ -124,7 +135,7 @@ class OrderManager:
         )
 
         # Round quantity to exchange precision
-        if self._symbol_info:
+        if self._symbol_info and not skip_symbol_rounding:
             quantity = self._symbol_info.round_quantity(symbol, quantity, is_market=True)
             order.quantity = quantity
 
@@ -149,12 +160,129 @@ class OrderManager:
                 self._tracker.update_exchange_id(order.client_order_id, eid)
             # DON'T set state to "active" — wait for feed confirmation
 
+            rest_status = str(result.get("status", "") or "").upper()
+            executed_qty = float(result.get("executedQty", 0) or 0)
+            avg_price = float(result.get("avgPrice", 0) or result.get("price", 0) or 0)
+            if rest_status == "FILLED" and executed_qty > 0 and avg_price > 0:
+                logger.warning(
+                    "Market order %s REST-reported FILLED before user stream confirmation — applying fast-path fill",
+                    order.client_order_id,
+                )
+                await self.on_order_update({
+                    "order_id": eid,
+                    "client_order_id": order.client_order_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "order_type": "MARKET",
+                    "order_status": "FILLED",
+                    "orig_qty": str(result.get("origQty", quantity)),
+                    "last_filled_qty": str(executed_qty),
+                    "last_filled_price": str(avg_price),
+                    "accumulated_filled_qty": str(result.get("executedQty", executed_qty)),
+                    "avg_price": str(avg_price),
+                })
+
         except Exception as e:
             order.transition("failed")
             logger.error("Market order failed: %s %s %s — %s", symbol, side, quantity, e)
             await self._publish_event("order_failed", order, error=str(e))
 
         return order
+
+    async def close_virtual_position(
+        self,
+        position: Any,
+        requested_qty: Optional[float] = None,
+        origin: str = "MANUAL",
+        parent_id: Optional[str] = None,
+        on_fill: Optional[Callable] = None,
+        on_cancel: Optional[Callable] = None,
+        cleanup_if_unexecutable: bool = False,
+    ) -> dict:
+        """Close a virtual position using exchange-truth and side-scoped reduce-only."""
+        result = {
+            "placed": False,
+            "order": None,
+            "reason": "",
+            "requested_qty": 0.0,
+            "exchange_qty": 0.0,
+            "close_qty": 0.0,
+            "cleaned_up": False,
+            "lookup_failed": False,
+        }
+
+        if not position:
+            result["reason"] = "POSITION_NOT_FOUND"
+            return result
+
+        requested = float(requested_qty if requested_qty is not None else position.quantity)
+        requested = min(requested, float(getattr(position, "quantity", 0) or 0))
+        result["requested_qty"] = requested
+        if requested <= 0:
+            result["reason"] = "NON_POSITIVE_REQUEST"
+            return result
+
+        position_side = str(getattr(position, "side", "") or "").upper()
+        if position_side not in ("LONG", "SHORT"):
+            result["reason"] = f"INVALID_POSITION_SIDE:{position_side or 'UNKNOWN'}"
+            return result
+
+        exchange_qty, ref_price, lookup_failed = await self._get_exchange_close_context(
+            getattr(position, "symbol", ""),
+            position_side,
+        )
+        result["exchange_qty"] = exchange_qty
+        result["lookup_failed"] = lookup_failed
+        if lookup_failed:
+            result["reason"] = "EXCHANGE_LOOKUP_FAILED"
+            return result
+
+        raw_close_qty = min(requested, exchange_qty)
+        executable_qty = self._truncate_market_quantity(getattr(position, "symbol", ""), raw_close_qty)
+        result["close_qty"] = executable_qty
+
+        reason = self._close_quantity_rejection_reason(
+            getattr(position, "symbol", ""),
+            raw_close_qty,
+            executable_qty,
+            ref_price or getattr(position, "mark_price", 0) or getattr(position, "entry_price", 0),
+        )
+        if reason:
+            result["reason"] = reason
+            if cleanup_if_unexecutable and self._risk:
+                await self._risk.force_close_stale_position(position)
+                result["cleaned_up"] = True
+            else:
+                logger.warning(
+                    "Close skipped for %s %s %s: %s (requested=%.8f exchange=%.8f executable=%.8f)",
+                    getattr(position, "sub_account_id", ""),
+                    getattr(position, "symbol", ""),
+                    position_side,
+                    reason,
+                    requested,
+                    exchange_qty,
+                    executable_qty,
+                )
+            return result
+
+        close_side = "SELL" if position_side == "LONG" else "BUY"
+        order = await self.place_market_order(
+            sub_account_id=position.sub_account_id,
+            symbol=position.symbol,
+            side=close_side,
+            quantity=executable_qty,
+            leverage=getattr(position, "leverage", 1) or 1,
+            origin=origin,
+            parent_id=parent_id,
+            on_fill=on_fill,
+            on_cancel=on_cancel,
+            reduce_only=True,
+            _skip_symbol_rounding=True,
+        )
+        result["placed"] = order.state != "failed"
+        result["order"] = order
+        result["reason"] = "PLACED" if result["placed"] else "ORDER_FAILED"
+        return result
 
     async def place_limit_order(
         self,
@@ -217,10 +345,6 @@ class OrderManager:
             if eid:
                 self._tracker.update_exchange_id(order.client_order_id, eid)
 
-            # Transition placing → active on REST success.
-            # The feed will handle further transitions (filled/cancelled).
-            order.transition("active")
-
             # Persist to pending_orders table
             await self._db_persist_pending_order(order)
 
@@ -230,6 +354,77 @@ class OrderManager:
             await self._publish_event("order_failed", order, error=str(e))
 
         return order
+
+    async def _get_exchange_close_context(self, symbol: str, position_side: str) -> tuple[float, float, bool]:
+        """Get current exchange quantity and a reference price for one symbol side."""
+        try:
+            rows = await self._exchange.get_position_risk(symbol)
+        except Exception as e:
+            logger.error("Failed to query exchange position risk for %s %s: %s", symbol, position_side, e)
+            return 0.0, 0.0, True
+
+        for row in rows or []:
+            row_side = str(row.get("positionSide", "BOTH") or "BOTH").upper()
+            amt = float(row.get("positionAmt", 0) or 0)
+            qty = abs(amt)
+            if qty <= 0:
+                continue
+
+            matched = False
+            if row_side == position_side:
+                matched = True
+            elif row_side == "BOTH":
+                if position_side == "LONG" and amt > 0:
+                    matched = True
+                elif position_side == "SHORT" and amt < 0:
+                    matched = True
+
+            if not matched:
+                continue
+
+            ref_price = float(
+                row.get("markPrice", 0)
+                or row.get("entryPrice", 0)
+                or row.get("notional", 0)
+                or 0
+            )
+            return qty, abs(ref_price), False
+
+        return 0.0, 0.0, False
+
+    def _truncate_market_quantity(self, symbol: str, qty: float) -> float:
+        """Truncate market quantity without forcing minQty upward."""
+        if not self._symbol_info:
+            return max(0.0, qty)
+        return self._symbol_info.truncate_quantity(symbol, qty, is_market=True)
+
+    def _close_quantity_rejection_reason(
+        self,
+        symbol: str,
+        raw_close_qty: float,
+        executable_qty: float,
+        ref_price: float,
+    ) -> str:
+        """Return a stable reason when a reduce-only close is not executable."""
+        if raw_close_qty <= 0:
+            return "NO_EXCHANGE_POSITION"
+        if not self._symbol_info:
+            if executable_qty <= 0:
+                return "NO_EXCHANGE_POSITION"
+            return ""
+
+        min_qty = self._symbol_info.get_min_qty(symbol)
+        if raw_close_qty < min_qty or executable_qty < min_qty:
+            return "BELOW_MIN_QTY"
+
+        min_notional = self._symbol_info.get_min_notional(symbol)
+        if ref_price > 0 and (raw_close_qty * ref_price) < min_notional:
+            return "BELOW_MIN_NOTIONAL"
+
+        if executable_qty <= 0:
+            return "NO_EXCHANGE_POSITION"
+
+        return ""
 
     async def place_batch_limit_orders(
         self, order_params: list[dict]
@@ -306,7 +501,6 @@ class OrderManager:
                     # Success
                     eid = str(result["orderId"])
                     self._tracker.update_exchange_id(order.client_order_id, eid)
-                    order.transition("active")
                     await self._db_persist_pending_order(order)
                 elif isinstance(result, dict) and "code" in result:
                     # Individual order failed within batch
@@ -506,12 +700,32 @@ class OrderManager:
         if status == "NEW":
             if not order.exchange_order_id and exchange_order_id:
                 self._tracker.update_exchange_id(order.client_order_id, exchange_order_id)
-            order.transition("active")
-            await self._redis_set_open_order(order)
+
+            if order.is_terminal:
+                logger.info(
+                    "Ignoring late NEW for terminal order %s (state=%s)",
+                    order.client_order_id,
+                    order.state,
+                )
+                return
+            if order.state == "active":
+                logger.debug("Ignoring duplicate NEW for active order %s", order.client_order_id)
+                return
+            if not order.transition("active"):
+                logger.warning(
+                    "Rejecting NEW for %s in state=%s",
+                    order.client_order_id,
+                    order.state,
+                )
+                return
+
+            if order.order_type != "MARKET":
+                await self._redis_set_open_order(order)
             # Publish order_placed for limit orders (frontend shows in open orders)
             if order.order_type == "LIMIT":
                 await self._publish_event("order_placed", order)
-            await self._publish_event("order_active", order)
+            if order.order_type != "MARKET":
+                await self._publish_event("order_active", order)
 
         elif status == "PARTIALLY_FILLED":
             fill_price = float(data.get("last_filled_price", 0))
@@ -759,6 +973,7 @@ class OrderManager:
                 created_at=eo.get("time", 0) / 1000.0 if eo.get("time") else 0,
                 reduce_only=eo.get("reduceOnly", False),
             )
+            order._extra["exchange_new_seen"] = True
 
             self._tracker.register(order)
             await self._redis_set_open_order(order)
@@ -879,9 +1094,20 @@ class OrderManager:
             )
             return None
 
+        # ── Fill ownership guard: verify this sub-account is managed by this server ──
+        if self._managed_accounts is not None and sub_account_id not in self._managed_accounts:
+            self._ignored_prefixes.add(sub_prefix)
+            logger.info(
+                "Ignoring orders for non-managed sub-account '%s' (managed by another server)",
+                sub_prefix,
+            )
+            return None
+
         # Determine initial state based on incoming status
         # Bot orders arrive from the feed, so they're already on the exchange.
-        if status in ("FILLED",):
+        if status == "NEW":
+            initial_state = "placing"
+        elif status in ("FILLED",):
             initial_state = "active"  # Will transition to "filled" in the main handler
         elif status in ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED"):
             initial_state = "active"  # Will transition to terminal in the main handler
@@ -922,15 +1148,20 @@ class OrderManager:
             db_side = "LONG" if order.side == "BUY" else "SHORT"
             await self._db.execute(
                 """INSERT INTO pending_orders
-                   (id, sub_account_id, symbol, side, type, price, quantity, leverage,
-                    exchange_order_id, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', datetime('now'))""",
-                (order.client_order_id, order.sub_account_id, order.symbol,
-                 db_side, order.order_type, order.price, order.quantity,
-                 float(order.leverage), order.exchange_order_id or ""),
+                   (id, sub_account_id, client_order_id, symbol, side, type, price, quantity, leverage,
+                    exchange_order_id, origin, parent_id, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', datetime('now'))""",
+                (order.client_order_id, order.sub_account_id, order.client_order_id,
+                 order.symbol, db_side, order.order_type, order.price, order.quantity,
+                 float(order.leverage), order.exchange_order_id or "",
+                 order.origin, order.parent_id or ""),
             )
         except Exception as e:
-            logger.error("Failed to persist pending order to DB: %s", e)
+            # Duplicate key on clientOrderId is expected for batch retries
+            if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+                logger.debug("Pending order %s already in DB (duplicate)", order.client_order_id)
+            else:
+                logger.error("Failed to persist pending order to DB: %s", e)
 
     async def _db_update_pending_order(self, order: OrderState, status: str) -> None:
         """Update pending order status (FILLED / CANCELLED)."""
@@ -954,10 +1185,13 @@ class OrderManager:
 
     async def cleanup(self) -> int:
         """Clean up terminal orders older than 5 minutes + expire stale orders + purge ghost Redis entries."""
-        # 1. Expire stale orders stuck in "placing" > 30s
+        # 1. Exchange-level reconciliation first — recover fills/cancels before stale expiry.
+        reconciled = await self._reconcile_active_orders()
+
+        # 2. Expire stale orders stuck in "placing" > 30s with no exchange ID.
         stale_count = 0
         for order in list(self._tracker._by_client_id.values()):
-            if order.is_stale:
+            if order.is_stale and not order.exchange_order_id:
                 order.transition("failed")
                 stale_count += 1
                 logger.warning(
@@ -968,14 +1202,11 @@ class OrderManager:
         if stale_count:
             logger.info("Expired %d stale orders", stale_count)
 
-        # 2. Clean up terminal orders older than 5 min
+        # 3. Clean up terminal orders older than 5 min
         cleaned = self._tracker.cleanup_terminal()
 
-        # 3. Purge ghost entries from Redis open_orders hashes
+        # 4. Purge ghost entries from Redis open_orders hashes
         ghost_count = await self._reconcile_redis_open_orders()
-
-        # 4. Exchange-level fill reconciliation — catch missed WS events
-        reconciled = await self._reconcile_active_orders()
 
         # 5. Observability
         total = cleaned + stale_count + ghost_count + reconciled
@@ -1032,7 +1263,8 @@ class OrderManager:
 
     # ── Exchange-Level Fill Reconciliation ──
 
-    _RECONCILE_STALE_THRESHOLD = 15.0   # seconds before checking exchange
+    _RECONCILE_PLACING_THRESHOLD = 2.0  # seconds before checking exchange for market/placing orders
+    _RECONCILE_STALE_THRESHOLD = 15.0   # seconds before checking exchange for active/cancelling orders
     _RECONCILE_MAX_PER_CYCLE = 3        # limit REST calls per cleanup cycle
 
     async def _reconcile_active_orders(self) -> int:
@@ -1054,12 +1286,17 @@ class OrderManager:
             if checked >= self._RECONCILE_MAX_PER_CYCLE:
                 break
 
-            # Only check orders that have been active for a while
+            # Only check orders that have been alive for a while
             if order.is_terminal:
                 continue
-            if order.state not in ("active", "cancelling"):
+            if order.state not in ("placing", "active", "cancelling"):
                 continue
-            if (now - order.updated_at) < self._RECONCILE_STALE_THRESHOLD:
+            threshold = (
+                self._RECONCILE_PLACING_THRESHOLD
+                if order.state == "placing"
+                else self._RECONCILE_STALE_THRESHOLD
+            )
+            if (now - order.updated_at) < threshold:
                 continue
             if not order.exchange_order_id:
                 continue
@@ -1085,8 +1322,29 @@ class OrderManager:
                 continue
 
             exchange_status = exchange_data.get("status", "")
+            executed_qty = float(exchange_data.get("executedQty", order.filled_qty) or 0)
+            fill_delta = max(0.0, executed_qty - float(order.filled_qty or 0))
+            avg_price = str(exchange_data.get("avgPrice", exchange_data.get("price", 0)))
 
-            if exchange_status == "FILLED":
+            if exchange_status == "NEW" and order.state == "placing":
+                logger.warning(
+                    "RECONCILE: order %s NEW on exchange while tracker state=placing — syncing active",
+                    order.client_order_id,
+                )
+                synthetic = {
+                    "order_id": order.exchange_order_id,
+                    "client_order_id": order.client_order_id,
+                    "symbol": exchange_data.get("symbol", order.symbol),
+                    "side": exchange_data.get("side", order.side),
+                    "order_type": exchange_data.get("type", order.order_type),
+                    "order_status": "NEW",
+                    "orig_qty": str(exchange_data.get("origQty", order.quantity)),
+                    "price": str(exchange_data.get("price", order.price or 0)),
+                }
+                await self.on_order_update(synthetic)
+                reconciled += 1
+
+            elif exchange_status == "FILLED":
                 # ── Critical: exchange filled but we missed it ──
                 logger.warning(
                     "RECONCILE: order %s FILLED on exchange but tracker state=%s — injecting fill",
@@ -1100,14 +1358,37 @@ class OrderManager:
                     "symbol": exchange_data.get("symbol", order.symbol),
                     "side": exchange_data.get("side", order.side),
                     "order_status": "FILLED",
-                    "last_filled_qty": str(exchange_data.get("executedQty", order.quantity)),
-                    "last_filled_price": str(exchange_data.get("avgPrice", "0")),
-                    "accumulated_filled_qty": str(exchange_data.get("executedQty", "0")),
-                    "avg_price": str(exchange_data.get("avgPrice", "0")),
+                    "last_filled_qty": str(fill_delta or executed_qty or order.quantity),
+                    "last_filled_price": avg_price,
+                    "accumulated_filled_qty": str(executed_qty),
+                    "avg_price": avg_price,
                     "orig_qty": str(exchange_data.get("origQty", order.quantity)),
                 }
                 await self.on_order_update(synthetic)
                 reconciled += 1
+
+            elif exchange_status == "PARTIALLY_FILLED":
+                logger.warning(
+                    "RECONCILE: order %s PARTIALLY_FILLED on exchange but tracker state=%s — injecting partial",
+                    order.client_order_id, order.state,
+                )
+                synthetic = {
+                    "order_id": order.exchange_order_id,
+                    "client_order_id": order.client_order_id,
+                    "symbol": exchange_data.get("symbol", order.symbol),
+                    "side": exchange_data.get("side", order.side),
+                    "order_type": exchange_data.get("type", order.order_type),
+                    "order_status": "PARTIALLY_FILLED",
+                    "last_filled_qty": str(fill_delta),
+                    "last_filled_price": avg_price,
+                    "accumulated_filled_qty": str(executed_qty),
+                    "avg_price": avg_price,
+                    "orig_qty": str(exchange_data.get("origQty", order.quantity)),
+                    "price": str(exchange_data.get("price", order.price or 0)),
+                }
+                if fill_delta > 0:
+                    await self.on_order_update(synthetic)
+                    reconciled += 1
 
             elif exchange_status in ("CANCELED", "EXPIRED", "REJECTED"):
                 logger.warning(
@@ -1259,6 +1540,7 @@ class OrderManager:
                     origin="RECOVERED",
                     reduce_only=eo.get("reduceOnly", False),
                 )
+                order._extra["exchange_new_seen"] = True
                 self._tracker.register(order)
                 await self._redis_set_open_order(order)
                 orphans_registered += 1

@@ -92,6 +92,10 @@ class ChaseEngine:
         """Set a callable that returns True when UserStream WS is connected."""
         self._ws_healthy = checker
 
+    def set_scalper(self, scalper_engine: Any) -> None:
+        """Wire scalper reference for event-driven fill/cancel routing."""
+        self._scalper = scalper_engine
+
     # ── Background tasks ──
 
     def start_background_tasks(self) -> None:
@@ -610,10 +614,9 @@ class ChaseEngine:
                 fill_price = order.avg_fill_price if order else 0
                 fill_qty = order.filled_qty if order else state.quantity
                 cb = state.on_chase_fill
-                if asyncio.iscoroutinefunction(cb):
-                    await cb(fill_price, fill_qty)
-                else:
-                    cb(fill_price, fill_qty)
+                result = cb(fill_price, fill_qty)
+                if asyncio.iscoroutine(result):
+                    await result
             except Exception as e:
                 logger.error("Chase %s on_chase_fill callback error: %s", state.id, e)
         await self._cleanup(state)
@@ -650,16 +653,133 @@ class ChaseEngine:
         if state.on_chase_cancel:
             try:
                 cb = state.on_chase_cancel
-                if asyncio.iscoroutinefunction(cb):
-                    await cb(reason)
-                else:
-                    cb(reason)
+                result = cb(reason)
+                if asyncio.iscoroutine(result):
+                    await result
             except Exception as e:
                 logger.error("Chase %s on_chase_cancel callback error: %s", state.id, e)
             await self._cleanup(state)
             return
         # Standalone chase — unexpected cancel → try to re-arm
         logger.warning("Chase %s: order cancelled unexpectedly, re-arming", state.id)
+        l1 = self._md.get_l1(state.symbol) if self._md else None
+        price = self._compute_chase_price(state, l1)
+        if price:
+            new_order = await self._om.place_limit_order(
+                sub_account_id=state.sub_account_id,
+                symbol=state.symbol, side=state.side,
+                quantity=state.quantity, price=price,
+                leverage=state.leverage, origin="CHASE",
+                parent_id=state.id,
+                on_fill=lambda o: self._on_fill(state, o),
+                on_cancel=lambda o, r: self._on_cancel(state, o, r),
+                reduce_only=state.reduce_only,
+            )
+            state.current_order_id = new_order.client_order_id
+            state.current_order_price = price
+
+    # ── Event-Driven Methods (used by AlgoConsumer instead of callbacks) ──
+
+    async def on_fill_event(self, state: "ChaseState", event: dict) -> None:
+        """Handle fill via event stream (replaces callback-based _on_fill).
+
+        Called by AlgoConsumer when an ORDER_STATE_FILLED event arrives
+        for a chase-owned order. No lambdas, no closures.
+        """
+        if state.status in ("FILLED", "CANCELLED"):
+            logger.debug("Chase %s: ignoring duplicate fill event (already %s)",
+                         state.id, state.status)
+            return
+
+        try:
+            CHASE_FSM.validate_transition(state.status, "FILL")
+        except InvariantViolation as e:
+            logger.error("Chase %s FSM violation on fill event: %s", state.id, e)
+        state.status = "FILLED"
+
+        filled_coid = event.get("client_order_id", "")
+        if filled_coid and state.current_order_id and filled_coid != state.current_order_id:
+            logger.info("Chase %s: filled order %s != current %s — cancelling orphan",
+                        state.id, filled_coid, state.current_order_id)
+            try:
+                await self._om.cancel_order(state.current_order_id)
+            except Exception as e:
+                logger.warning("Chase %s: failed to cancel orphan: %s", state.id, e)
+
+        fill_price = float(event.get("avg_price", 0) or event.get("fill_price", 0))
+        fill_qty = float(event.get("fill_qty", 0) or state.quantity)
+
+        # Notify parent scalper if this chase is owned by one
+        if state.parent_scalper_id and hasattr(self, "_scalper") and self._scalper:
+            try:
+                await self._scalper.on_chase_fill_event(
+                    state.parent_scalper_id, state.id, fill_price, fill_qty
+                )
+            except Exception as e:
+                logger.error("Chase %s: scalper on_chase_fill_event error: %s", state.id, e)
+        elif state.on_chase_fill:
+            # Fallback: old callback path (during migration)
+            try:
+                cb = state.on_chase_fill
+                result = cb(fill_price, fill_qty)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.error("Chase %s on_chase_fill callback error: %s", state.id, e)
+
+        await self._cleanup(state)
+        await self._publish_event("chase_filled", state, fillPrice=fill_price)
+        logger.info("Chase filled (event): %s", state.id)
+
+    async def on_cancel_event(self, state: "ChaseState", event: dict, reason: str) -> None:
+        """Handle cancel via event stream (replaces callback-based _on_cancel).
+
+        Called by AlgoConsumer when an ORDER_STATE_CANCELLED event arrives
+        for a chase-owned order.
+        """
+        if state.status != "ACTIVE":
+            return
+
+        if state._tick_lock.locked():
+            logger.debug("Chase %s: ignoring cancel event during active reprice", state.id)
+            return
+
+        cancelled_coid = event.get("client_order_id", "")
+        if cancelled_coid and cancelled_coid != state.current_order_id:
+            logger.debug("Chase %s: ignoring cancel event for old order %s (replaced by %s)",
+                         state.id, cancelled_coid, state.current_order_id)
+            return
+
+        fsm_event = "CHILD_CANCEL" if state.parent_scalper_id else "EXTERNAL_CANCEL"
+        try:
+            CHASE_FSM.validate_transition(state.status, fsm_event)
+        except InvariantViolation as e:
+            logger.error("Chase %s FSM violation on cancel event: %s", state.id, e)
+
+        # If owned by a scalper, delegate restart
+        if state.parent_scalper_id and hasattr(self, "_scalper") and self._scalper:
+            try:
+                await self._scalper.on_chase_cancel_event(
+                    state.parent_scalper_id, state.id, reason
+                )
+            except Exception as e:
+                logger.error("Chase %s: scalper on_chase_cancel_event error: %s", state.id, e)
+            await self._cleanup(state)
+            return
+        elif state.on_chase_cancel:
+            # Fallback: old callback path (during migration)
+            try:
+                cb = state.on_chase_cancel
+                result = cb(reason)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.error("Chase %s on_chase_cancel callback error: %s", state.id, e)
+            await self._cleanup(state)
+            return
+
+        # Standalone chase — re-arm
+        logger.warning("Chase %s: order cancelled unexpectedly (event), re-arming", state.id)
         l1 = self._md.get_l1(state.symbol) if self._md else None
         price = self._compute_chase_price(state, l1)
         if price:

@@ -32,7 +32,7 @@ from contracts.invariants import (
 from contracts.state_machines import TRAIL_STOP_FSM
 from contracts.pure_logic import (
     trail_stop_update_extreme, trail_stop_is_triggered,
-    trail_stop_compute_trigger, trail_stop_close_side,
+    trail_stop_compute_trigger,
 )
 
 logger = logging.getLogger(__name__)
@@ -190,7 +190,6 @@ class TrailStopEngine:
             except InvariantViolation as e:
                 logger.error("Trail stop %s FSM violation on trigger: %s", state.id, e)
             state.status = "TRIGGERED"
-            close_side = trail_stop_close_side(state.side)
 
             logger.warning(
                 "Trail stop TRIGGERED: %s %s mid=%.2f extreme=%.2f trigger=%.2f",
@@ -198,15 +197,32 @@ class TrailStopEngine:
             )
 
             try:
-                await self._om.place_market_order(
-                    sub_account_id=state.sub_account_id,
-                    symbol=state.symbol,
-                    side=close_side,
-                    quantity=state.quantity,
-                    reduce_only=True,
+                close_target = None
+                if getattr(self._om, "_risk", None):
+                    if state.position_id:
+                        close_target = self._om._risk.position_book.get_position(
+                            state.sub_account_id, state.position_id
+                        )
+                    if not close_target:
+                        close_target = self._om._risk.position_book.find_position(
+                            state.sub_account_id, state.symbol, state.side
+                        )
+                if not close_target:
+                    logger.warning("Trail stop %s: no matching virtual position found on trigger", state.id)
+                    close_target = state
+
+                close_result = await self._om.close_virtual_position(
+                    position=close_target,
+                    requested_qty=state.quantity,
                     origin="TRAIL_STOP",
                     parent_id=state.id,
+                    cleanup_if_unexecutable=close_target is not state,
                 )
+                if not close_result.get("placed") and not close_result.get("cleaned_up"):
+                    logger.warning(
+                        "Trail stop %s close skipped: %s",
+                        state.id, close_result.get("reason", ""),
+                    )
             except Exception as e:
                 logger.error("Trail stop %s trigger failed: %s", state.id, e)
 

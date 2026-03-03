@@ -16,6 +16,7 @@ export const EVENT_TYPES = {
     // Order lifecycle
     ORDER_PLACED: 'order_placed',
     ORDER_ACTIVE: 'order_active',
+    ORDER_PARTIAL: 'order_partial',
     ORDER_FILLED: 'order_filled',
     ORDER_CANCELLED: 'order_cancelled',
     ORDER_FAILED: 'order_failed',
@@ -185,6 +186,32 @@ export const EVENT_TYPES = {
  * @property {number} availableMargin
  * @property {PositionSnapshot[]} positions
  * @property {Object[]} openOrders
+ */
+
+/**
+ * @typedef {Object} PositionClosedPayload
+ * @property {string} subAccountId
+ * @property {string} positionId
+ * @property {string} symbol
+ * @property {string} side
+ * @property {number} realizedPnl
+ * @property {number} closePrice
+ * @property {boolean} [staleCleanup]
+ * @property {string} [originType]
+ * @property {string} [reason]
+ */
+
+/**
+ * @typedef {Object} PositionReducedPayload
+ * @property {string} subAccountId
+ * @property {string} positionId
+ * @property {string} symbol
+ * @property {number} closedQty
+ * @property {number} remainingQty
+ * @property {number} realizedPnl
+ * @property {number} [liquidationPrice]
+ * @property {string} [originType]
+ * @property {string} [reason]
  */
 
 // ── Mapping Helpers ─────────────────────────────────────────

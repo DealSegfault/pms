@@ -15,6 +15,57 @@ body {
     -webkit-font-smoothing: antialiased;
 }
 
+/* ═══════════════════════════════════════════
+   TABULAR NUMS — equal-width digits for all
+   dynamic numbers (prices, PnL, counters,
+   percentages, timers, live data, etc.)
+   ═══════════════════════════════════════════ */
+.tabular-nums,
+.price-big,
+.stat-value,
+.position-pnl,
+.position-detail-value,
+.trade-preview-row .value,
+.data-table td,
+.symbol-price,
+.symbol-bar-price,
+.sym-stat-value,
+.spread-display,
+.ob-row,
+.ob-mid,
+.measure-label,
+.chart-left-annotation-label,
+.acct-info-row span:last-child,
+.form-account,
+.leverage-value,
+.leverage-inline span,
+.leverage-presets button,
+.leverage-presets-mini button,
+.input-group input,
+.input-group-mini input,
+.prev-row span:last-child,
+.form-balance span:last-child,
+.tape-row,
+.oo-row,
+.compact-pos-row,
+.cpr-lev,
+.scanner-stat-value,
+.engine-row,
+.engine-signals,
+.event-log,
+.event-time,
+.idx-composite-price,
+.idx-weight-chip,
+.idx-top-pick-medal,
+.idx-top-pick-metrics span,
+.bot-field input,
+.pnl-positive,
+.pnl-negative,
+.pnl-neutral,
+.badge {
+    font-variant-numeric: tabular-nums;
+}
+
 #app {
     height: 100%;
     display: flex;
@@ -1672,6 +1723,116 @@ body {
     font-weight: 500;
     color: var(--text-muted);
     opacity: 0.85;
+}
+
+/* ── Orderbook Tab System ─────────── */
+.ob-tabs {
+    display: flex;
+    gap: 2px;
+}
+
+.ob-tab {
+    padding: 2px 8px;
+    font-family: var(--font);
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-muted);
+    background: transparent;
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    transition: all 0.15s;
+}
+
+.ob-tab:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.ob-tab.active {
+    color: var(--accent);
+    background: rgba(99, 102, 241, 0.1);
+}
+
+.ob-book-view {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.ob-impact-view {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 0;
+}
+
+/* ── Spread Impact Table ──────────── */
+.si-header {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    padding: 6px 10px;
+    font-size: 10px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
+.si-header span:nth-child(2),
+.si-header span:nth-child(3) {
+    text-align: right;
+}
+
+.si-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    padding: 6px 10px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 20px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+    transition: background 0.1s;
+}
+
+.si-row:hover {
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.si-size {
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.si-slip {
+    text-align: right;
+    font-weight: 500;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.si-slip-green {
+    color: var(--green);
+}
+
+.si-slip-yellow {
+    color: #eab308;
+}
+
+.si-slip-red {
+    color: var(--red);
+}
+
+.si-slip-muted {
+    color: var(--text-muted);
+    opacity: 0.5;
 }
 
 /* ── Order Form Panel ───────────────── */

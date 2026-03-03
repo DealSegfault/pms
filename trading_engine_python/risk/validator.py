@@ -94,33 +94,57 @@ class TradeValidator:
 
         # ── 5-7. Position-aware checks ──
         positions = list(entry["positions"].values())
-        opposite_side = "SHORT" if side == "LONG" else "LONG"
+        current_pos = self._book.find_symbol_position(sub_account_id, symbol)
 
-        # Find opposite position for flip detection
-        opposite_pos = None
-        opposite_notional = 0.0
-        opposite_pnl = 0.0
-        for p in positions:
-            if p.symbol == symbol and p.side == opposite_side:
-                opposite_pos = p
-                opposite_notional = p.notional
-                opposite_pnl = compute_pnl(opposite_side, p.entry_price, price, p.quantity)
-                break
-
-        # Total exposure check
-        current_exposure = sum(p.notional for p in positions) - opposite_notional
-        max_exposure = rules.get("max_total_exposure", DEFAULT_RULES["max_total_exposure"])
-        if current_exposure + notional > max_exposure:
-            errors.append(f"MAX_EXPOSURE:{current_exposure + notional:.2f}>{max_exposure}")
-
-        # Compute total unrealized PnL using current prices
-        total_upnl = 0.0
-        for p in positions:
+        other_positions = [p for p in positions if p is not current_pos]
+        base_notional = sum(p.notional for p in other_positions)
+        base_margin_used = sum(p.margin for p in other_positions)
+        base_upnl = 0.0
+        for p in other_positions:
             p_l1 = self._market_data.get_l1(p.symbol) if self._market_data else None
             mark = p_l1["mid"] if p_l1 else p.entry_price
-            total_upnl += compute_pnl(p.side, p.entry_price, mark, p.quantity)
+            base_upnl += compute_pnl(p.side, p.entry_price, mark, p.quantity)
 
-        total_notional = sum(p.notional for p in positions)
+        resulting_symbol_notional = notional
+        resulting_symbol_margin = required_margin
+        resulting_symbol_upnl = 0.0
+        current_symbol_margin = current_pos.margin if current_pos else 0.0
+
+        if current_pos:
+            if current_pos.side == side:
+                total_qty = current_pos.quantity + quantity
+                avg_entry = (
+                    (current_pos.entry_price * current_pos.quantity) + (price * quantity)
+                ) / total_qty
+                resulting_symbol_notional = total_qty * avg_entry
+                resulting_symbol_margin = resulting_symbol_notional / leverage if leverage > 0 else resulting_symbol_notional
+                resulting_symbol_upnl = compute_pnl(side, avg_entry, price, total_qty)
+            elif quantity < current_pos.quantity:
+                remaining_qty = current_pos.quantity - quantity
+                resulting_symbol_notional = remaining_qty * current_pos.entry_price
+                resulting_symbol_margin = current_pos.margin * (remaining_qty / current_pos.quantity)
+                resulting_symbol_upnl = compute_pnl(
+                    current_pos.side, current_pos.entry_price, price, remaining_qty
+                )
+            elif quantity == current_pos.quantity:
+                resulting_symbol_notional = 0.0
+                resulting_symbol_margin = 0.0
+                resulting_symbol_upnl = 0.0
+            else:
+                remainder = quantity - current_pos.quantity
+                resulting_symbol_notional = remainder * price
+                resulting_symbol_margin = resulting_symbol_notional / leverage if leverage > 0 else resulting_symbol_notional
+                resulting_symbol_upnl = 0.0
+
+        # Total exposure check
+        current_exposure = base_notional
+        max_exposure = rules.get("max_total_exposure", DEFAULT_RULES["max_total_exposure"])
+        post_trade_exposure = base_notional + resulting_symbol_notional
+        if post_trade_exposure > max_exposure:
+            errors.append(f"MAX_EXPOSURE:{post_trade_exposure:.2f}>{max_exposure}")
+
+        total_upnl = base_upnl + resulting_symbol_upnl
+        total_notional = post_trade_exposure
         balance = account.get("currentBalance", 0)
         maintenance_rate = account.get("maintenanceRate", 0.005)
 
@@ -129,25 +153,21 @@ class TradeValidator:
             maintenance_rate=maintenance_rate,
             total_upnl=total_upnl,
             total_notional=total_notional,
-            opposite_notional=opposite_notional,
-            opposite_pnl=opposite_pnl,
         )
 
+        additional_margin = max(0.0, resulting_symbol_margin - current_symbol_margin)
+
         # ── 6. Margin check ──
-        if required_margin > margin_info["available_margin"]:
+        if additional_margin > margin_info["available_margin"]:
             errors.append(
-                f"INSUFFICIENT_MARGIN:{required_margin:.2f}>{margin_info['available_margin']:.2f}"
+                f"INSUFFICIENT_MARGIN:{additional_margin:.2f}>{margin_info['available_margin']:.2f}"
             )
 
         # ── 7. Margin usage ratio ──
-        current_margin_used = sum(
-            p.margin for p in positions
-            if not (p.symbol == symbol and p.side == opposite_side)
-        )
         usage_ratio = compute_margin_usage_ratio(
             equity=margin_info["equity"],
-            current_margin_used=current_margin_used,
-            new_margin=required_margin,
+            current_margin_used=base_margin_used,
+            new_margin=resulting_symbol_margin,
         )
         if usage_ratio >= 0.98:
             errors.append(f"MARGIN_RATIO_EXCEEDED:{usage_ratio:.3f}>=0.98")
@@ -158,7 +178,7 @@ class TradeValidator:
             "computed_values": {
                 "price": price,
                 "notional": notional,
-                "required_margin": required_margin,
+                "required_margin": additional_margin,
                 "available_margin": margin_info["available_margin"],
                 "current_exposure": current_exposure,
                 "equity": margin_info["equity"],

@@ -26,7 +26,7 @@ from typing import Callable, Optional, Any
 # Valid state transitions (current_state → set of allowed next states)
 VALID_TRANSITIONS = {
     "idle":       {"placing"},
-    "placing":    {"active", "filled", "cancelled", "failed"},
+    "placing":    {"active", "cancelling", "filled", "cancelled", "failed"},
     "active":     {"cancelling", "filled", "cancelled", "expired"},
     "cancelling": {"cancelled", "filled", "expired"},
     # Terminal states — no transitions out

@@ -137,28 +137,37 @@ class LiquidationEngine:
 
         for pos in positions:
             close_qty = pos.quantity * close_fraction
-            close_side = "SELL" if pos.side == "LONG" else "BUY"
 
             try:
-                order = await self._order_manager.place_market_order(
-                    sub_account_id=sub_account_id,
-                    symbol=pos.symbol,
-                    side=close_side,
-                    quantity=close_qty,
-                    reduce_only=True,
+                close_result = await self._order_manager.close_virtual_position(
+                    position=pos,
+                    requested_qty=close_qty,
                     origin="LIQUIDATION",
                     parent_id=pos.id,
+                    cleanup_if_unexecutable=close_fraction >= 1.0,
                 )
+                order = close_result.get("order")
                 results.append({
                     "position_id": pos.id,
-                    "close_quantity": close_qty,
+                    "requested_quantity": close_qty,
+                    "close_quantity": close_result.get("close_qty", 0.0),
+                    "exchange_quantity": close_result.get("exchange_qty", 0.0),
                     "tier": tier,
-                    "order_id": order.client_order_id,
+                    "order_id": order.client_order_id if order else None,
+                    "reason": close_result.get("reason", ""),
+                    "cleaned_up": close_result.get("cleaned_up", False),
                 })
-                logger.warning(
-                    "Liquidation order placed: pos=%s qty=%.6f tier=%s",
-                    pos.id, close_qty, tier,
-                )
+                if close_result.get("placed"):
+                    logger.warning(
+                        "Liquidation order placed: pos=%s qty=%.6f tier=%s",
+                        pos.id, close_result.get("close_qty", 0.0), tier,
+                    )
+                else:
+                    logger.warning(
+                        "Liquidation close skipped: pos=%s tier=%s reason=%s requested=%.6f exchange=%.6f",
+                        pos.id, tier, close_result.get("reason", ""),
+                        close_qty, close_result.get("exchange_qty", 0.0),
+                    )
             except Exception as e:
                 logger.error("Liquidation order FAILED: pos=%s — %s", pos.id, e)
                 results.append({

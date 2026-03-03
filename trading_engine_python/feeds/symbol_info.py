@@ -144,6 +144,20 @@ class SymbolInfoCache:
         result = max(spec.min_qty, min(result, spec.max_qty))
         return result
 
+    def truncate_quantity(self, symbol: str, qty: float, is_market: bool = False) -> float:
+        """Truncate quantity to exchange precision without forcing minQty upward."""
+        spec = self._specs.get(self._norm_key(symbol))
+        if not spec:
+            return max(0.0, qty)
+        precision = spec.market_qty_precision if is_market else spec.qty_precision
+        result = _truncate(max(0.0, qty), precision)
+        return min(result, spec.max_qty)
+
+    def get_min_qty(self, symbol: str) -> float:
+        """Get minimum tradable quantity for a symbol."""
+        spec = self._specs.get(self._norm_key(symbol))
+        return spec.min_qty if spec else 0.0
+
     def get_min_notional(self, symbol: str) -> float:
         """Get minimum notional for a symbol."""
         spec = self._specs.get(self._norm_key(symbol))

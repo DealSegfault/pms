@@ -13,7 +13,7 @@
  *   await startPythonEngine();   // in server start()
  *   await stopPythonEngine();    // in gracefulShutdown()
  */
-import { spawn } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -25,6 +25,8 @@ let shouldRestart = true;
 let restartAttempt = 0;
 let restartTimer = null;
 const MAX_BACKOFF = 30_000;  // 30s max between restarts
+const NON_RESTARTABLE_EXIT_CODES = new Set([78]);  // Fatal startup/config errors
+const PYTHON_MAIN_MARKER = 'trading_engine_python.main';
 
 function getBackoffMs() {
     // 1s, 2s, 4s, 8s, 16s, 30s, 30s, ...
@@ -42,6 +44,7 @@ export async function startPythonEngine() {
 
     shouldRestart = true;
     restartAttempt = 0;
+    await terminateOrphanPythonEngines();
     _spawn();
 }
 
@@ -57,6 +60,7 @@ export async function stopPythonEngine() {
     }
 
     if (!pythonProcess) {
+        await terminateOrphanPythonEngines();
         return;
     }
 
@@ -88,7 +92,76 @@ export async function stopPythonEngine() {
             clearTimeout(killTimer);
             resolve();
         }
+    }).finally(async () => {
+        await terminateOrphanPythonEngines();
     });
+}
+
+function listPythonEnginePids() {
+    try {
+        const output = execSync('ps -Ao pid=,command=', {
+            cwd: PROJECT_ROOT,
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+        });
+
+        return output
+            .split('\n')
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .map((line) => {
+                const match = line.match(/^(\d+)\s+(.+)$/);
+                if (!match) return null;
+                return { pid: Number(match[1]), command: match[2] };
+            })
+            .filter((row) => row && row.pid && row.command.includes(PYTHON_MAIN_MARKER))
+            .filter((row) => row.pid !== process.pid)
+            .map((row) => row.pid);
+    } catch {
+        return [];
+    }
+}
+
+function isPidAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function terminateOrphanPythonEngines(extraSkipPids = []) {
+    const skipPids = new Set(extraSkipPids.filter(Boolean));
+    if (pythonProcess?.pid) {
+        skipPids.add(pythonProcess.pid);
+    }
+
+    const stalePids = listPythonEnginePids().filter((pid) => !skipPids.has(pid));
+    if (stalePids.length === 0) {
+        return;
+    }
+
+    console.warn('[PythonEngine] Killing stale Python engine PID(s): %s', stalePids.join(', '));
+    for (const pid of stalePids) {
+        try {
+            process.kill(pid, 'SIGTERM');
+        } catch {
+            // Process may have already exited.
+        }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    for (const pid of stalePids) {
+        if (!isPidAlive(pid)) continue;
+        try {
+            process.kill(pid, 'SIGKILL');
+            console.warn('[PythonEngine] Force-killed stale Python engine pid=%d', pid);
+        } catch {
+            // Already gone.
+        }
+    }
 }
 
 /**
@@ -141,6 +214,13 @@ function _spawn() {
         if (code === 0) {
             console.log('[PythonEngine] Exited cleanly');
             restartAttempt = 0;
+        } else if (NON_RESTARTABLE_EXIT_CODES.has(code)) {
+            shouldRestart = false;
+            restartAttempt = 0;
+            console.error(
+                '[PythonEngine] Fatal startup/config error (code=%s). Auto-restart disabled until manual restart.',
+                code,
+            );
         } else {
             console.warn('[PythonEngine] Exited (code=%s, signal=%s)', code, signal);
         }

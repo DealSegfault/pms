@@ -718,6 +718,8 @@ class PositionClosedEvent:
     realized_pnl: float = 0.0
     close_price: float = 0.0
     stale_cleanup: bool = False
+    origin_type: Optional[str] = None
+    reason: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = {
@@ -732,6 +734,10 @@ class PositionClosedEvent:
         }
         if self.stale_cleanup:
             d["staleCleanup"] = True
+        if self.origin_type:
+            d["originType"] = self.origin_type
+        if self.reason:
+            d["reason"] = self.reason
         return d
 
 
@@ -744,9 +750,11 @@ class PositionReducedEvent:
     closed_qty: float = 0.0
     remaining_qty: float = 0.0
     realized_pnl: float = 0.0
+    origin_type: Optional[str] = None
+    reason: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "type": EventType.POSITION_REDUCED,
             "subAccountId": self.sub_account_id,
             "positionId": self.position_id,
@@ -756,6 +764,11 @@ class PositionReducedEvent:
             "realizedPnl": self.realized_pnl,
             "timestamp": ts_ms(),
         }
+        if self.origin_type:
+            d["originType"] = self.origin_type
+        if self.reason:
+            d["reason"] = self.reason
+        return d
 
 
 @dataclass

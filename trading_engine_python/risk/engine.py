@@ -16,8 +16,10 @@ import asyncio
 from datetime import datetime
 import json
 import logging
+import math
 import time
 import uuid
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from .math import (
@@ -32,6 +34,7 @@ from .validator import TradeValidator
 from .liquidation import LiquidationEngine
 
 logger = logging.getLogger(__name__)
+RECENT_FILL_TTL_SEC = 10.0
 
 
 def _db_timestamp_to_seconds(value: Any) -> Optional[float]:
@@ -91,11 +94,439 @@ class RiskEngine:
         self._last_snapshot_ts: Dict[str, float] = {}
         # Guard against concurrent liquidation tasks per account (#13)
         self._liquidating: set = set()
+        # Server-scoped sub-account IDs (None = all, set = only these)
+        self._managed_accounts: Optional[set] = None
+        # Track which sub-account had recent PMS activity per symbol.
+        # Used by on_account_update so manual exchange activity does not mutate
+        # virtual positions unless there is evidence the update belongs to PMS.
+        self._recent_fill_accounts: Dict[str, tuple[str, float]] = {}  # "BTCUSDT" → (sub_id, ts)
+
+    def set_managed_accounts(self, sub_ids: set) -> None:
+        """Set the sub-account IDs this server manages.
+
+        When set, on_account_update will only reconcile positions
+        for these sub-accounts, preventing cross-server pollution.
+        """
+        self._managed_accounts = sub_ids
+        logger.info("RiskEngine: managing %d sub-accounts", len(sub_ids))
 
     def set_order_manager(self, om: Any) -> None:
         """Wire up OrderManager for liquidation execution."""
         self._om = om
         self._liquidation.set_order_manager(om)
+
+    def _remember_recent_fill_account(self, symbol: str, sub_id: str) -> None:
+        """Record recent PMS ownership evidence for ACCOUNT_UPDATE routing."""
+        self._recent_fill_accounts[self._symbol_key(symbol)] = (sub_id, time.time())
+
+    def _get_recent_fill_hint(self, symbol: str) -> Optional[str]:
+        """Return a fresh PMS ownership hint for the symbol, if any."""
+        symbol_key = self._symbol_key(symbol)
+        hint = self._recent_fill_accounts.get(symbol_key)
+        if not hint:
+            return None
+        sub_id, ts = hint
+        if time.time() - ts > RECENT_FILL_TTL_SEC:
+            self._recent_fill_accounts.pop(symbol_key, None)
+            return None
+        return sub_id
+
+    def _get_active_order_accounts(self, symbol: str) -> set[str]:
+        """Return managed sub-accounts with live PMS orders on the symbol."""
+        om = getattr(self, "_om", None)
+        if not om:
+            return set()
+        try:
+            orders = om.get_active_orders(symbol=symbol)
+        except Exception:
+            try:
+                orders = om.get_active_orders()
+            except Exception:
+                return set()
+
+        accounts = set()
+        target_key = self._symbol_key(symbol)
+        for order in orders:
+            sub_id = getattr(order, "sub_account_id", "")
+            if not sub_id:
+                continue
+            if self._managed_accounts is not None and sub_id not in self._managed_accounts:
+                continue
+            order_symbol = getattr(order, "symbol", "")
+            if order_symbol and self._symbol_key(order_symbol) != target_key:
+                continue
+            accounts.add(sub_id)
+        return accounts
+
+    def _get_managed_symbol_positions(self, symbol: str) -> list[VirtualPos]:
+        """Return all managed virtual positions for a symbol across sub-accounts."""
+        positions: list[VirtualPos] = []
+        for sub_id in list(self._book._entries.keys()):
+            if self._managed_accounts is not None and sub_id not in self._managed_accounts:
+                continue
+            pos = self._book.find_symbol_position(sub_id, symbol)
+            if pos:
+                positions.append(pos)
+        return positions
+
+    async def ensure_position_from_snapshot(
+        self,
+        sub_account_id: str,
+        position_id: Optional[str] = None,
+        symbol: Optional[str] = None,
+    ) -> Optional[VirtualPos]:
+        """Rehydrate a live position from the Redis risk snapshot if the book missed it."""
+        if position_id:
+            existing = self._book.get_position(sub_account_id, position_id)
+            if existing:
+                return existing
+        if symbol:
+            existing = self._book.find_symbol_position(sub_account_id, symbol)
+            if existing:
+                return existing
+        if not self._redis:
+            return None
+
+        try:
+            raw = await self._redis.get(f"pms:risk:{sub_account_id}")
+        except Exception as e:
+            logger.error("Failed to load risk snapshot for %s: %s", sub_account_id[:8], e)
+            return None
+        if not raw:
+            return None
+
+        try:
+            snapshot = json.loads(raw)
+        except Exception as e:
+            logger.error("Invalid risk snapshot for %s: %s", sub_account_id[:8], e)
+            return None
+
+        positions = snapshot.get("positions") or []
+        target = None
+        for pos in positions:
+            if position_id and (pos.get("id") == position_id or pos.get("positionId") == position_id):
+                target = pos
+                break
+            if symbol and self._symbol_key(pos.get("symbol", "")) == self._symbol_key(symbol):
+                target = pos
+                break
+        if not target:
+            return None
+
+        account = self._book.get_account(sub_account_id) or {
+            "id": sub_account_id,
+            "currentBalance": float(snapshot.get("balance", 0) or 0),
+            "maintenanceRate": 0.005,
+            "status": "ACTIVE",
+        }
+        pos_id = target.get("id") or target.get("positionId")
+        if not pos_id:
+            return None
+
+        hydrated = VirtualPos(
+            id=pos_id,
+            sub_account_id=sub_account_id,
+            symbol=target.get("symbol", symbol or ""),
+            side=target.get("side", ""),
+            entry_price=float(target.get("entryPrice", 0) or 0),
+            quantity=float(target.get("quantity", 0) or 0),
+            notional=float(target.get("notional", 0) or 0),
+            leverage=int(target.get("leverage", 1) or 1),
+            margin=float(target.get("margin", 0) or 0),
+            liquidation_price=float(target.get("liquidationPrice", 0) or 0),
+            opened_at=target.get("openedAt"),
+            mark_price=float(target.get("markPrice", 0) or 0),
+            unrealized_pnl=float(target.get("unrealizedPnl", 0) or 0),
+        )
+
+        try:
+            self._book.add(hydrated, account)
+        except RuntimeError:
+            return self._book.get_position(sub_account_id, pos_id) or (
+                self._book.find_symbol_position(sub_account_id, hydrated.symbol)
+            )
+
+        logger.warning(
+            "Hydrated missing live position from risk snapshot: %s %s %s qty=%.6f",
+            sub_account_id[:8],
+            hydrated.symbol,
+            hydrated.side,
+            hydrated.quantity,
+        )
+        return hydrated
+
+    @staticmethod
+    def _symbol_key(symbol: str) -> str:
+        return PositionBook._extract_base(symbol).upper()
+
+    def _get_reference_price(
+        self,
+        symbol: str,
+        exchange_entry_price: float,
+        positions: list[VirtualPos],
+    ) -> float:
+        """Pick a common symbol price to compare actual backing vs virtual exposure."""
+        mid = self._market_data.get_mid_price(symbol) if self._market_data else None
+        if mid and mid > 0:
+            return mid
+        if self._market_data:
+            for pos in positions:
+                mid = self._market_data.get_mid_price(pos.symbol)
+                if mid and mid > 0:
+                    return mid
+        if exchange_entry_price and exchange_entry_price > 0:
+            return exchange_entry_price
+        for pos in positions:
+            if pos.mark_price and pos.mark_price > 0:
+                return pos.mark_price
+        for pos in positions:
+            if pos.entry_price and pos.entry_price > 0:
+                return pos.entry_price
+        return 0.0
+
+    def _get_symbol_min_notional(self, symbol: str) -> float:
+        """Resolve the minimum deleverage step for a symbol."""
+        om = getattr(self, "_om", None)
+        symbol_info = getattr(om, "_symbol_info", None) if om else None
+        if symbol_info:
+            try:
+                return max(5.0, float(symbol_info.get_min_notional(symbol)))
+            except Exception:
+                pass
+        return 5.0
+
+    @staticmethod
+    def _build_virtual_adl_order(pos: VirtualPos, close_qty: float, fill_price: float) -> Any:
+        """Synthetic order used to persist/admin-log virtual-only exchange ADL."""
+        side = "SELL" if pos.side == "LONG" else "BUY"
+        ts = int(time.time() * 1000)
+        return SimpleNamespace(
+            sub_account_id=pos.sub_account_id,
+            symbol=pos.symbol,
+            side=side,
+            order_type="MARKET",
+            filled_qty=close_qty,
+            avg_fill_price=fill_price,
+            exchange_order_id="",
+            client_order_id=f"SYSADL_{pos.sub_account_id[:8]}_{ts}",
+            origin="EXCHANGE_ADL",
+            reduce_only=True,
+            leverage=pos.leverage,
+        )
+
+    @staticmethod
+    def _position_event_meta(order: Any) -> dict:
+        """Optional metadata carried on position WS events."""
+        origin = getattr(order, "origin", "")
+        reason = getattr(order, "reason", "")
+        payload = {}
+        if origin:
+            payload["originType"] = origin
+        if reason:
+            payload["reason"] = reason
+        return payload
+
+    def _plan_proportional_adl(
+        self,
+        positions: list[VirtualPos],
+        target_notional: float,
+        reference_price: float,
+        increment: float,
+    ) -> dict[str, float]:
+        """Allocate a symbol-level deleverage target across positions proportionally."""
+        if target_notional <= 0 or reference_price <= 0 or increment <= 0:
+            return {}
+
+        capacities = {
+            pos.id: max(0.0, pos.quantity * reference_price)
+            for pos in positions
+        }
+        total_capacity = sum(capacities.values())
+        if total_capacity <= 0:
+            return {}
+
+        rounded_target = min(total_capacity, math.ceil(target_notional / increment) * increment)
+        raw_shares = {
+            pos.id: rounded_target * capacities[pos.id] / total_capacity
+            for pos in positions
+        }
+        allocations = {
+            pos.id: min(
+                capacities[pos.id],
+                math.floor(raw_shares[pos.id] / increment) * increment if capacities[pos.id] >= increment else 0.0,
+            )
+            for pos in positions
+        }
+        allocated = sum(allocations.values())
+        remaining = max(0.0, rounded_target - allocated)
+
+        while remaining >= increment - 1e-9:
+            candidates = [
+                pos for pos in positions
+                if capacities[pos.id] - allocations[pos.id] >= increment - 1e-9
+            ]
+            if not candidates:
+                break
+            candidates.sort(
+                key=lambda pos: (
+                    raw_shares[pos.id] - allocations[pos.id],
+                    capacities[pos.id] - allocations[pos.id],
+                    capacities[pos.id],
+                ),
+                reverse=True,
+            )
+            chosen = candidates[0]
+            allocations[chosen.id] += increment
+            remaining = max(0.0, rounded_target - sum(allocations.values()))
+
+        if remaining > 1e-9:
+            candidates = [
+                pos for pos in positions
+                if capacities[pos.id] - allocations[pos.id] > 1e-9
+            ]
+            if candidates:
+                candidates.sort(
+                    key=lambda pos: (
+                        capacities[pos.id] - allocations[pos.id],
+                        capacities[pos.id],
+                    ),
+                    reverse=True,
+                )
+                chosen = candidates[0]
+                free = capacities[chosen.id] - allocations[chosen.id]
+                step = increment if free >= increment - 1e-9 else free
+                allocations[chosen.id] = min(capacities[chosen.id], allocations[chosen.id] + step)
+
+        return {
+            pos_id: notional
+            for pos_id, notional in allocations.items()
+            if notional > 1e-9
+        }
+
+    async def _apply_virtual_exchange_adl(
+        self,
+        pos: VirtualPos,
+        close_qty: float,
+        fill_price: float,
+        reason: str,
+    ) -> None:
+        """Virtually reduce a position because exchange backing disappeared externally."""
+        close_qty = min(max(close_qty, 0.0), pos.quantity)
+        if close_qty <= 1e-12:
+            return
+
+        logger.warning(
+            "EXTERNAL BACKING ADL: %s %s %s qty=%.6f reason=%s",
+            pos.sub_account_id[:8],
+            pos.symbol,
+            pos.side,
+            close_qty,
+            reason,
+        )
+        order = self._build_virtual_adl_order(pos, close_qty, fill_price)
+        order.reason = reason
+        await self._close_position(
+            pos,
+            fill_price,
+            close_qty,
+            order,
+        )
+
+    async def _apply_external_backing_guard(
+        self,
+        symbol: str,
+        exchange_qty: float,
+        entry_price: float,
+    ) -> bool:
+        """Deleverage virtual positions only when exchange backing falls below them."""
+        positions = self._get_managed_symbol_positions(symbol)
+        if not positions:
+            return False
+
+        reference_price = self._get_reference_price(symbol, entry_price, positions)
+        if reference_price <= 0:
+            logger.debug("Skipping external backing guard for %s: no reference price", symbol)
+            return False
+
+        actual_side = None
+        if exchange_qty > 0:
+            actual_side = "LONG"
+        elif exchange_qty < 0:
+            actual_side = "SHORT"
+
+        unsupported = [pos for pos in positions if actual_side is None or pos.side != actual_side]
+        for pos in sorted(unsupported, key=lambda p: p.quantity * reference_price, reverse=True):
+            await self._apply_virtual_exchange_adl(
+                pos,
+                pos.quantity,
+                reference_price,
+                reason="UNBACKED_SIDE",
+            )
+
+        if actual_side is None:
+            return bool(unsupported)
+
+        supported = [
+            pos for pos in self._get_managed_symbol_positions(symbol)
+            if pos.side == actual_side
+        ]
+        if not supported:
+            return bool(unsupported)
+
+        actual_abs_qty = abs(exchange_qty)
+        total_supported_qty = sum(pos.quantity for pos in supported)
+        if actual_abs_qty >= total_supported_qty - 1e-12:
+            return bool(unsupported)
+
+        shortage_qty = total_supported_qty - actual_abs_qty
+        shortage_notional = shortage_qty * reference_price
+        increment = self._get_symbol_min_notional(symbol)
+        plan = self._plan_proportional_adl(supported, shortage_notional, reference_price, increment)
+
+        if not plan:
+            return bool(unsupported)
+
+        for pos in sorted(supported, key=lambda p: p.quantity * reference_price, reverse=True):
+            close_notional = plan.get(pos.id, 0.0)
+            if close_notional <= 1e-9:
+                continue
+            close_qty = min(pos.quantity, close_notional / reference_price)
+            await self._apply_virtual_exchange_adl(
+                pos,
+                close_qty,
+                reference_price,
+                reason="BACKING_SHORTAGE",
+            )
+
+        return True
+
+    async def reconcile_exchange_snapshot(self, positions: list[dict]) -> dict:
+        """Apply the external backing guard from a full exchange snapshot."""
+        snapshot = {
+            self._symbol_key(p.get("symbol", "")): p
+            for p in positions
+            if p.get("symbol", "")
+        }
+        symbols = set(snapshot.keys())
+        for sub_id in list(self._book._entries.keys()):
+            if self._managed_accounts is not None and sub_id not in self._managed_accounts:
+                continue
+            for pos in self._book.get_by_sub_account(sub_id):
+                symbols.add(self._symbol_key(pos.symbol))
+
+        adjusted = 0
+        for symbol_key in symbols:
+            pos_data = snapshot.get(symbol_key, {})
+            managed_positions = self._get_managed_symbol_positions(pos_data.get("symbol", symbol_key))
+            symbol = managed_positions[0].symbol if managed_positions else pos_data.get("symbol", symbol_key)
+            changed = await self._apply_external_backing_guard(
+                symbol=symbol,
+                exchange_qty=float(pos_data.get("position_amount", 0) or 0),
+                entry_price=float(pos_data.get("entry_price", 0) or 0),
+            )
+            if changed:
+                adjusted += 1
+        return {"adjusted_symbols": adjusted}
 
     @property
     def position_book(self) -> PositionBook:
@@ -197,30 +628,43 @@ class RiskEngine:
         if fill_qty <= 0 or fill_price <= 0:
             return
 
-        # Determine position side from order side
-        position_side = "LONG" if fill_side == "BUY" else "SHORT"
-        opposite_side = "SHORT" if fill_side == "BUY" else "LONG"
+        # Determine resulting direction from order side.
+        incoming_side = "LONG" if fill_side == "BUY" else "SHORT"
 
-        # Check for existing position on opposite side (close/flip)
-        existing = self._book.find_position(sub_id, symbol, opposite_side)
+        # Track which sub-account had this fill (for on_account_update hints)
+        self._remember_recent_fill_account(symbol, sub_id)
 
-        if existing:
-            # Closing or flipping existing position
-            await self._close_position(existing, fill_price, fill_qty, order)
-        elif getattr(order, 'reduce_only', False):
-            # ── Guard: reduceOnly order should NEVER open a new position ──
-            # This prevents flips when position was already closed by another event
+        existing = self._book.find_symbol_position(sub_id, symbol)
+
+        if not existing:
+            if getattr(order, "reduce_only", False):
+                logger.warning(
+                    "ReduceOnly fill with no matching open position for %s — ignoring (prevents flip)",
+                    symbol,
+                )
+                return
+            await self._open_position(sub_id, symbol, incoming_side, fill_price, fill_qty, order)
+            return
+
+        if existing.side == incoming_side:
+            await self._add_to_position(existing, fill_price, fill_qty, order)
+            return
+
+        close_qty = min(fill_qty, existing.quantity)
+        await self._close_position(existing, fill_price, close_qty, order)
+
+        remainder = fill_qty - close_qty
+        if remainder <= 1e-12:
+            return
+
+        if getattr(order, "reduce_only", False):
             logger.warning(
-                "ReduceOnly fill with no matching %s position for %s — ignoring (prevents flip)",
-                opposite_side, symbol,
+                "ReduceOnly fill exceeded tracked position on %s by %.8f — not opening reverse side",
+                symbol, remainder,
             )
-        else:
-            # Opening new position or adding to existing same-side
-            same_side = self._book.find_position(sub_id, symbol, position_side)
-            if same_side:
-                await self._add_to_position(same_side, fill_price, fill_qty, order)
-            else:
-                await self._open_position(sub_id, symbol, position_side, fill_price, fill_qty, order)
+            return
+
+        await self._open_position(sub_id, symbol, incoming_side, fill_price, remainder, order)
 
     async def _open_position(
         self, sub_id: str, symbol: str, side: str, price: float, qty: float, order: Any
@@ -273,6 +717,7 @@ class RiskEngine:
             "update": snapshot,
             **snapshot,
         })
+        await self._refresh_account_snapshot(sub_id, snapshot)
 
         logger.info("Opened position: %s %s %s qty=%.6f @ %.2f margin=%.2f", pos_id[:8], symbol, side, qty, price, margin)
 
@@ -302,6 +747,7 @@ class RiskEngine:
                 "side": existing.side,
                 "realizedPnl": pnl,
                 "closePrice": fill_price,
+                **self._position_event_meta(order),
             })
             snapshot = self.get_account_snapshot(existing.sub_account_id)
             await self._publish_event("margin_update", {
@@ -309,6 +755,7 @@ class RiskEngine:
                 "update": snapshot,
                 **snapshot,
             })
+            await self._refresh_account_snapshot(existing.sub_account_id, snapshot)
 
             logger.info("Closed position: %s PnL=%.4f", existing.id[:8], pnl)
         else:
@@ -343,6 +790,7 @@ class RiskEngine:
                 "remainingQty": remaining,
                 "realizedPnl": pnl,
                 "liquidationPrice": new_liq,
+                **self._position_event_meta(order),
             })
             snapshot = self.get_account_snapshot(existing.sub_account_id)
             await self._publish_event("margin_update", {
@@ -350,6 +798,7 @@ class RiskEngine:
                 "update": snapshot,
                 **snapshot,
             })
+            await self._refresh_account_snapshot(existing.sub_account_id, snapshot)
 
             logger.info("Partial close: %s qty=%.6f→%.6f PnL=%.4f", existing.id[:8], existing.quantity, remaining, pnl)
 
@@ -374,6 +823,27 @@ class RiskEngine:
         # DB: persist add-to-position (#5)
         if self._db:
             await self._persist_add_to_position(existing, avg_entry, total_qty, new_notional, new_margin, new_liq, fill_price, fill_qty, order)
+
+        await self._publish_event("position_updated", {
+            "subAccountId": existing.sub_account_id,
+            "positionId": existing.id,
+            "symbol": existing.symbol,
+            "side": existing.side,
+            "entryPrice": avg_entry,
+            "quantity": total_qty,
+            "notional": new_notional,
+            "margin": new_margin,
+            "leverage": existing.leverage,
+            "liquidationPrice": new_liq,
+            **self._position_event_meta(order),
+        })
+        snapshot = self.get_account_snapshot(existing.sub_account_id)
+        await self._publish_event("margin_update", {
+            "subAccountId": existing.sub_account_id,
+            "update": snapshot,
+            **snapshot,
+        })
+        await self._refresh_account_snapshot(existing.sub_account_id, snapshot)
 
         logger.info("Added to position: %s qty→%.6f entry→%.2f", existing.id[:8], total_qty, avg_entry)
 
@@ -428,6 +898,11 @@ class RiskEngine:
         data. We use it to reconcile virtual positions — if ORDER_TRADE_UPDATE fills
         were missed (WS glitch, race condition), this corrects the drift.
 
+        IMPORTANT: Only reconciles positions for sub-accounts managed by THIS server,
+        and only when there is recent PMS evidence (fresh PMS fill hint or active PMS
+        order on the symbol). Manual exchange activity without PMS tagging must not
+        mutate virtual positions.
+
         For each position in the update:
           - Exchange has position, we don't → log warning (can't auto-create, no sub-account info)
           - Both have position, quantities differ >1% → update PositionBook to match exchange
@@ -446,89 +921,118 @@ class RiskEngine:
             entry_price = pos_data.get("entry_price", 0)
             exchange_side = "LONG" if exchange_qty > 0 else "SHORT"
             abs_qty = abs(exchange_qty)
+            candidate_positions = self._get_managed_symbol_positions(binance_symbol)
+            candidate_subs = [pos.sub_account_id for pos in candidate_positions]
+            if not candidate_positions:
+                if abs_qty > 0:
+                    logger.debug(
+                        "ACCOUNT_UPDATE: exchange has %s %s qty=%.6f but no matching virtual position",
+                        binance_symbol, exchange_side, abs_qty,
+                    )
+                continue
 
-            # Search all sub-accounts for a matching position
-            # (ACCOUNT_UPDATE doesn't carry sub-account info — it's exchange-level)
-            matched = False
-            for sub_id in list(self._book._entries.keys()):
-                # Try both sides — exchange might have closed one side
-                for side in ("LONG", "SHORT"):
-                    pos = self._book.find_position(sub_id, binance_symbol, side)
-                    if not pos:
-                        continue
-                    matched = True
+            evidence_subs = self._get_active_order_accounts(binance_symbol).intersection(candidate_subs)
+            hint_sub = self._get_recent_fill_hint(binance_symbol)
+            if hint_sub in candidate_subs:
+                evidence_subs.add(hint_sub)
 
-                    if abs_qty == 0:
-                        # Exchange has no position but we do → ghost
-                        logger.warning(
-                            "ACCOUNT_UPDATE RECONCILE: %s %s qty=%.6f is GONE on exchange — force closing",
-                            pos.symbol, pos.side, pos.quantity,
+            if not evidence_subs:
+                await self._apply_external_backing_guard(
+                    symbol=binance_symbol,
+                    exchange_qty=exchange_qty,
+                    entry_price=entry_price,
+                )
+                continue
+
+            if hint_sub in evidence_subs:
+                target_sub = hint_sub
+            elif len(evidence_subs) == 1:
+                target_sub = next(iter(evidence_subs))
+            else:
+                logger.warning(
+                    "ACCOUNT_UPDATE direct reconcile skipped for %s qty=%.6f: ambiguous PMS evidence across sub-accounts %s",
+                    binance_symbol,
+                    abs_qty,
+                    ", ".join(sorted(sub[:8] for sub in evidence_subs)),
+                )
+                await self._apply_external_backing_guard(
+                    symbol=binance_symbol,
+                    exchange_qty=exchange_qty,
+                    entry_price=entry_price,
+                )
+                continue
+
+            pos = self._book.find_symbol_position(target_sub, binance_symbol)
+            if not pos:
+                if abs_qty > 0:
+                    logger.debug(
+                        "ACCOUNT_UPDATE: PMS evidence resolved to %s for %s, but no virtual position exists",
+                        target_sub[:8], binance_symbol,
+                    )
+                continue
+
+            if abs_qty == 0:
+                logger.warning(
+                    "ACCOUNT_UPDATE RECONCILE: %s %s qty=%.6f is GONE on exchange — force closing",
+                    pos.symbol, pos.side, pos.quantity,
+                )
+                await self.force_close_stale_position(pos)
+                continue
+
+            old_qty = pos.quantity
+            old_side = pos.side
+            side_changed = pos.side != exchange_side
+            qty_diff_pct = abs(pos.quantity - abs_qty) / max(pos.quantity, abs_qty, 1e-10) * 100
+
+            if side_changed or qty_diff_pct > 1.0:
+                new_notional = abs_qty * (entry_price if entry_price > 0 else pos.entry_price)
+                new_entry = entry_price if entry_price > 0 else pos.entry_price
+                new_margin = compute_margin(new_notional, pos.leverage)
+                new_liq = compute_liquidation_price(exchange_side, new_entry, abs_qty, new_margin)
+
+                self._book.update_position(
+                    pos.id, pos.sub_account_id,
+                    side=exchange_side,
+                    entry_price=new_entry, quantity=abs_qty,
+                    notional=new_notional, margin=new_margin,
+                    liquidation_price=new_liq,
+                )
+
+                if self._db:
+                    try:
+                        await self._db.execute(
+                            """UPDATE virtual_positions
+                               SET side=?, entry_price=?, quantity=?, notional=?, margin=?, liquidation_price=?
+                               WHERE id=?""",
+                            (exchange_side, new_entry, abs_qty, new_notional, new_margin, new_liq, pos.id),
                         )
-                        await self.force_close_stale_position(pos)
-                        continue
+                    except Exception as e:
+                        logger.error("ACCOUNT_UPDATE DB update failed for %s: %s", pos.id[:8], e)
 
-                    # Only reconcile if exchange side matches
-                    if side != exchange_side:
-                        continue
+                await self._publish_event("position_updated", {
+                    "subAccountId": pos.sub_account_id,
+                    "positionId": pos.id,
+                    "symbol": pos.symbol,
+                    "side": exchange_side,
+                    "entryPrice": new_entry,
+                    "quantity": abs_qty,
+                    "notional": new_notional,
+                    "margin": new_margin,
+                    "leverage": pos.leverage,
+                    "liquidationPrice": new_liq,
+                    "reconciled": True,
+                })
+                snapshot = self.get_account_snapshot(pos.sub_account_id)
+                await self._publish_event("margin_update", {
+                    "subAccountId": pos.sub_account_id,
+                    "update": snapshot,
+                    **snapshot,
+                })
+                await self._refresh_account_snapshot(pos.sub_account_id, snapshot)
 
-                    # Compare quantities
-                    qty_diff_pct = abs(pos.quantity - abs_qty) / max(pos.quantity, abs_qty, 1e-10) * 100
-                    if qty_diff_pct > 1.0:
-                        old_qty = pos.quantity
-                        new_notional = abs_qty * (entry_price if entry_price > 0 else pos.entry_price)
-                        new_entry = entry_price if entry_price > 0 else pos.entry_price
-                        new_margin = compute_margin(new_notional, pos.leverage)
-                        new_liq = compute_liquidation_price(pos.side, new_entry, abs_qty, new_margin)
-
-                        self._book.update_position(
-                            pos.id, pos.sub_account_id,
-                            entry_price=new_entry, quantity=abs_qty,
-                            notional=new_notional, margin=new_margin,
-                            liquidation_price=new_liq,
-                        )
-
-                        # Persist to DB
-                        if self._db:
-                            try:
-                                await self._db.execute(
-                                    """UPDATE virtual_positions
-                                       SET entry_price=?, quantity=?, notional=?, margin=?, liquidation_price=?
-                                       WHERE id=?""",
-                                    (new_entry, abs_qty, new_notional, new_margin, new_liq, pos.id),
-                                )
-                            except Exception as e:
-                                logger.error("ACCOUNT_UPDATE DB update failed for %s: %s", pos.id[:8], e)
-
-                        # Publish correction to frontend
-                        await self._publish_event("position_updated", {
-                            "subAccountId": pos.sub_account_id,
-                            "positionId": pos.id,
-                            "symbol": pos.symbol,
-                            "side": pos.side,
-                            "entryPrice": new_entry,
-                            "quantity": abs_qty,
-                            "notional": new_notional,
-                            "margin": new_margin,
-                            "leverage": pos.leverage,
-                            "liquidationPrice": new_liq,
-                            "reconciled": True,
-                        })
-                        snapshot = self.get_account_snapshot(pos.sub_account_id)
-                        await self._publish_event("margin_update", {
-                            "subAccountId": pos.sub_account_id,
-                            "update": snapshot,
-                            **snapshot,
-                        })
-
-                        logger.warning(
-                            "ACCOUNT_UPDATE RECONCILE: %s %s qty %.6f → %.6f (exchange is source of truth, diff=%.1f%%)",
-                            pos.symbol, pos.side, old_qty, abs_qty, qty_diff_pct,
-                        )
-
-            if not matched and abs_qty > 0:
-                logger.debug(
-                    "ACCOUNT_UPDATE: exchange has %s %s qty=%.6f but no matching virtual position",
-                    binance_symbol, exchange_side, abs_qty,
+                logger.warning(
+                    "ACCOUNT_UPDATE RECONCILE: %s %s qty %.6f → %.6f side=%s (sub=%s, diff=%.1f%%)",
+                    pos.symbol, old_side, old_qty, abs_qty, exchange_side, target_sub[:8], qty_diff_pct,
                 )
 
     # ── Validation ──
@@ -544,8 +1048,8 @@ class RiskEngine:
         if self._db:
             try:
                 await self._db.execute(
-                    "UPDATE virtual_positions SET status='CLOSED', closed_at=?, close_price=?, realized_pnl=0 WHERE id=?",
-                    (int(time.time() * 1000), pos.entry_price, pos.id),
+                    "UPDATE virtual_positions SET status='CLOSED', closed_at=?, realized_pnl=0 WHERE id=?",
+                    (int(time.time() * 1000), pos.id),
                 )
             except Exception as e:
                 logger.error("Failed to DB-close stale position %s: %s", pos.id[:8], e)
@@ -569,11 +1073,7 @@ class RiskEngine:
 
         # Immediately refresh Redis risk snapshot so positions endpoint returns fresh data
         if self._redis:
-            try:
-                key = f"pms:risk:{pos.sub_account_id}"
-                await self._redis.set(key, json.dumps(snapshot), ex=60)
-            except Exception as e:
-                logger.error("Failed to refresh risk snapshot after stale close: %s", e)
+            await self._refresh_account_snapshot(pos.sub_account_id, snapshot)
 
         logger.info("Force-closed stale position: %s %s", pos.id[:8], pos.symbol)
 
@@ -676,6 +1176,37 @@ class RiskEngine:
             except Exception as e:
                 logger.error("Failed to write risk snapshot for %s: %s", sub_id, e)
 
+    async def _refresh_account_snapshot(
+        self,
+        sub_account_id: str,
+        snapshot: Optional[dict] = None,
+    ) -> None:
+        """Immediately refresh one account snapshot after a position mutation."""
+        if not self._redis:
+            return
+
+        payload = snapshot or self.get_account_snapshot(sub_account_id)
+        try:
+            await self._redis.set(f"pms:risk:{sub_account_id}", json.dumps(payload), ex=60)
+            self._last_snapshot_ts[sub_account_id] = time.time()
+        except Exception as e:
+            logger.error("Failed to refresh risk snapshot for %s: %s", sub_account_id, e)
+
+    async def write_all_risk_snapshots(self) -> None:
+        """Publish fresh risk snapshots for all managed accounts."""
+        if not self._redis:
+            return
+
+        for sub_id in list(self._book._entries.keys()):
+            if self._managed_accounts is not None and sub_id not in self._managed_accounts:
+                continue
+            snapshot = self.get_account_snapshot(sub_id)
+            try:
+                await self._redis.set(f"pms:risk:{sub_id}", json.dumps(snapshot), ex=60)
+                self._last_snapshot_ts[sub_id] = time.time()
+            except Exception as e:
+                logger.error("Failed to write startup risk snapshot for %s: %s", sub_id, e)
+
     # ── DB Persistence Helpers (raw SQL via aiosqlite) ──
 
     async def _persist_open_position(self, pos: VirtualPos, order: Any) -> None:
@@ -735,7 +1266,13 @@ class RiskEngine:
             # Trade execution
             trade_id = str(uuid.uuid4())
             side = "SELL" if pos.side == "LONG" else "BUY"
-            action = getattr(order, 'origin', 'MANUAL') if getattr(order, 'origin', '') == 'LIQUIDATION' else 'CLOSE'
+            origin = getattr(order, "origin", "MANUAL")
+            if origin == "LIQUIDATION":
+                action = "LIQUIDATION"
+            elif origin == "EXCHANGE_ADL":
+                action = "ADL"
+            else:
+                action = "CLOSE"
             await self._db.execute(
                 """INSERT INTO trade_executions
                    (id, sub_account_id, position_id, exchange_order_id, client_order_id,
@@ -747,7 +1284,7 @@ class RiskEngine:
                  getattr(order, 'client_order_id', ''),
                  pos.symbol, side, getattr(order, 'order_type', 'MARKET'),
                  close_price, pos.quantity, pos.quantity * close_price, pnl,
-                 action, getattr(order, 'origin', 'MANUAL'), sig, now_ms),
+                 action, origin, sig, now_ms),
             )
 
             # Update balance
@@ -770,7 +1307,7 @@ class RiskEngine:
                         reason, trade_id, timestamp)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (str(uuid.uuid4()), pos.sub_account_id, old_balance, new_balance,
-                     pnl, f"CLOSE:{pos.symbol}:{pos.side}", trade_id, now_ms),
+                     pnl, f"{action}:{pos.symbol}:{pos.side}", trade_id, now_ms),
                 )
         except Exception as e:
             logger.error("Failed to persist close position: %s", e)
@@ -795,18 +1332,20 @@ class RiskEngine:
             # Trade execution record
             trade_id = str(uuid.uuid4())
             side = "SELL" if pos.side == "LONG" else "BUY"
+            origin = getattr(order, "origin", "MANUAL")
+            action = "ADL" if origin == "EXCHANGE_ADL" else "CLOSE"
             await self._db.execute(
                 """INSERT INTO trade_executions
                    (id, sub_account_id, position_id, exchange_order_id, client_order_id,
                     symbol, side, type, price, quantity, notional, fee, realized_pnl,
                     action, origin_type, status, signature, timestamp)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'CLOSE', ?, 'FILLED', ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'FILLED', ?, ?)""",
                 (trade_id, pos.sub_account_id, pos.id,
                  getattr(order, 'exchange_order_id', ''),
                  getattr(order, 'client_order_id', ''),
                  pos.symbol, side, getattr(order, 'order_type', 'MARKET'),
                  fill_price, fill_qty, fill_qty * fill_price, pnl,
-                 getattr(order, 'origin', 'MANUAL'), sig, now_ms),
+                 action, origin, sig, now_ms),
             )
 
             # Update balance
@@ -827,7 +1366,7 @@ class RiskEngine:
                         reason, trade_id, timestamp)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (str(uuid.uuid4()), pos.sub_account_id, old_balance, new_balance,
-                     pnl, f"PARTIAL_CLOSE:{pos.symbol}:{pos.side}", trade_id, now_ms),
+                     pnl, f"{action}:{pos.symbol}:{pos.side}", trade_id, now_ms),
                 )
         except Exception as e:
             logger.error("Failed to persist partial close: %s", e)

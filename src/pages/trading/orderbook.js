@@ -3,13 +3,15 @@ import { formatPrice } from '../../core/index.js';
 import * as S from './state.js';
 import { recordLatency } from './perf-metrics.js';
 
-const ORDERBOOK_ROWS = 12;
+const ORDERBOOK_ROWS = 20;
 const TAPE_ROWS = 30;
+const IMPACT_SIZES = [1, 10, 100, 1_000, 10_000, 100_000];
 
 let orderBookRenderScheduled = false;
 let tradeTapeRenderScheduled = false;
 let pendingOrderBookTickTs = 0;
 let pendingTradeTickTs = 0;
+let activeObView = 'book'; // 'book' | 'impact'
 
 const orderBookDom = {
     asksEl: null,
@@ -24,6 +26,11 @@ const orderBookDom = {
 
 const tapeDom = {
     listEl: null,
+    rows: [],
+};
+
+const impactDom = {
+    rowsEl: null,
     rows: [],
 };
 
@@ -70,6 +77,26 @@ function _createTapeRow() {
     row.appendChild(time);
 
     return { row, price, qty, time };
+}
+
+function _createImpactRow() {
+    const row = document.createElement('div');
+    row.className = 'si-row';
+
+    const size = document.createElement('span');
+    size.className = 'si-size';
+
+    const buySlip = document.createElement('span');
+    buySlip.className = 'si-slip';
+
+    const sellSlip = document.createElement('span');
+    sellSlip.className = 'si-slip';
+
+    row.appendChild(size);
+    row.appendChild(buySlip);
+    row.appendChild(sellSlip);
+
+    return { row, size, buySlip, sellSlip };
 }
 
 function _ensureOrderBookDom() {
@@ -128,6 +155,23 @@ function _ensureTapeDom() {
     return true;
 }
 
+function _ensureImpactDom() {
+    const rowsEl = document.getElementById('si-rows');
+    if (!rowsEl) return false;
+
+    if (impactDom.rowsEl !== rowsEl) {
+        impactDom.rowsEl = rowsEl;
+        impactDom.rows = [];
+        rowsEl.innerHTML = '';
+        for (let i = 0; i < IMPACT_SIZES.length; i += 1) {
+            const refs = _createImpactRow();
+            rowsEl.appendChild(refs.row);
+            impactDom.rows.push(refs);
+        }
+    }
+    return true;
+}
+
 function _updateBookSide(rows, levels, isAsk) {
     let runningTotal = 0;
     const maxQty = Math.max(...levels.map((lvl) => lvl[1]), 0.001);
@@ -155,6 +199,107 @@ function _updateBookSide(rows, levels, isAsk) {
 
         // Keep side-specific row class stable if this row was reused after remount.
         refs.row.className = `ob-row ${isAsk ? 'ob-ask' : 'ob-bid'}`;
+    }
+}
+
+/**
+ * Calculate VWAP slippage for a given notional size walking orderbook levels.
+ * @param {Array<[number,number]>} levels - sorted [price, qty] pairs (best first)
+ * @param {number} targetNotional - target size in USDT
+ * @param {number} mid - mid price
+ * @param {'buy'|'sell'} side
+ * @returns {{ bps: number, sufficient: boolean }}
+ */
+function _calcSlippage(levels, targetNotional, mid, side) {
+    if (!levels.length || mid <= 0) return { bps: 0, sufficient: false };
+
+    let filledNotional = 0;
+    let filledQty = 0;
+
+    for (let i = 0; i < levels.length; i += 1) {
+        const price = levels[i][0];
+        const qty = levels[i][1];
+        const levelNotional = price * qty;
+        const remaining = targetNotional - filledNotional;
+
+        if (levelNotional >= remaining) {
+            const partialQty = remaining / price;
+            filledQty += partialQty;
+            filledNotional += remaining;
+            break;
+        } else {
+            filledQty += qty;
+            filledNotional += levelNotional;
+        }
+    }
+
+    if (filledNotional < targetNotional * 0.99) {
+        return { bps: 0, sufficient: false };
+    }
+
+    const vwap = filledNotional / filledQty;
+    const slip = side === 'buy'
+        ? ((vwap - mid) / mid) * 10000
+        : ((mid - vwap) / mid) * 10000;
+
+    return { bps: Math.max(0, slip), sufficient: true };
+}
+
+function _slipClass(bps) {
+    if (bps < 5) return 'si-slip-green';
+    if (bps < 20) return 'si-slip-yellow';
+    return 'si-slip-red';
+}
+
+function _formatSize(n) {
+    if (n >= 1000) return `$${(n / 1000).toFixed(0)}K`;
+    return `$${n}`;
+}
+
+function _renderSpreadImpactNow() {
+    if (!_ensureImpactDom()) return;
+
+    const asks = S.orderBookAsks;
+    const bids = S.orderBookBids;
+    const bestAsk = asks[0]?.[0] || 0;
+    const bestBid = bids[0]?.[0] || 0;
+    const mid = (bestAsk + bestBid) / 2;
+
+    for (let i = 0; i < IMPACT_SIZES.length; i += 1) {
+        const refs = impactDom.rows[i];
+        const size = IMPACT_SIZES[i];
+
+        refs.size.textContent = _formatSize(size);
+
+        if (mid <= 0) {
+            refs.buySlip.textContent = '—';
+            refs.buySlip.className = 'si-slip';
+            refs.sellSlip.textContent = '—';
+            refs.sellSlip.className = 'si-slip';
+            continue;
+        }
+
+        // Buy side — walk asks
+        const buy = _calcSlippage(asks, size, mid, 'buy');
+        if (buy.sufficient) {
+            const bpsStr = buy.bps.toFixed(1);
+            refs.buySlip.textContent = `${bpsStr} bps`;
+            refs.buySlip.className = `si-slip ${_slipClass(buy.bps)}`;
+        } else {
+            refs.buySlip.textContent = '—';
+            refs.buySlip.className = 'si-slip si-slip-muted';
+        }
+
+        // Sell side — walk bids
+        const sell = _calcSlippage(bids, size, mid, 'sell');
+        if (sell.sufficient) {
+            const bpsStr = sell.bps.toFixed(1);
+            refs.sellSlip.textContent = `${bpsStr} bps`;
+            refs.sellSlip.className = `si-slip ${_slipClass(sell.bps)}`;
+        } else {
+            refs.sellSlip.textContent = '—';
+            refs.sellSlip.className = 'si-slip si-slip-muted';
+        }
     }
 }
 
@@ -243,7 +388,12 @@ export function scheduleOrderBookRender(tickTs = 0) {
     orderBookRenderScheduled = true;
     requestAnimationFrame(() => {
         orderBookRenderScheduled = false;
-        _renderOrderBookNow();
+
+        if (activeObView === 'book') {
+            _renderOrderBookNow();
+        } else {
+            _renderSpreadImpactNow();
+        }
 
         if (pendingOrderBookTickTs) {
             recordLatency('depth_tick_to_paint_ms', Math.max(0, Date.now() - pendingOrderBookTickTs));
@@ -274,4 +424,35 @@ export function renderOrderBook() {
 
 export function renderTradeTape() {
     _renderTradeTapeNow();
+}
+
+/**
+ * Wire up the Book / Spread Impact tab toggle.
+ * Call once after the trading DOM is mounted.
+ */
+export function initOrderBookTabs() {
+    const tabs = document.querySelectorAll('.ob-tab');
+    const bookView = document.getElementById('ob-book-view');
+    const impactView = document.getElementById('ob-impact-view');
+    if (!bookView || !impactView) return;
+
+    tabs.forEach(tab => {
+        tab.addEventListener('click', () => {
+            const view = tab.dataset.obView;
+            if (view === activeObView) return;
+            activeObView = view;
+
+            tabs.forEach(t => t.classList.toggle('active', t === tab));
+
+            if (view === 'book') {
+                bookView.style.display = '';
+                impactView.style.display = 'none';
+                _renderOrderBookNow();
+            } else {
+                bookView.style.display = 'none';
+                impactView.style.display = '';
+                _renderSpreadImpactNow();
+            }
+        });
+    });
 }

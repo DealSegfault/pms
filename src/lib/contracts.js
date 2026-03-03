@@ -20,6 +20,7 @@ export const WS_EVENTS = {
     // Order lifecycle
     ORDER_PLACED: 'order_placed',
     ORDER_ACTIVE: 'order_active',
+    ORDER_PARTIAL: 'order_partial',
     ORDER_FILLED: 'order_filled',
     ORDER_CANCELLED: 'order_cancelled',
     ORDER_FAILED: 'order_failed',
@@ -199,6 +200,21 @@ export const WS_EVENTS = {
  * @property {number} realizedPnl
  * @property {number} closePrice
  * @property {boolean} [staleCleanup]
+ * @property {string} [originType]
+ * @property {string} [reason]
+ */
+
+/**
+ * @typedef {Object} PositionReducedPayload
+ * @property {string} subAccountId
+ * @property {string} positionId
+ * @property {string} symbol
+ * @property {number} closedQty
+ * @property {number} remainingQty
+ * @property {number} realizedPnl
+ * @property {number} [liquidationPrice]
+ * @property {string} [originType]
+ * @property {string} [reason]
  */
 
 /**

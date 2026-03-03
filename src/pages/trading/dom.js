@@ -142,20 +142,33 @@ export function buildTradingHTML() {
         <!-- Order Book -->
         <div class="orderbook-panel tab-trade-item mob-hidden">
           <div class="panel-header">
-            <span>Order Book</span>
+            <div class="ob-tabs">
+              <button class="ob-tab active" data-ob-view="book">Book</button>
+              <button class="ob-tab" data-ob-view="impact">Spread Impact</button>
+            </div>
             <span class="spread-display" id="ob-spread">—</span>
           </div>
-          <div class="ob-header-row">
-            <span>Price(USDT)</span>
-            <span>Qty</span>
-            <span>Total</span>
+          <div class="ob-book-view" id="ob-book-view">
+            <div class="ob-header-row">
+              <span>Price(USDT)</span>
+              <span>Qty</span>
+              <span>Total</span>
+            </div>
+            <div class="ob-asks" id="ob-asks">${cuteSpinner({ mini: true })}</div>
+            <div class="ob-mid" id="ob-mid-price">
+              <span class="ob-mid-value">—</span>
+              <span class="ob-mid-spread" id="ob-mid-spread"></span>
+            </div>
+            <div class="ob-bids" id="ob-bids">${cuteSpinner({ mini: true })}</div>
           </div>
-          <div class="ob-asks" id="ob-asks">${cuteSpinner({ mini: true })}</div>
-          <div class="ob-mid" id="ob-mid-price">
-            <span class="ob-mid-value">—</span>
-            <span class="ob-mid-spread" id="ob-mid-spread"></span>
+          <div class="ob-impact-view" id="ob-impact-view" style="display:none;">
+            <div class="si-header">
+              <span>Size</span>
+              <span>Buy slip</span>
+              <span>Sell slip</span>
+            </div>
+            <div id="si-rows"></div>
           </div>
-          <div class="ob-bids" id="ob-bids">${cuteSpinner({ mini: true })}</div>
         </div>
 
         <!-- Order Form -->

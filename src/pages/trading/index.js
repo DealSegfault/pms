@@ -35,6 +35,7 @@ import {
 import { initWebSockets, teardownStreams, setupAppEventListeners, startCompactPoll, stopCompactPoll } from './ws-handlers.js';
 import { clearTradingRefreshScheduler } from './refresh-scheduler.js';
 import { startPerfMetrics, stopPerfMetrics } from './perf-metrics.js';
+import { initOrderBookTabs } from './orderbook.js';
 
 // ── Render ──────────────────────────────────────
 
@@ -45,6 +46,7 @@ export function renderTradingPage(container) {
     container.innerHTML = buildTradingHTML();
 
     attachEventListeners();
+    initOrderBookTabs();
     setupAppEventListeners();
     startCompactPoll();
     startPerfMetrics();

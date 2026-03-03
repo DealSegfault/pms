@@ -194,7 +194,7 @@ function renderTradesList(trades, reset) {
 
     const actionColors = {
       OPEN: 'var(--accent)', CLOSE: 'var(--text-secondary)',
-      LIQUIDATE: 'var(--red)', ADD: 'var(--yellow)',
+      LIQUIDATE: 'var(--red)', ADD: 'var(--yellow)', ADL: 'var(--orange)',
     };
 
     const pnlHtml = trade.realizedPnl != null

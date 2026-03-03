@@ -248,6 +248,96 @@ def test_liq_trigger():
     tier, ratio, positions = result
     assert "TIER" in tier
 
+@test("order_manager close clamps to exchange qty without hedge positionSide")
+async def test_close_virtual_position_clamps():
+    from trading_engine_python.feeds.symbol_info import SymbolInfoCache, SymbolSpec
+    from trading_engine_python.orders.manager import OrderManager
+    from trading_engine_python.risk.position_book import VirtualPos
+
+    exchange = MagicMock()
+    exchange.create_market_order = AsyncMock(return_value={"orderId": "123"})
+    exchange.get_position_risk = AsyncMock(return_value=[{
+        "symbol": "BTCUSDT",
+        "positionAmt": "0.0034",
+        "positionSide": "LONG",
+        "markPrice": "65000",
+    }])
+
+    cache = SymbolInfoCache()
+    cache._specs["BTCUSDT"] = SymbolSpec(
+        symbol="BTCUSDT",
+        market_step_size=0.001,
+        min_qty=0.001,
+        max_qty=9999999.0,
+        min_notional=5.0,
+        market_qty_precision=3,
+    )
+
+    om = OrderManager(exchange_client=exchange, symbol_info=cache)
+    pos = VirtualPos(
+        id="p1", sub_account_id="s1", symbol="BTCUSDT", side="LONG",
+        entry_price=65000, quantity=0.01, notional=650, leverage=10, margin=65,
+    )
+
+    result = await om.close_virtual_position(pos, requested_qty=0.005, origin="MANUAL")
+    assert result["placed"] is True
+    assert result["reason"] == "PLACED"
+    assert result["close_qty"] == 0.003
+
+    args = exchange.create_market_order.await_args.args
+    kwargs = exchange.create_market_order.await_args.kwargs
+    assert args[0] == "BTCUSDT"
+    assert args[1] == "SELL"
+    assert args[2] == 0.003
+    assert kwargs["reduceOnly"] == "true"
+    assert "positionSide" not in kwargs
+
+@test("order_manager close cleans up full dust position instead of sending invalid reduce-only")
+async def test_close_virtual_position_dust_cleanup():
+    from trading_engine_python.feeds.symbol_info import SymbolInfoCache, SymbolSpec
+    from trading_engine_python.orders.manager import OrderManager
+    from trading_engine_python.risk.position_book import VirtualPos
+
+    exchange = MagicMock()
+    exchange.create_market_order = AsyncMock(return_value={"orderId": "123"})
+    exchange.get_position_risk = AsyncMock(return_value=[{
+        "symbol": "BTCUSDT",
+        "positionAmt": "0.0004",
+        "positionSide": "LONG",
+        "markPrice": "65000",
+    }])
+
+    cache = SymbolInfoCache()
+    cache._specs["BTCUSDT"] = SymbolSpec(
+        symbol="BTCUSDT",
+        market_step_size=0.001,
+        min_qty=0.001,
+        max_qty=9999999.0,
+        min_notional=5.0,
+        market_qty_precision=3,
+    )
+
+    risk = MagicMock()
+    risk.force_close_stale_position = AsyncMock()
+
+    om = OrderManager(exchange_client=exchange, symbol_info=cache, risk_engine=risk)
+    pos = VirtualPos(
+        id="p2", sub_account_id="s1", symbol="BTCUSDT", side="LONG",
+        entry_price=65000, quantity=0.0004, notional=26, leverage=10, margin=2.6,
+    )
+
+    result = await om.close_virtual_position(
+        pos,
+        requested_qty=pos.quantity,
+        origin="MANUAL",
+        cleanup_if_unexecutable=True,
+    )
+    assert result["placed"] is False
+    assert result["cleaned_up"] is True
+    assert result["reason"] == "BELOW_MIN_QTY"
+    exchange.create_market_order.assert_not_awaited()
+    risk.force_close_stale_position.assert_awaited_once_with(pos)
+
 
 # ── 5. RiskEngine position lifecycle ──
 

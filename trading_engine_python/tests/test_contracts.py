@@ -304,12 +304,27 @@ class TestPositionEvents:
                          "notional", "margin", "leverage", "liquidationPrice"])
 
     def test_closed_keys(self):
-        d = PositionClosedEvent(position_id="p1", realized_pnl=100.5).to_dict()
+        d = PositionClosedEvent(
+            position_id="p1",
+            realized_pnl=100.5,
+            origin_type="EXCHANGE_ADL",
+            reason="BACKING_SHORTAGE",
+        ).to_dict()
         _assert_keys(d, ["type", "positionId", "realizedPnl", "closePrice"])
+        assert d["originType"] == "EXCHANGE_ADL"
+        assert d["reason"] == "BACKING_SHORTAGE"
 
     def test_reduced_keys(self):
-        d = PositionReducedEvent(position_id="p1", closed_qty=0.05, remaining_qty=0.05).to_dict()
+        d = PositionReducedEvent(
+            position_id="p1",
+            closed_qty=0.05,
+            remaining_qty=0.05,
+            origin_type="EXCHANGE_ADL",
+            reason="BACKING_SHORTAGE",
+        ).to_dict()
         _assert_keys(d, ["type", "positionId", "closedQty", "remainingQty", "realizedPnl"])
+        assert d["originType"] == "EXCHANGE_ADL"
+        assert d["reason"] == "BACKING_SHORTAGE"
 
 
 class TestMarginUpdateEvent:

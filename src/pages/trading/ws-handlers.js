@@ -156,7 +156,7 @@ export function initWebSockets() {
     }
 
     // Depth stream
-    S.set('_depthUnsub', streams.subscribe(`${symbol}@depth10@100ms`, (data) => {
+    S.set('_depthUnsub', streams.subscribe(`${symbol}@depth20@100ms`, (data) => {
         if (!S._tradingMounted) return;
         S.set('orderBookAsks', (data.a || data.asks || []).map(([p, q]) => [parseFloat(p), parseFloat(q)]));
         S.set('orderBookBids', (data.b || data.bids || []).map(([p, q]) => [parseFloat(p), parseFloat(q)]));

@@ -29,7 +29,7 @@ from contracts.events import (
     TWAPProgressEvent, TWAPCompletedEvent, TWAPCancelledEvent,
     TWAPBasketProgressEvent, TWAPBasketCompletedEvent,
     TrailStopProgressEvent, TrailStopTriggeredEvent, TrailStopCancelledEvent,
-    PositionUpdatedEvent, PositionClosedEvent, MarginUpdateEvent,
+    PositionUpdatedEvent, PositionClosedEvent, PositionReducedEvent, MarginUpdateEvent,
     ScalperSlotInfo,
 )
 
@@ -249,6 +249,18 @@ class TestEventIntegrity:
             symbol="BTCUSDT", side="LONG", entry_price=50000,
         ).to_dict()
         self._check_event(d, "PositionUpdatedEvent")
+
+    def test_position_reduced(self):
+        d = PositionReducedEvent(
+            position_id="p1",
+            sub_account_id="a1",
+            symbol="BTCUSDT",
+            closed_qty=0.1,
+            remaining_qty=0.2,
+            origin_type="EXCHANGE_ADL",
+            reason="BACKING_SHORTAGE",
+        ).to_dict()
+        self._check_event(d, "PositionReducedEvent")
 
     def test_margin_update(self):
         d = MarginUpdateEvent(

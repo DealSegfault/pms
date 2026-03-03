@@ -251,43 +251,43 @@ class CommandHandler:
         sub_account_id = cmd["subAccountId"]
         quantity = float(cmd["quantity"])
         position_id = cmd.get("positionId")  # JS now sends this
+        existing = None
+        if self._risk:
+            if position_id:
+                existing = self._risk.position_book.get_position(sub_account_id, position_id)
+            if not existing:
+                existing = self._risk.position_book.find_symbol_position(sub_account_id, symbol)
+            if not existing and self._risk:
+                existing = await self._risk.ensure_position_from_snapshot(
+                    sub_account_id=sub_account_id,
+                    position_id=position_id,
+                    symbol=symbol,
+                )
 
-        order = await self._order_manager.place_market_order(
-            sub_account_id=sub_account_id,
-            symbol=symbol,
-            side=side,
-            quantity=quantity,
-            reduce_only=True,
+        if not existing:
+            return {"success": False, "error": "Position not found"}
+
+        expected_close_side = "SELL" if existing.side == "LONG" else "BUY"
+        if side != expected_close_side:
+            return {
+                "success": False,
+                "error": f"Close side mismatch: expected {expected_close_side} for {existing.side} position",
+            }
+
+        cleanup_if_unexecutable = quantity >= (existing.quantity - 1e-12)
+        close_result = await self._order_manager.close_virtual_position(
+            position=existing,
+            requested_qty=quantity,
             origin="MANUAL",
+            cleanup_if_unexecutable=cleanup_if_unexecutable,
         )
 
-        if order.state == "failed":
-            # Position likely doesn't exist on exchange (e.g. -2022 ReduceOnly rejected)
-            # Force-clean the stale virtual position from our books
-            if self._risk:
-                # Find the position we were trying to close (opposite side of close order)
-                pos_side = "LONG" if side == "SELL" else "SHORT"
-                existing = self._risk.position_book.find_position(sub_account_id, symbol, pos_side)
-                if existing:
-                    await self._risk.force_close_stale_position(existing)
-                    logger.warning("Force-closed stale position %s (exchange rejected reduceOnly)", existing.id[:8])
-                    return {"success": True, "staleCleanup": True, "positionId": existing.id}
+        if close_result.get("cleaned_up"):
+            return {"success": True, "staleCleanup": True, "positionId": existing.id}
 
-                # Position not in book — try direct DB cleanup using positionId from JS
-                if position_id and self._risk._db:
-                    try:
-                        import time as _time
-                        await self._risk._db.execute(
-                            "UPDATE virtual_positions SET status='CLOSED', closed_at=?, realized_pnl=0 WHERE id=? AND status='OPEN'",
-                            (int(_time.time() * 1000), position_id),
-                        )
-                        # Database.execute() auto-commits — no extra commit needed
-                        logger.warning("Force-closed ghost position %s via direct DB update", position_id[:8])
-                        return {"success": True, "staleCleanup": True, "positionId": position_id}
-                    except Exception as e:
-                        logger.error("Direct DB cleanup for %s failed: %s", position_id[:8], e)
-
-            return {"success": False, "error": "Close order failed and no position found to clean up"}
+        order = close_result.get("order")
+        if not order or order.state == "failed":
+            return {"success": False, "error": close_result.get("reason", "Close order failed")}
 
         return {"success": True, "clientOrderId": order.client_order_id, "state": order.state}
 
@@ -313,17 +313,17 @@ class CommandHandler:
         closed = 0
         errors = []
         for pos in positions:
-            close_side = "SELL" if pos.side == "LONG" else "BUY"
             try:
-                order = await self._order_manager.place_market_order(
-                    sub_account_id=sub_id,
-                    symbol=pos.symbol,
-                    side=close_side,
-                    quantity=pos.quantity,
-                    reduce_only=True,
+                close_result = await self._order_manager.close_virtual_position(
+                    position=pos,
+                    requested_qty=pos.quantity,
                     origin="CLOSE_ALL",
+                    cleanup_if_unexecutable=True,
                 )
-                closed += 1
+                if close_result.get("placed") or close_result.get("cleaned_up"):
+                    closed += 1
+                else:
+                    errors.append(f"{pos.symbol}: {close_result.get('reason', 'close skipped')}")
             except Exception as e:
                 errors.append(f"{pos.symbol}: {e}")
                 logger.error("close_all: failed to close %s: %s", pos.symbol, e)

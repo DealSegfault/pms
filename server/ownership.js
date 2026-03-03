@@ -65,17 +65,34 @@ export function requirePositionOwnership(paramKey = 'positionId') {
 
         const position = await prisma.virtualPosition.findUnique({
             where: { id: positionId },
-            select: { subAccount: { select: { userId: true } } },
+            select: { subAccountId: true, subAccount: { select: { userId: true } } },
         });
 
-        if (!position) {
+        if (position) {
+            if (position.subAccount?.userId !== req.user?.id) {
+                return res.status(403).json({ error: 'You do not own this position' });
+            }
+            req.subAccountId = position.subAccountId;
+            return next();
+        }
+
+        const hintedSubAccountId = req.body?.subAccountId || req.query?.subAccountId || null;
+        if (!hintedSubAccountId) {
             return res.status(404).json({ error: 'Position not found' });
         }
 
-        if (position.subAccount?.userId !== req.user?.id) {
-            return res.status(403).json({ error: 'You do not own this position' });
+        const account = await prisma.subAccount.findUnique({
+            where: { id: hintedSubAccountId },
+            select: { userId: true },
+        });
+        if (!account) {
+            return res.status(404).json({ error: 'Sub-account not found' });
+        }
+        if (account.userId !== req.user?.id) {
+            return res.status(403).json({ error: 'You do not own this sub-account' });
         }
 
+        req.subAccountId = hintedSubAccountId;
         next();
     };
 }

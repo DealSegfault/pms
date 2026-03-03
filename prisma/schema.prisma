@@ -140,22 +140,26 @@ model BalanceLog {
 }
 
 model PendingOrder {
-  id            String    @id @default(uuid())
-  subAccountId  String    @map("sub_account_id")
-  symbol        String
-  side          String    // LONG, SHORT
-  type          String    @default("LIMIT") // LIMIT, STOP_MARKET, TAKE_PROFIT_MARKET
-  price         Float     // limit/trigger price
-  quantity      Float
-  leverage      Float
-  exchangeOrderId String? @map("exchange_order_id")
-  status        String    @default("PENDING") // PENDING, FILLED, CANCELLED, EXPIRED
-  createdAt     DateTime  @default(now()) @map("created_at")
-  filledAt      DateTime? @map("filled_at")
-  cancelledAt   DateTime? @map("cancelled_at")
+  id              String    @id @default(uuid())
+  subAccountId    String    @map("sub_account_id")
+  clientOrderId   String?   @unique @map("client_order_id")
+  symbol          String
+  side            String    // LONG, SHORT
+  type            String    @default("LIMIT") // LIMIT, STOP_MARKET, TAKE_PROFIT_MARKET
+  price           Float     // limit/trigger price
+  quantity        Float
+  leverage        Float
+  exchangeOrderId String?   @map("exchange_order_id")
+  origin          String    @default("MANUAL")  // MANUAL, CHASE, SCALPER, TWAP, TRAIL_STOP, BOT
+  parentId        String?   @map("parent_id")   // chase_id, scalper_id, etc.
+  status          String    @default("PENDING") // PENDING, FILLED, CANCELLED, EXPIRED
+  createdAt       DateTime  @default(now()) @map("created_at")
+  filledAt        DateTime? @map("filled_at")
+  cancelledAt     DateTime? @map("cancelled_at")
 
   subAccount SubAccount @relation(fields: [subAccountId], references: [id])
 
+  @@index([clientOrderId])
   @@index([exchangeOrderId])
   @@index([status, type])
   @@index([subAccountId, status])

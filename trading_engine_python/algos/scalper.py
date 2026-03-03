@@ -64,6 +64,7 @@ class ScalperSlot:
     retry_count: int = 0
     fills: int = 0
     _restarting: bool = False
+    _restart_pending: bool = False
 
 
 @dataclass
@@ -481,17 +482,20 @@ class ScalperEngine:
                 positions = self._om._risk.position_book.get_by_sub_account(state.sub_account_id)
                 for pos in positions:
                     if pos.symbol == state.symbol:
-                        close_side = "SELL" if pos.side == "LONG" else "BUY"
-                        await self._om.place_market_order(
-                            sub_account_id=state.sub_account_id,
-                            symbol=pos.symbol,
-                            side=close_side,
-                            quantity=pos.quantity,
-                            reduce_only=True,
+                        close_result = await self._om.close_virtual_position(
+                            position=pos,
+                            requested_qty=pos.quantity,
                             origin="SCALPER",
                             parent_id=scalper_id,
+                            cleanup_if_unexecutable=True,
                         )
-                        logger.info("Scalper %s: closed position %s %s", scalper_id, pos.symbol, pos.side)
+                        if close_result.get("placed") or close_result.get("cleaned_up"):
+                            logger.info("Scalper %s: closed position %s %s", scalper_id, pos.symbol, pos.side)
+                        else:
+                            logger.warning(
+                                "Scalper %s: close skipped for %s %s: %s",
+                                scalper_id, pos.symbol, pos.side, close_result.get("reason", ""),
+                            )
             except Exception as e:
                 logger.error("Scalper %s: close positions failed: %s", scalper_id, e)
 
@@ -577,12 +581,8 @@ class ScalperEngine:
                 "maxDistancePct": 0,
                 "reduceOnly": slot.reduce_only,
                 "parentScalperId": state.id,
-                "onFill": lambda fp, fq, _s=state, _sl=slot: asyncio.ensure_future(
-                    self._on_child_fill(_s, _sl, fp, fq)
-                ),
-                "onCancel": lambda reason, _s=state, _sl=slot: asyncio.ensure_future(
-                    self._on_child_cancel(_s, _sl, reason)
-                ),
+                "onFill": lambda fp, fq, _s=state, _sl=slot: self._on_child_fill(_s, _sl, fp, fq),
+                "onCancel": lambda reason, _s=state, _sl=slot: self._on_child_cancel(_s, _sl, reason),
             })
             batch_slot_indices.append(i)
 
@@ -624,12 +624,8 @@ class ScalperEngine:
                 "reduceOnly": slot.reduce_only,
                 "parentScalperId": state.id,
                 # Wire fill/cancel callbacks back to this scalper
-                "onFill": lambda fp, fq, _s=state, _sl=slot: asyncio.ensure_future(
-                    self._on_child_fill(_s, _sl, fp, fq)
-                ),
-                "onCancel": lambda reason, _s=state, _sl=slot: asyncio.ensure_future(
-                    self._on_child_cancel(_s, _sl, reason)
-                ),
+                "onFill": lambda fp, fq, _s=state, _sl=slot: self._on_child_fill(_s, _sl, fp, fq),
+                "onCancel": lambda reason, _s=state, _sl=slot: self._on_child_cancel(_s, _sl, reason),
             }
             chase_id = await self._chase.start_chase(chase_params)
             return chase_id
@@ -642,10 +638,16 @@ class ScalperEngine:
 
     async def _on_child_fill(self, state: ScalperState, slot: ScalperSlot,
                               fill_price: float, fill_qty: float) -> None:
-        """Called when a child chase fills."""
+        """Called when a child chase fills.
+
+        Split into fast path (bookkeeping, awaited by chase ~1ms) and slow path
+        (arm + restart, supervised fire-and-forget ~50-200ms).
+        This keeps the WS reader unblocked during REST order placement.
+        """
         if state.status != "active":
             return
 
+        # ── Fast path: bookkeeping (must complete before chase cleanup) ──
         slot.chase_id = None
         slot.active = False
         slot.fills += 1
@@ -671,17 +673,27 @@ class ScalperEngine:
                      state.id, slot.side, slot.layer_idx, fill_price, fill_qty,
                      "opening" if is_opening else "closing")
 
-        # Publish fill event
+        # Publish fill event (fast — Redis publish ~1ms)
         await self._publish_event("scalper_filled", state,
                                    side=slot.side, layerIdx=slot.layer_idx,
                                    fillPrice=fill_price, fillQty=fill_qty)
 
-        # Normal mode: first fill on opening leg → arm reduce-only (closing) leg
-        if not state.neutral_mode and is_opening and not state.reduce_only_armed:
-            await self._arm_reduce_only_leg(state)
+        # ── Slow path: arm + restart (fire-and-forget with error logging) ──
+        # Launched as a supervised task so the WS reader isn't blocked
+        # during REST order placement (50-200ms).
+        async def _restart_after_fill():
+            try:
+                # Normal mode: first fill on opening leg → arm reduce-only (closing) leg
+                if not state.neutral_mode and is_opening and not state.reduce_only_armed:
+                    await self._arm_reduce_only_leg(state)
 
-        # Re-arm this slot with fill spread/burst guards
-        await self._restart_slot(state, slot, is_fill_restart=True)
+                # Re-arm this slot with fill spread/burst guards
+                await self._restart_slot(state, slot, is_fill_restart=True)
+            except Exception as e:
+                logger.error("Scalper %s: restart after %s layer %d fill failed: %s",
+                             state.id, slot.side, slot.layer_idx, e)
+
+        asyncio.ensure_future(_restart_after_fill())
 
     async def _on_child_cancel(self, state: ScalperState, slot: ScalperSlot, reason: str) -> None:
         """Called when a child chase is cancelled externally."""
@@ -725,7 +737,55 @@ class ScalperEngine:
                      state.id, slot.side, slot.layer_idx, reason, delay)
         await self._schedule_restart(state, slot, delay=delay)
 
-    # ── Reduce-Only Leg Arming ──
+    # ── Event-Driven Methods (used by chase.on_fill_event instead of callbacks) ──
+
+    async def on_chase_fill_event(
+        self, scalper_id: str, chase_id: str, fill_price: float, fill_qty: float
+    ) -> None:
+        """Handle chase fill via event stream (replaces lambda callback).
+
+        Called by ChaseEngine.on_fill_event when a chase-owned order fills.
+        Looks up the scalper and matching slot, then delegates to _on_child_fill.
+        """
+        state = self._active.get(scalper_id)
+        if not state:
+            logger.debug("ScalperEngine: scalper %s not active for fill event", scalper_id)
+            return
+
+        slot = self._find_slot_by_chase(state, chase_id)
+        if not slot:
+            logger.warning("ScalperEngine: no slot found for chase %s in scalper %s",
+                           chase_id, scalper_id)
+            return
+
+        await self._on_child_fill(state, slot, fill_price, fill_qty)
+
+    async def on_chase_cancel_event(
+        self, scalper_id: str, chase_id: str, reason: str
+    ) -> None:
+        """Handle chase cancel via event stream (replaces lambda callback).
+
+        Called by ChaseEngine.on_cancel_event when a chase-owned order is cancelled.
+        """
+        state = self._active.get(scalper_id)
+        if not state:
+            logger.debug("ScalperEngine: scalper %s not active for cancel event", scalper_id)
+            return
+
+        slot = self._find_slot_by_chase(state, chase_id)
+        if not slot:
+            logger.debug("ScalperEngine: no slot found for chase %s in scalper %s (may already be cleaned up)",
+                         chase_id, scalper_id)
+            return
+
+        await self._on_child_cancel(state, slot, reason)
+
+    def _find_slot_by_chase(self, state: ScalperState, chase_id: str) -> Optional[ScalperSlot]:
+        """Find the slot that owns a specific chase ID."""
+        for slot in state.long_slots + state.short_slots:
+            if slot.chase_id == chase_id:
+                return slot
+        return None
 
     async def _arm_reduce_only_leg(self, state: ScalperState) -> None:
         """Arm the reduce-only (closing) leg on first opening fill."""
@@ -777,6 +837,7 @@ class ScalperEngine:
         if state.status != "active":
             return
         if slot._restarting:
+            slot._restart_pending = True
             return
         slot._restarting = True
 
@@ -879,6 +940,12 @@ class ScalperEngine:
 
         finally:
             slot._restarting = False
+            # Catchup: if another fill arrived while we were restarting,
+            # process the queued restart now instead of silently dropping it
+            if slot._restart_pending:
+                slot._restart_pending = False
+                if state.status == "active":
+                    await self._restart_slot(state, slot, is_fill_restart=True)
 
     async def _schedule_restart(self, state: ScalperState, slot: ScalperSlot,
                                  delay: float, is_fill: bool = False) -> None:

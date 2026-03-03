@@ -2,9 +2,37 @@ function dispatchEvent(type, detail) {
     window.dispatchEvent(new CustomEvent(type, { detail }));
 }
 
+function baseSymbol(symbol) {
+    return symbol?.split('/')[0] || symbol || 'Unknown';
+}
+
 function getEventScope(data, currentAccount) {
     const eventAccount = data?.subAccountId;
     return !eventAccount || eventAccount === currentAccount;
+}
+
+function isSystemAdl(detail) {
+    return detail?.originType === 'EXCHANGE_ADL';
+}
+
+function adlReductionMessage(detail) {
+    const base = baseSymbol(detail?.symbol);
+    const pct = detail?.closedQty && detail?.remainingQty != null
+        ? ((detail.closedQty / (detail.closedQty + detail.remainingQty)) * 100).toFixed(0)
+        : '?';
+    if (detail?.reason === 'UNBACKED_SIDE') {
+        return `ADL system: ${base} reduced ${pct}% — exchange side no longer backs this position`;
+    }
+    return `ADL system: ${base} reduced ${pct}% to match exchange backing`;
+}
+
+function adlCloseMessage(detail) {
+    const base = baseSymbol(detail?.symbol);
+    const pnlText = detail?.realizedPnl != null ? ` PnL: $${detail.realizedPnl.toFixed(2)}` : '';
+    if (detail?.reason === 'UNBACKED_SIDE') {
+        return `ADL system: ${base} closed — exchange side no longer backs this position${pnlText}`;
+    }
+    return `ADL system: ${base} closed to match exchange backing${pnlText}`;
 }
 
 export function createWsClient({
@@ -144,7 +172,10 @@ export function createWsClient({
                     if (!isMyEvent) return;
                     const d = msg.data;
                     const pnlText = d.realizedPnl != null ? ` PnL: $${d.realizedPnl.toFixed(2)}` : '';
-                    showToast(`Closed: ${d.symbol?.split('/')[0]}${pnlText}`, d.realizedPnl >= 0 ? 'success' : 'warning');
+                    const message = isSystemAdl(d)
+                        ? adlCloseMessage(d)
+                        : `Closed: ${baseSymbol(d.symbol)}${pnlText}`;
+                    showToast(message, isSystemAdl(d) ? 'warning' : (d.realizedPnl >= 0 ? 'success' : 'warning'));
                     onPositionClosed(d);
                     dispatchEvent('position_closed', d);
                     return;
@@ -156,7 +187,10 @@ export function createWsClient({
                     const pct = d.closedQty && d.remainingQty != null
                         ? ((d.closedQty / (d.closedQty + d.remainingQty)) * 100).toFixed(0)
                         : '?';
-                    showToast(`Reduced ${pct}%: ${d.symbol?.split('/')[0]}`, 'warning');
+                    const message = isSystemAdl(d)
+                        ? adlReductionMessage(d)
+                        : `Reduced ${pct}%: ${baseSymbol(d.symbol)}`;
+                    showToast(message, 'warning');
                     dispatchEvent('position_reduced', d);
                     return;
                 }

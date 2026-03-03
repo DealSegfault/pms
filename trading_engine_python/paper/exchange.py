@@ -238,6 +238,10 @@ class PaperExchangeClient:
         sym = self._to_binance_symbol(symbol) if symbol else None
         return self._wallet.get_position_risk_response(sym)
 
+    async def get_account_trades(self, symbol: str, limit: int = 500, **kwargs) -> list:
+        """Paper mode has no exchange trade-history endpoint."""
+        return []
+
     async def get_balance(self) -> list:
         """Get virtual balance."""
         return self._wallet.get_balance_response()
@@ -261,6 +265,14 @@ class PaperExchangeClient:
             )
 
         return await asyncio.to_thread(self._real_client.get_exchange_info)
+
+    async def get_position_mode(self) -> dict:
+        """Paper mode follows the one-way net-position model."""
+        return {"dualSidePosition": False}
+
+    async def change_position_mode(self, dual_side_position: bool) -> dict:
+        """No-op in paper mode."""
+        return {"dualSidePosition": bool(dual_side_position)}
 
     # ── Leverage / Margin ──
 

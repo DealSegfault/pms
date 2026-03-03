@@ -823,7 +823,10 @@ export async function marketClosePosition(positionId, symbol) {
     if (!(await cuteConfirm({ title: `Close ${symbol.split('/')[0]}?`, message: 'This will market close the position~', confirmText: 'Close', danger: true }))) return;
     showToast(`Closing ${symbol.split('/')[0]}...`, 'info');
     try {
-        const result = await api(`/trade/close/${positionId}`, { method: 'POST' });
+        const result = await api(`/trade/close/${positionId}`, {
+            method: 'POST',
+            body: { subAccountId: state.currentAccount },
+        });
         const pnl = result.trade?.realizedPnl || 0;
         const label = result.staleCleanup ? 'Removed stale position' : `Closed ${symbol.split('/')[0]}. PnL: ${formatUsd(pnl)}`;
         showToast(label, result.staleCleanup ? 'info' : (pnl >= 0 ? 'success' : 'warning'));
@@ -836,12 +839,20 @@ export async function marketClosePosition(positionId, symbol) {
     } catch (err) {
         const msg = (err.message || '').toLowerCase();
         if (msg.includes('not found') || msg.includes('already closed')) {
-            // Position is gone — remove the ghost row from UI
-            _removePositionRow(positionId);
-            showToast('Position already closed — removed from list', 'info');
+            try {
+                const current = await api(`/trade/positions/${state.currentAccount}`);
+                const stillLive = (current?.positions || []).some((p) => p.id === positionId || p.positionId === positionId);
+                if (!stillLive) {
+                    _removePositionRow(positionId);
+                    showToast('Position already closed — removed from list', 'info');
+                    return;
+                }
+            } catch { }
         } else {
             showToast(`${err.message}`, 'error');
+            return;
         }
+        showToast(`${err.message}`, 'error');
     }
 }
 
@@ -1127,7 +1138,7 @@ function _drawChartAnnotations(data, showPositions, showOpenOrders, showPastOrde
             .filter(t => t.timestamp)
             .map(t => {
                 const isBuy = t.side === 'BUY';
-                const isClose = t.action === 'CLOSE' || t.action === 'LIQUIDATE';
+                const isClose = t.action === 'CLOSE' || t.action === 'LIQUIDATE' || t.action === 'ADL';
                 const rawTime = Math.floor(new Date(t.timestamp).getTime() / 1000);
                 // Snap to candle boundary so all trades in the same candle share the same time
                 const snappedTime = Math.floor(rawTime / candleSeconds) * candleSeconds;

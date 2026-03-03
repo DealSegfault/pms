@@ -104,6 +104,10 @@ class UserStreamService:
         """Wire up risk engine after creation (Step 7)."""
         self._risk_engine = risk_engine
 
+    def set_event_bus(self, event_bus: Any) -> None:
+        """Wire the Redis Stream bus used by the primary ingest path."""
+        self._event_bus = event_bus
+
     # ── Public API ──
 
     async def start(self) -> None:
@@ -165,7 +169,7 @@ class UserStreamService:
                 await self._handle_messages(ws)
         finally:
             self._ws_connected = False
-            self._running = False
+            self._ws = None
             if self._keepalive_task:
                 self._keepalive_task.cancel()
 
@@ -237,8 +241,41 @@ class UserStreamService:
                 mapped["side"],
             )
 
-        # Route to OrderManager
-        await self._order_manager.on_order_update(mapped)
+        if hasattr(self, "_event_bus") and self._event_bus:
+            try:
+                # Map Binance status to event type
+                status_map = {
+                    "NEW": "ORDER_NEW",
+                    "PARTIALLY_FILLED": "ORDER_PARTIALLY_FILLED",
+                    "FILLED": "ORDER_FILLED",
+                    "CANCELED": "ORDER_CANCELLED",
+                    "CANCELLED": "ORDER_CANCELLED",
+                    "EXPIRED": "ORDER_EXPIRED",
+                    "REJECTED": "ORDER_REJECTED",
+                }
+                event_type = status_map.get(status, f"ORDER_{status}")
+                event_id = await self._event_bus.publish(event_type, {
+                    "client_order_id": mapped["client_order_id"],
+                    "exchange_order_id": mapped["order_id"],
+                    "symbol": mapped["symbol"],
+                    "side": mapped["side"],
+                    "order_type": mapped.get("order_type", ""),
+                    "status": status,
+                    "quantity": mapped["orig_qty"],
+                    "price": mapped.get("price", "0"),
+                    "fill_price": mapped["last_filled_price"],
+                    "fill_qty": mapped["last_filled_qty"],
+                    "accumulated_filled_qty": mapped["accumulated_filled_qty"],
+                    "avg_price": mapped["avg_price"],
+                    "reduce_only": str(mapped.get("reduce_only", False)),
+                })
+                if not event_id:
+                    await self._order_manager.on_order_update(mapped)
+            except Exception as e:
+                logger.debug("Event bus publish error (non-fatal): %s", e)
+                await self._order_manager.on_order_update(mapped)
+        else:
+            await self._order_manager.on_order_update(mapped)
 
     async def _on_account_update(self, message: dict) -> None:
         """
@@ -248,30 +285,41 @@ class UserStreamService:
         # Re-broadcast raw event for bot consumers (before normalization)
         await self._publish_raw_event(message)
 
-        if self._risk_engine:
-            try:
-                data = message.get("a", {})
-                # Extract balance changes
-                balances = data.get("B", [])
-                # Extract position updates
-                positions = []
-                for pos in data.get("P", []):
-                    positions.append({
-                        "symbol": pos.get("s", ""),
-                        "position_amount": float(pos.get("pa", 0)),
-                        "entry_price": float(pos.get("ep", 0)),
-                        "unrealized_pnl": float(pos.get("up", 0)),
-                        "margin_type": pos.get("mt", ""),
-                        "isolated_wallet": float(pos.get("iw", 0)),
-                        "position_side": pos.get("ps", "BOTH"),
-                    })
+        data = message.get("a", {})
+        normalized = {
+            "balances": data.get("B", []),
+            "positions": [
+                {
+                    "symbol": pos.get("s", ""),
+                    "position_amount": float(pos.get("pa", 0)),
+                    "entry_price": float(pos.get("ep", 0)),
+                    "unrealized_pnl": float(pos.get("up", 0)),
+                    "margin_type": pos.get("mt", ""),
+                    "isolated_wallet": float(pos.get("iw", 0)),
+                    "position_side": pos.get("ps", "BOTH"),
+                }
+                for pos in data.get("P", [])
+            ],
+            "event_time": message.get("E", 0),
+            "transaction_time": message.get("T", 0),
+        }
 
-                await self._risk_engine.on_account_update({
-                    "balances": balances,
-                    "positions": positions,
-                    "event_time": message.get("E", 0),
-                    "transaction_time": message.get("T", 0),
+        if hasattr(self, "_event_bus") and self._event_bus:
+            try:
+                event_id = await self._event_bus.publish("ACCOUNT_UPDATE", {
+                    "payload": json.dumps(normalized),
+                    "event_time": str(message.get("E", 0)),
+                    "transaction_time": str(message.get("T", 0)),
                 })
+                if not event_id and self._risk_engine:
+                    await self._risk_engine.on_account_update(normalized)
+            except Exception as e:
+                logger.debug("Event bus ACCOUNT_UPDATE publish error: %s", e)
+                if self._risk_engine:
+                    await self._risk_engine.on_account_update(normalized)
+        elif self._risk_engine:
+            try:
+                await self._risk_engine.on_account_update(normalized)
             except Exception as e:
                 logger.error("Error handling ACCOUNT_UPDATE: %s", e)
 
@@ -317,7 +365,26 @@ class UserStreamService:
             mapped["side"],
         )
 
-        await self._order_manager.on_order_update(mapped)
+        if hasattr(self, "_event_bus") and self._event_bus:
+            try:
+                event_id = await self._event_bus.publish("TRADE_LITE", {
+                    "client_order_id": mapped["client_order_id"],
+                    "exchange_order_id": mapped["order_id"],
+                    "symbol": mapped["symbol"],
+                    "side": mapped["side"],
+                    "status": "FILLED",
+                    "fill_price": mapped["last_filled_price"],
+                    "fill_qty": mapped["last_filled_qty"],
+                    "accumulated_filled_qty": mapped["accumulated_filled_qty"],
+                    "avg_price": mapped["avg_price"],
+                })
+                if not event_id:
+                    await self._order_manager.on_order_update(mapped)
+            except Exception as e:
+                logger.debug("Event bus TRADE_LITE publish error: %s", e)
+                await self._order_manager.on_order_update(mapped)
+        else:
+            await self._order_manager.on_order_update(mapped)
 
     # ── Reconnect State Sync ──
 

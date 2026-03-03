@@ -288,6 +288,15 @@ class ExchangeClient:
         s = self._to_binance_symbol(symbol) if symbol else None
         return await self._execute(self._client.get_position_risk, symbol=s)
 
+    async def get_account_trades(self, symbol: str, limit: int = 500, **kwargs) -> list:
+        """Get recent account trades for one symbol."""
+        return await self._execute(
+            self._client.get_account_trades,
+            symbol=self._to_binance_symbol(symbol),
+            limit=limit,
+            **kwargs,
+        )
+
     async def get_balance(self) -> list:
         """Get account balance."""
         return await self._execute(self._client.get_balance)
@@ -299,6 +308,17 @@ class ExchangeClient:
     async def get_exchange_info(self) -> dict:
         """Get exchange information (symbols, filters, rate limits)."""
         return await self._execute(self._client.get_exchange_info)
+
+    async def get_position_mode(self) -> dict:
+        """Get current Binance position mode."""
+        return await self._execute(self._client.get_position_mode)
+
+    async def change_position_mode(self, dual_side_position: bool) -> dict:
+        """Change Binance position mode."""
+        return await self._execute(
+            self._client.change_position_mode,
+            dualSidePosition=dual_side_position,
+        )
 
     # ── Leverage / Margin ──
 

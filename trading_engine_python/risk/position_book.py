@@ -1,5 +1,5 @@
 """
-PositionBook — In-memory position tracking with dual indexes.
+PositionBook — In-memory position tracking with net-position invariants.
 
 Ported from JS server/risk/position-book.js.
 Pure data structure with zero side effects. No DB, no exchange calls.
@@ -42,7 +42,7 @@ class PositionBook:
     """
     In-memory position index (matches JS PositionBook structure).
     
-    Dual-indexed:
+    Indexed:
     - _entries[sub_account_id] → {account, positions: {pos_id → VirtualPos}, rules}
     - _symbol_accounts[symbol] → set of sub_account_ids (reverse index)
     """
@@ -75,38 +75,43 @@ class PositionBook:
             return None
         return entry["positions"].get(position_id)
 
-    def find_position(self, sub_account_id: str, symbol: str, side: str) -> Optional[VirtualPos]:
-        """Find an open position matching sub-account + symbol + side."""
+    def find_symbol_position(self, sub_account_id: str, symbol: str) -> Optional[VirtualPos]:
+        """Find the single open position for a symbol.
+
+        One-way mode invariant: at most one open position per sub-account + symbol.
+        If duplicates are present, fail fast so the engine does not keep running
+        on an ambiguous risk model.
+        """
         entry = self._entries.get(sub_account_id)
         if not entry:
             return None
 
-        # Primary: exact match
-        for pos in entry["positions"].values():
-            if pos.symbol == symbol and pos.side == side:
-                return pos
+        matches = [
+            pos for pos in entry["positions"].values()
+            if self._extract_base(pos.symbol).upper() == self._extract_base(symbol).upper()
+        ]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"One-way invariant violated for {sub_account_id}:{symbol}: "
+                f"{len(matches)} open positions"
+            )
+        return matches[0]
 
-        # Fallback: match by base symbol (handles ccxt vs Binance format mismatch)
-        # e.g., 'BTC/USDT:USDT' → 'BTC', 'BTCUSDT' → 'BTC'
-        def _extract_base(s: str) -> str:
-            if '/' in s:
-                return s.split('/')[0]
-            # Binance format: remove USDT/BUSD suffix
-            for suffix in ('USDT', 'BUSD', 'USDC', 'BTC', 'ETH', 'BNB'):
-                if s.endswith(suffix) and len(s) > len(suffix):
-                    return s[:-len(suffix)]
-            return s
-
-        target_base = _extract_base(symbol).upper()
-        for pos in entry["positions"].values():
-            if _extract_base(pos.symbol).upper() == target_base and pos.side == side:
-                logger.warning(
-                    "find_position: symbol format mismatch — searched '%s' matched '%s' (base='%s')",
-                    symbol, pos.symbol, target_base,
-                )
-                return pos
-
-        return None
+    def find_position(self, sub_account_id: str, symbol: str, side: str) -> Optional[VirtualPos]:
+        """Find an open position matching sub-account + symbol + side."""
+        pos = self.find_symbol_position(sub_account_id, symbol)
+        if not pos:
+            return None
+        if pos.side != side:
+            return None
+        if pos.symbol != symbol and self._extract_base(pos.symbol).upper() == self._extract_base(symbol).upper():
+            logger.warning(
+                "find_position: symbol format mismatch — searched '%s' matched '%s' (base='%s')",
+                symbol, pos.symbol, self._extract_base(symbol).upper(),
+            )
+        return pos
 
     @property
     def size(self) -> int:
@@ -125,7 +130,14 @@ class PositionBook:
         """
         for sub_id, data in by_account.items():
             pos_map = {}
+            seen_symbols: set[str] = set()
             for p in data.get("positions", []):
+                symbol_key = self._extract_base(p["symbol"]).upper()
+                if symbol_key in seen_symbols:
+                    raise RuntimeError(
+                        f"One-way invariant violated while loading {sub_id}:{p['symbol']}"
+                    )
+                seen_symbols.add(symbol_key)
                 vp = VirtualPos(
                     id=p["id"], sub_account_id=sub_id,
                     symbol=p["symbol"], side=p["side"],
@@ -150,6 +162,13 @@ class PositionBook:
         if not entry:
             entry = {"account": account, "positions": {}, "rules": None}
             self._entries[sub_id] = entry
+
+        existing = self.find_symbol_position(sub_id, position.symbol)
+        if existing and existing.id != position.id:
+            raise RuntimeError(
+                f"One-way invariant violated while adding {sub_id}:{position.symbol}: "
+                f"{existing.id} already open"
+            )
 
         entry["positions"][position.id] = position
         entry["account"]["currentBalance"] = account.get("currentBalance", entry["account"].get("currentBalance", 0))
@@ -214,6 +233,15 @@ class PositionBook:
         if symbol not in self._symbol_accounts:
             self._symbol_accounts[symbol] = set()
         self._symbol_accounts[symbol].add(sub_account_id)
+
+    @staticmethod
+    def _extract_base(symbol: str) -> str:
+        if '/' in symbol:
+            return symbol.split('/')[0]
+        for suffix in ("USDT", "BUSD", "USDC", "BTC", "ETH", "BNB"):
+            if symbol.endswith(suffix) and len(symbol) > len(suffix):
+                return symbol[:-len(suffix)]
+        return symbol
 
     def __repr__(self) -> str:
         total_positions = sum(len(e["positions"]) for e in self._entries.values())

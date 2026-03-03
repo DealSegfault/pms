@@ -378,7 +378,10 @@ async function marketClose(positionId, symbol) {
   if (!(await cuteConfirm({ title: `Close ${symbol.split('/')[0]}?`, message: 'This will market close the position~', confirmText: 'Close', danger: true }))) return;
 
   try {
-    const result = await api(`/trade/close/${positionId}`, { method: 'POST' });
+    const result = await api(`/trade/close/${positionId}`, {
+      method: 'POST',
+      body: { subAccountId: state.currentAccount },
+    });
     const pnl = result.trade?.realizedPnl || 0;
     showToast(`Closed ${symbol.split('/')[0]}. PnL: ${formatUsd(pnl)}`, pnl >= 0 ? 'success' : 'warning');
     loadPositions();

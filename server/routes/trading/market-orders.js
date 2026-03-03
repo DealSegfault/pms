@@ -27,42 +27,56 @@ router.post('/', requireOwnership('body'), proxyToRedis('pms:cmd:trade', (req) =
 router.post('/close/:positionId', requirePositionOwnership(), async (req, res) => {
     try {
         const positionId = req.params.positionId;
-        const position = await prisma.virtualPosition.findUnique({
+        const dbPosition = await prisma.virtualPosition.findUnique({
             where: { id: positionId },
         });
-        if (!position || position.status !== 'OPEN') {
+        const subAccountId = req.body?.subAccountId || req.subAccountId || dbPosition?.subAccountId || null;
+        const snapshot = subAccountId ? await getRiskSnapshot(subAccountId) : null;
+        const livePositions = snapshot?.positions || [];
+        const livePosition = livePositions.find((p) =>
+            (p.id === positionId || p.positionId === positionId)
+        );
+
+        if (!livePosition && (!dbPosition || dbPosition.status !== 'OPEN')) {
             return res.status(404).json({ error: 'Position not found or already closed' });
         }
 
+        const position = livePosition || dbPosition;
         const closeSide = position.side === 'LONG' ? 'SELL' : 'BUY';
+        const closeQty = livePosition?.quantity ?? dbPosition?.quantity;
+        const closeSubAccountId = subAccountId || dbPosition?.subAccountId;
         let result;
         try {
             result = await pushAndWait('pms:cmd:close', {
-                subAccountId: position.subAccountId,
+                subAccountId: closeSubAccountId,
                 symbol: position.symbol,
                 side: closeSide,
-                quantity: position.quantity,
+                quantity: closeQty,
                 positionId,
             });
         } catch (cmdErr) {
             // pushAndWait timed out or Python not running —
             // check if position actually exists in the live snapshot
-            const snapshot = await getRiskSnapshot(position.subAccountId);
-            const livePositions = snapshot?.positions || [];
-            const existsLive = livePositions.some(p =>
+            const freshSnapshot = closeSubAccountId ? await getRiskSnapshot(closeSubAccountId) : null;
+            const freshPositions = freshSnapshot?.positions || [];
+            const existsLive = freshPositions.some(p =>
                 (p.id === positionId || p.positionId === positionId)
             );
 
             if (!existsLive) {
                 // Ghost: in DB but not in Python's live book
-                await prisma.virtualPosition.update({
-                    where: { id: positionId },
-                    data: { status: 'CLOSED', closedAt: new Date(), realizedPnl: 0 },
-                });
+                if (dbPosition) {
+                    await prisma.virtualPosition.update({
+                        where: { id: positionId },
+                        data: { status: 'CLOSED', closedAt: new Date(), realizedPnl: 0 },
+                    });
+                }
                 console.warn(`[close] Force-closed ghost position ${positionId.slice(0, 8)} (Python unreachable, not in live snapshot)`);
                 try {
                     const { getRedis } = await import('../../redis.js');
-                    await (getRedis()).del(`pms:risk:${position.subAccountId}`);
+                    if (closeSubAccountId) {
+                        await (getRedis()).del(`pms:risk:${closeSubAccountId}`);
+                    }
                 } catch (_) { /* non-fatal */ }
                 return res.json({ success: true, staleCleanup: true, positionId });
             }
@@ -77,6 +91,11 @@ router.post('/close/:positionId', requirePositionOwnership(), async (req, res) =
 
         // Python failed to close AND failed to find the position in its book.
         if (!result.success) {
+            if (livePosition) {
+                return res.status(409).json({
+                    error: result.error || 'Close rejected while position is still live',
+                });
+            }
             const errorStr = (result.error || '').toLowerCase();
             const isGhost = errorStr.includes('reduceonly')
                 || errorStr.includes('reduce only')
@@ -84,14 +103,18 @@ router.post('/close/:positionId', requirePositionOwnership(), async (req, res) =
                 || errorStr.includes('close order failed');
 
             if (isGhost) {
-                await prisma.virtualPosition.update({
-                    where: { id: positionId },
-                    data: { status: 'CLOSED', closedAt: new Date(), realizedPnl: 0 },
-                });
+                if (dbPosition) {
+                    await prisma.virtualPosition.update({
+                        where: { id: positionId },
+                        data: { status: 'CLOSED', closedAt: new Date(), realizedPnl: 0 },
+                    });
+                }
                 console.warn(`[close] Force-closed ghost position ${positionId.slice(0, 8)} from DB (not on exchange)`);
                 try {
                     const { getRedis } = await import('../../redis.js');
-                    await (getRedis()).del(`pms:risk:${position.subAccountId}`);
+                    if (closeSubAccountId) {
+                        await (getRedis()).del(`pms:risk:${closeSubAccountId}`);
+                    }
                 } catch (_) { /* non-fatal */ }
                 return res.json({ success: true, staleCleanup: true, positionId });
             }
