@@ -66,6 +66,9 @@ class ChaseState:
     on_chase_cancel: Optional[Callable] = field(default=None, repr=False)
     # Concurrency guard — prevents concurrent _on_tick from stacking orders
     _tick_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # Bootstrap guard — blocks deferred first-order placement until startup/resume
+    # has either placed the initial order or decided to wait for a future tick.
+    _initializing: bool = field(default=True, repr=False)
 
 
 class ChaseEngine:
@@ -238,6 +241,10 @@ class ChaseEngine:
         except InvariantViolation as e:
             logger.error("Chase %s invariant violation at creation: %s", chase_id, e)
 
+        # Register before the first exchange order so fast ORDER_STATE_* events
+        # can resolve parent_id → chase state immediately.
+        self._active[chase_id] = state
+
         # Subscribe to L1 ticks FIRST — this triggers Redis PubSub + seed from
         # existing orderbook data, so L1 will likely be available after a brief wait.
         # NOTE: use state.symbol (ccxt format) — MarketDataService keys by ccxt format.
@@ -255,30 +262,31 @@ class ChaseEngine:
 
         # Place initial limit order (if L1 available)
         price = self._compute_chase_price(state, l1)
-        if price:
-            order = await self._om.place_limit_order(
-                sub_account_id=state.sub_account_id,
-                symbol=state.symbol,
-                side=state.side,
-                quantity=state.quantity,
-                price=price,
-                leverage=state.leverage,
-                origin="CHASE",
-                parent_id=chase_id,
-                on_fill=lambda o: self._on_fill(state, o),
-                on_cancel=lambda o, r: self._on_cancel(state, o, r),
-                reduce_only=state.reduce_only,
-            )
-            if order.state != "failed":
-                state.current_order_id = order.client_order_id
-                state.current_order_price = price
-                logger.info("Chase %s: initial order placed at %.8f", chase_id, price)
+        try:
+            if price:
+                order = await self._om.place_limit_order(
+                    sub_account_id=state.sub_account_id,
+                    symbol=state.symbol,
+                    side=state.side,
+                    quantity=state.quantity,
+                    price=price,
+                    leverage=state.leverage,
+                    origin="CHASE",
+                    parent_id=chase_id,
+                    on_fill=lambda o: self._on_fill(state, o),
+                    on_cancel=lambda o, r: self._on_cancel(state, o, r),
+                    reduce_only=state.reduce_only,
+                )
+                if order.state != "failed":
+                    state.current_order_id = order.client_order_id
+                    state.current_order_price = price
+                    logger.info("Chase %s: initial order placed at %.8f", chase_id, price)
+                else:
+                    logger.warning("Chase %s: initial order failed, will retry on tick", chase_id)
             else:
-                logger.warning("Chase %s: initial order failed, will retry on tick", chase_id)
-        else:
-            logger.warning("Chase %s: no L1 data yet, will place on first tick", chase_id)
-
-        self._active[chase_id] = state
+                logger.warning("Chase %s: no L1 data yet, will place on first tick", chase_id)
+        finally:
+            state._initializing = False
 
         await self._save_state(state)
         await self._publish_event("chase_started", state)
@@ -325,6 +333,8 @@ class ChaseEngine:
             except InvariantViolation as e:
                 logger.error("Chase %s invariant violation: %s", chase_id, e)
 
+            self._active[state.id] = state
+
             # Subscribe to L1 ticks
             if self._md:
                 self._md.subscribe(state.symbol, self._make_tick_handler(state))
@@ -358,27 +368,30 @@ class ChaseEngine:
                 })
 
         # 3. Batch place all orders
-        if order_params:
-            orders = await self._om.place_batch_limit_orders(order_params)
+        try:
+            if order_params:
+                orders = await self._om.place_batch_limit_orders(order_params)
 
-            # 4. Map results back to chase states
-            for state in states:
-                idx = state_to_idx.get(state.id)
-                if idx is not None and idx < len(orders):
-                    order = orders[idx]
-                    if order.state != "failed":
-                        state.current_order_id = order.client_order_id
-                        state.current_order_price = order.price or 0
-                        logger.info("Chase %s: batch order placed at %.8f", state.id, state.current_order_price)
+                # 4. Map results back to chase states
+                for state in states:
+                    idx = state_to_idx.get(state.id)
+                    if idx is not None and idx < len(orders):
+                        order = orders[idx]
+                        if order.state != "failed":
+                            state.current_order_id = order.client_order_id
+                            state.current_order_price = order.price or 0
+                            logger.info("Chase %s: batch order placed at %.8f", state.id, state.current_order_price)
+                        else:
+                            logger.warning("Chase %s: batch order failed, will retry on tick", state.id)
                     else:
-                        logger.warning("Chase %s: batch order failed, will retry on tick", state.id)
-                else:
-                    logger.warning("Chase %s: no L1 data, will place on first tick", state.id)
+                        logger.warning("Chase %s: no L1 data, will place on first tick", state.id)
+        finally:
+            for state in states:
+                state._initializing = False
 
         # 5. Register all states and persist
         chase_ids = []
         for state in states:
-            self._active[state.id] = state
             await self._save_state(state)
             await self._publish_event("chase_started", state)
             chase_ids.append(state.id)
@@ -476,6 +489,9 @@ class ChaseEngine:
     ) -> None:
         """Handle L1 tick — place initial order or reprice."""
         if state.status != "ACTIVE":
+            return
+
+        if state._initializing:
             return
 
         # Non-blocking lock: skip tick if a reprice is already in flight.
@@ -970,6 +986,8 @@ class ChaseEngine:
                     created_at=data.get("startedAt", 0) / 1000.0 if data.get("startedAt") else time.time(),
                 )
 
+                self._active[chase_id] = state
+
                 # Subscribe to L1 ticks
                 if self._md:
                     self._md.subscribe(state.symbol, self._make_tick_handler(state))
@@ -983,25 +1001,28 @@ class ChaseEngine:
                     state.initial_price = l1["mid"]
 
                 price = self._compute_chase_price(state, l1)
-                if price:
-                    order = await self._om.place_limit_order(
-                        sub_account_id=state.sub_account_id,
-                        symbol=state.symbol,
-                        side=state.side,
-                        quantity=state.quantity,
-                        price=price,
-                        leverage=state.leverage,
-                        origin="CHASE",
-                        parent_id=chase_id,
-                        on_fill=lambda o, _s=state: self._on_fill(_s, o),
-                        on_cancel=lambda o, r, _s=state: self._on_cancel(_s, o, r),
-                        reduce_only=state.reduce_only,
-                    )
-                    if order.state != "failed":
-                        state.current_order_id = order.client_order_id
-                        state.current_order_price = price
+                try:
+                    if price:
+                        order = await self._om.place_limit_order(
+                            sub_account_id=state.sub_account_id,
+                            symbol=state.symbol,
+                            side=state.side,
+                            quantity=state.quantity,
+                            price=price,
+                            leverage=state.leverage,
+                            origin="CHASE",
+                            parent_id=chase_id,
+                            on_fill=lambda o, _s=state: self._on_fill(_s, o),
+                            on_cancel=lambda o, r, _s=state: self._on_cancel(_s, o, r),
+                            reduce_only=state.reduce_only,
+                        )
+                        if order.state != "failed":
+                            state.current_order_id = order.client_order_id
+                            state.current_order_price = price
+                finally:
+                    state._initializing = False
 
-                self._active[chase_id] = state
+                await self._save_state(state)
                 resumed += 1
                 logger.info("Chase resumed: %s %s %s qty=%.6f", chase_id, state.symbol, state.side, state.quantity)
 
