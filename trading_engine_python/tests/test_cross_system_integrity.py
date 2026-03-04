@@ -89,7 +89,7 @@ SCALPER_JS_KEYS = {
     "totalFillCount", "startSide", "longOffsetPct", "shortOffsetPct",
     "longSizeUsd", "shortSizeUsd", "skew", "longMaxPrice", "shortMinPrice",
     "neutralMode", "leverage", "minFillSpreadPct", "fillDecayHalfLifeMs",
-    "minRefillDelayMs", "allowLoss", "startedAt",
+    "minRefillDelayMs", "allowLoss", "startedAt", "reduceOnlyArmed",
 }
 
 TWAP_JS_KEYS = {

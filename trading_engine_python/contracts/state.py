@@ -155,6 +155,7 @@ class ScalperRedisState:
             "pinLongToEntry": self.pin_long_to_entry,
             "pinShortToEntry": self.pin_short_to_entry,
             "startedAt": self.started_at,
+            "reduceOnlyArmed": self.reduce_only_armed,
         }
 
 

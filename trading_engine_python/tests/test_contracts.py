@@ -366,10 +366,13 @@ class TestScalperRedisState:
     def test_keys(self):
         d = ScalperRedisState(
             scalper_id="s1", sub_account_id="a1", symbol="BTCUSDT",
+            reduce_only_armed=True,
             started_at=ts_ms(),
         ).to_dict()
         _assert_keys(d, ["scalperId", "subAccountId", "symbol", "childCount",
-                         "totalFillCount", "startedAt", "leverage", "startSide"])
+                         "totalFillCount", "startedAt", "leverage", "startSide",
+                         "reduceOnlyArmed"])
+        assert d["reduceOnlyArmed"] is True
         assert "id" not in d
 
 

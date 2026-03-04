@@ -261,6 +261,7 @@ class ScalperEngine:
         self._active: Dict[str, ScalperState] = {}
         # Timer handles for slot retries: key = f"{scalperId}:{side}:{layerIdx}"
         self._slot_tasks: Dict[str, asyncio.Task] = {}
+        self._bg_tasks: Dict[str, set[asyncio.Task]] = {}
         self._price_handlers: Dict[str, Callable] = {}  # scalper_id → L1 handler ref
 
     # ── Public API ──
@@ -438,6 +439,13 @@ class ScalperEngine:
         if tasks_to_await:
             await asyncio.gather(*tasks_to_await, return_exceptions=True)
 
+        bg_tasks = list(self._bg_tasks.pop(scalper_id, set()))
+        for task in bg_tasks:
+            if not task.done():
+                task.cancel()
+        if bg_tasks:
+            await asyncio.gather(*bg_tasks, return_exceptions=True)
+
         # Clean up Redis state BEFORE cancelling child chases,
         # because cancel_chase → cancel_order triggers feed events
         # that cause the frontend to refetch pms:active_scalper.
@@ -445,7 +453,7 @@ class ScalperEngine:
 
         # Unsubscribe the scalper's own L1 price handler
         handler = self._price_handlers.pop(scalper_id, None)
-        if handler and self._md:
+        if handler and self._md and hasattr(self._md, "unsubscribe"):
             self._md.unsubscribe(state.symbol, handler)
 
         if self._redis:
@@ -500,6 +508,25 @@ class ScalperEngine:
                 logger.error("Scalper %s: close positions failed: %s", scalper_id, e)
 
         return True
+
+    async def shutdown(self) -> None:
+        """Stop all active scalpers and cancel any pending background work."""
+        active_ids = list(self._active.keys())
+        for scalper_id in active_ids:
+            try:
+                await self.cancel_scalper(scalper_id)
+            except Exception as e:
+                logger.warning("Scalper %s: shutdown cancel failed: %s", scalper_id, e)
+
+        leftover_tasks = []
+        for scalper_id, tasks in list(self._bg_tasks.items()):
+            self._bg_tasks.pop(scalper_id, None)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+                leftover_tasks.append(task)
+        if leftover_tasks:
+            await asyncio.gather(*leftover_tasks, return_exceptions=True)
 
     def get_state(self, scalper_id: str) -> Optional[ScalperState]:
         return self._active.get(scalper_id)
@@ -693,7 +720,7 @@ class ScalperEngine:
                 logger.error("Scalper %s: restart after %s layer %d fill failed: %s",
                              state.id, slot.side, slot.layer_idx, e)
 
-        asyncio.ensure_future(_restart_after_fill())
+        self._track_task(state.id, asyncio.create_task(_restart_after_fill()))
 
     async def _on_child_cancel(self, state: ScalperState, slot: ScalperSlot, reason: str) -> None:
         """Called when a child chase is cancelled externally."""
@@ -921,6 +948,19 @@ class ScalperEngine:
 
             # Place new chase
             chase_id = await self._place_chase_for_slot(state, slot)
+            if chase_id and (state.status != "active" or state.id not in self._active):
+                logger.warning(
+                    "Scalper %s: slot restart completed after stop — cancelling orphan chase %s",
+                    state.id, chase_id,
+                )
+                try:
+                    await self._chase.cancel_chase(chase_id)
+                except Exception as e:
+                    logger.warning("Scalper %s: orphan chase cancel failed: %s", state.id, e)
+                slot.chase_id = None
+                slot.active = False
+                slot.retry_at = 0
+                return
             if chase_id:
                 slot.chase_id = chase_id
                 slot.active = True
@@ -968,8 +1008,24 @@ class ScalperEngine:
             if state.status == "active":
                 await self._restart_slot(state, slot, is_fill_restart=is_fill)
 
-        task = asyncio.ensure_future(_delayed_restart())
+        task = asyncio.create_task(_delayed_restart())
         self._slot_tasks[timer_key] = task
+        self._track_task(state.id, task)
+
+    def _track_task(self, scalper_id: str, task: asyncio.Task) -> None:
+        """Track fire-and-forget tasks so cancel/shutdown can stop them deterministically."""
+        tasks = self._bg_tasks.setdefault(scalper_id, set())
+        tasks.add(task)
+
+        def _cleanup(_task: asyncio.Task) -> None:
+            tracked = self._bg_tasks.get(scalper_id)
+            if not tracked:
+                return
+            tracked.discard(_task)
+            if not tracked:
+                self._bg_tasks.pop(scalper_id, None)
+
+        task.add_done_callback(_cleanup)
 
     # ── Events ──
 

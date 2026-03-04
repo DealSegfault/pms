@@ -122,6 +122,7 @@ export const EVENT_TYPES = {
  * @property {number} minRefillDelayMs
  * @property {boolean} allowLoss
  * @property {number} startedAt                - ms timestamp
+ * @property {boolean} reduceOnlyArmed
  */
 
 // ── TWAP State Shape (REST + Redis) ─────────────────────────

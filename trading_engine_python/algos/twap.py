@@ -187,6 +187,19 @@ class TWAPEngine:
         await self._publish_event("twap_cancelled", state)
         return True
 
+    async def shutdown(self) -> None:
+        """Cancel all active basket and single TWAPs."""
+        for basket_id in list(self._baskets.keys()):
+            try:
+                await self.cancel_basket_twap(basket_id)
+            except Exception as e:
+                logger.warning("TWAP basket %s: shutdown cancel failed: %s", basket_id, e)
+        for twap_id in list(self._active.keys()):
+            try:
+                await self.cancel_twap(twap_id)
+            except Exception as e:
+                logger.warning("TWAP %s: shutdown cancel failed: %s", twap_id, e)
+
     # ── Basket TWAP ──
 
     async def start_basket_twap(self, params: dict) -> dict:

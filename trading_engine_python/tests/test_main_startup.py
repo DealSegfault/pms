@@ -1,4 +1,5 @@
 import asyncio
+from unittest.mock import patch
 
 from trading_engine_python import main as main_module
 
@@ -38,3 +39,13 @@ def test_classify_startup_error_marks_one_way_requirement_as_fatal():
 
 def test_cleanup_tolerates_missing_resources():
     asyncio.run(main_module._cleanup(None, None, None, None))
+
+
+def test_parent_watchdog_sets_shutdown_when_parent_changes():
+    async def run():
+        shutdown_event = asyncio.Event()
+        with patch("trading_engine_python.main.os.getppid", side_effect=[100, 200]):
+            await main_module._parent_watchdog(shutdown_event, parent_pid=100, interval=0)
+        assert shutdown_event.is_set()
+
+    asyncio.run(run())

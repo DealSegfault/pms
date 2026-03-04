@@ -117,6 +117,15 @@ class ChaseEngine:
                 pass
             self._fill_checker_task = None
 
+    async def shutdown(self) -> None:
+        """Stop background work and cancel any remaining active chases."""
+        await self.stop()
+        for chase_id in list(self._active.keys()):
+            try:
+                await self.cancel_chase(chase_id)
+            except Exception as e:
+                logger.warning("Chase %s: shutdown cancel failed: %s", chase_id, e)
+
     async def _fill_checker_loop(self) -> None:
         """Poll active chase orders for missed fills.
 

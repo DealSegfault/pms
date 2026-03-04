@@ -89,6 +89,10 @@ async def main() -> int:
     user_stream = None
     cmd_handler = None
     depth_supervisor = None
+    chase = None
+    scalper = None
+    twap = None
+    trail_stop = None
     exit_code = EXIT_OK
     services_started = False
     try:
@@ -415,6 +419,7 @@ async def main() -> int:
         logger.info("All components wired — starting services...")
 
         shutdown_event = asyncio.Event()
+        parent_pid = os.getppid()
 
         def handle_signal():
             logger.info("Shutdown signal received")
@@ -453,7 +458,10 @@ async def main() -> int:
                     )
                 )
                 tg.create_task(_periodic_cleanup(order_manager, shutdown_event))
-                tg.create_task(_shutdown_waiter(shutdown_event, cmd_handler, user_stream))
+                tg.create_task(_shutdown_waiter(
+                    shutdown_event, cmd_handler, user_stream, chase, scalper, twap, trail_stop
+                ))
+                tg.create_task(_parent_watchdog(shutdown_event, parent_pid))
 
         except* KeyboardInterrupt:
             pass
@@ -470,6 +478,7 @@ async def main() -> int:
             else:
                 logger.error(message)
     finally:
+        await _shutdown_algos(chase, scalper, twap, trail_stop)
         if depth_supervisor is not None:
             await depth_supervisor.shutdown()
         await _cleanup(redis_client, db, user_stream, cmd_handler)
@@ -481,12 +490,41 @@ async def main() -> int:
     return exit_code
 
 
-async def _shutdown_waiter(event, cmd_handler, user_stream):
+async def _shutdown_waiter(event, cmd_handler, user_stream, chase, scalper, twap, trail_stop):
     """Wait for shutdown signal then stop services."""
     await event.wait()
     await cmd_handler.stop()
+    await _shutdown_algos(chase, scalper, twap, trail_stop)
     await user_stream.stop()
     raise asyncio.CancelledError()
+
+
+async def _shutdown_algos(chase, scalper, twap, trail_stop):
+    """Best-effort algo shutdown for graceful stop and parent death."""
+    for engine in (scalper, twap, trail_stop, chase):
+        if engine is None or not hasattr(engine, "shutdown"):
+            continue
+        try:
+            await engine.shutdown()
+        except Exception as e:
+            logger.error("Algo shutdown failed for %s: %s", engine.__class__.__name__, e)
+
+
+async def _parent_watchdog(shutdown_event, parent_pid: int, interval: float = 1.0):
+    """Exit if the parent Node process dies and leaves this engine orphaned."""
+    if parent_pid <= 1:
+        return
+    while not shutdown_event.is_set():
+        await asyncio.sleep(interval)
+        current_ppid = os.getppid()
+        if current_ppid == parent_pid:
+            continue
+        logger.error(
+            "Parent process changed (expected pid=%d, current ppid=%d) — shutting down Python engine",
+            parent_pid, current_ppid,
+        )
+        shutdown_event.set()
+        return
 
 
 async def _periodic_cleanup(order_manager, shutdown_event, interval: float = 5.0):

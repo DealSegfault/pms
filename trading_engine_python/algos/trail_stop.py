@@ -141,6 +141,14 @@ class TrailStopEngine:
         await self._publish_event("trail_stop_cancelled", state)
         return True
 
+    async def shutdown(self) -> None:
+        """Cancel all active trailing stops."""
+        for trail_stop_id in list(self._active.keys()):
+            try:
+                await self.cancel_trail_stop(trail_stop_id)
+            except Exception as e:
+                logger.warning("Trail stop %s: shutdown cancel failed: %s", trail_stop_id, e)
+
     def _make_tick_handler(self, state: TrailStopState):
         async def handler(symbol: str, bid: float, ask: float, mid: float):
             await self._on_tick(state, mid)
