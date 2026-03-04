@@ -583,7 +583,7 @@ class ChaseEngine:
                         pass
                 return
 
-            if new_order:
+            if new_order and new_order.state != "failed":
                 state.current_order_id = new_order.client_order_id
                 state.current_order_price = new_price
                 new_order.on_fill = lambda o: self._on_fill(state, o)
@@ -593,6 +593,14 @@ class ChaseEngine:
 
                 await self._save_state(state)
                 await self._publish_event("chase_progress", state, currentOrderPrice=new_price)
+            elif new_order and new_order.state == "failed":
+                # replace_order cancelled the old order but failed to place the new one.
+                # Reset current_order_id so the deferred initial order logic recovers it on next tick.
+                logger.warning("Chase %s: replace_order failed to place new order — resetting state to recover", state.id)
+                state.current_order_id = None
+                state.current_order_price = 0
+                state.last_reprice_time = now
+                await self._save_state(state)
             elif new_order is None:
                 # replace_order returned None — old order may have filled during cancel
                 # Let _on_fill handle it (will arrive via UserStream or fill checker)
