@@ -54,6 +54,13 @@ def compute_available_margin(
     }
 
 
+def compute_reserved_margin(total_notional: float, leverage_cap: float) -> float:
+    """Reserve margin based on exposure at the account leverage cap."""
+    if leverage_cap <= 0:
+        return total_notional
+    return total_notional / leverage_cap
+
+
 def compute_margin_usage_ratio(
     equity: float,
     current_margin_used: float,

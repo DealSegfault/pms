@@ -65,6 +65,7 @@ class ScalperSlot:
     fills: int = 0
     _restarting: bool = False
     _restart_pending: bool = False
+    _start_pending: bool = False
 
 
 @dataclass
@@ -611,6 +612,7 @@ class ScalperEngine:
                 "onFill": lambda fp, fq, _s=state, _sl=slot: self._on_child_fill(_s, _sl, fp, fq),
                 "onCancel": lambda reason, _s=state, _sl=slot: self._on_child_cancel(_s, _sl, reason),
             })
+            slot._start_pending = True
             batch_slot_indices.append(i)
 
         # 2. Batch start all chases
@@ -619,31 +621,43 @@ class ScalperEngine:
                 chase_ids = await self._chase.start_chase_batch(batch_params)
                 for j, chase_id in enumerate(chase_ids):
                     slot_idx = batch_slot_indices[j]
-                    if chase_id:
-                        slots[slot_idx].chase_id = chase_id
-                        slots[slot_idx].active = True
+                    slot = slots[slot_idx]
+                    if chase_id and slot._start_pending:
+                        slot.chase_id = chase_id
+                        slot.active = True
+                    slot._start_pending = False
             except Exception as e:
                 logger.error("Scalper %s: batch start_leg failed: %s — falling back to sequential", state.id, e)
                 # Fallback: start individually
                 for j, params in enumerate(batch_params):
                     slot_idx = batch_slot_indices[j]
-                    chase_id = await self._place_chase_for_slot(state, slots[slot_idx])
-                    if chase_id:
-                        slots[slot_idx].chase_id = chase_id
-                        slots[slot_idx].active = True
+                    slot = slots[slot_idx]
+                    if not slot._start_pending:
+                        continue
+                    chase_id = await self._place_chase_for_slot(state, slot)
+                    if chase_id and slot._start_pending:
+                        slot.chase_id = chase_id
+                        slot.active = True
+                    slot._start_pending = False
 
         return slots
 
-    async def _place_chase_for_slot(self, state: ScalperState, slot: ScalperSlot) -> Optional[str]:
+    async def _place_chase_for_slot(
+        self,
+        state: ScalperState,
+        slot: ScalperSlot,
+        quantity_override: Optional[float] = None,
+    ) -> Optional[str]:
         """Place a chase order for a single slot. Returns chase ID or None."""
         if state.status != "active":
             return None
         try:
+            quantity = float(quantity_override if quantity_override is not None else slot.qty)
             chase_params = {
                 "subAccountId": state.sub_account_id,
                 "symbol": state.symbol,
                 "side": slot.side,
-                "quantity": slot.qty,
+                "quantity": quantity,
                 "leverage": state.leverage,
                 "stalkOffsetPct": slot.offset_pct,
                 "stalkMode": "maintain",
@@ -675,6 +689,7 @@ class ScalperEngine:
             return
 
         # ── Fast path: bookkeeping (must complete before chase cleanup) ──
+        slot._start_pending = False
         slot.chase_id = None
         slot.active = False
         slot.fills += 1
@@ -768,7 +783,7 @@ class ScalperEngine:
 
     async def on_chase_fill_event(
         self, scalper_id: str, chase_id: str, fill_price: float, fill_qty: float
-    ) -> None:
+    ) -> bool:
         """Handle chase fill via event stream (replaces lambda callback).
 
         Called by ChaseEngine.on_fill_event when a chase-owned order fills.
@@ -777,19 +792,20 @@ class ScalperEngine:
         state = self._active.get(scalper_id)
         if not state:
             logger.debug("ScalperEngine: scalper %s not active for fill event", scalper_id)
-            return
+            return False
 
         slot = self._find_slot_by_chase(state, chase_id)
         if not slot:
-            logger.warning("ScalperEngine: no slot found for chase %s in scalper %s",
-                           chase_id, scalper_id)
-            return
+            logger.debug("ScalperEngine: no slot found for chase %s in scalper %s",
+                         chase_id, scalper_id)
+            return False
 
         await self._on_child_fill(state, slot, fill_price, fill_qty)
+        return True
 
     async def on_chase_cancel_event(
         self, scalper_id: str, chase_id: str, reason: str
-    ) -> None:
+    ) -> bool:
         """Handle chase cancel via event stream (replaces lambda callback).
 
         Called by ChaseEngine.on_cancel_event when a chase-owned order is cancelled.
@@ -797,15 +813,16 @@ class ScalperEngine:
         state = self._active.get(scalper_id)
         if not state:
             logger.debug("ScalperEngine: scalper %s not active for cancel event", scalper_id)
-            return
+            return False
 
         slot = self._find_slot_by_chase(state, chase_id)
         if not slot:
             logger.debug("ScalperEngine: no slot found for chase %s in scalper %s (may already be cleaned up)",
                          chase_id, scalper_id)
-            return
+            return False
 
         await self._on_child_cancel(state, slot, reason)
+        return True
 
     def _find_slot_by_chase(self, state: ScalperState, chase_id: str) -> Optional[ScalperSlot]:
         """Find the slot that owns a specific chase ID."""
@@ -927,7 +944,10 @@ class ScalperEngine:
             if state.status != "active":
                 return
 
-            # Clamp reduce-only qty to actual exchange position
+            place_qty = slot.qty
+
+            # Clamp reduce-only qty to actual exchange position without ratcheting
+            # the configured slot size downward across the life of the scalper.
             if slot.reduce_only:
                 try:
                     pos_side = "LONG" if slot.side == "SELL" else "SHORT"
@@ -939,15 +959,27 @@ class ScalperEngine:
                         slot.pause_reason = "no_position"
                         await self._broadcast_progress(state)
                         return
-                    if slot.qty > actual_pos.quantity:
-                        logger.info("Scalper %s: clamping %s reduce-only qty %.6f → %.6f (actual position)",
-                                    state.id, slot.side, slot.qty, actual_pos.quantity)
-                        slot.qty = actual_pos.quantity
+                    place_qty = min(slot.qty, actual_pos.quantity)
+                    price = state.last_known_price or 0
+                    if price > 0 and place_qty * price < MIN_NOTIONAL_USD:
+                        # Binance accepts an exact reduce-only close even under the
+                        # normal minimum notional threshold. Use the live position
+                        # size for dust cleanup instead of abandoning unwind coverage.
+                        place_qty = actual_pos.quantity
+                        logger.info(
+                            "Scalper %s: dust override for %s reduce-only slot %.6f → %.6f",
+                            state.id, slot.side, slot.qty, place_qty,
+                        )
+                    elif place_qty < slot.qty:
+                        logger.info(
+                            "Scalper %s: clamping %s reduce-only qty %.6f → %.6f (actual position)",
+                            state.id, slot.side, slot.qty, place_qty,
+                        )
                 except Exception as e:
                     logger.debug("Scalper %s: position clamp check failed: %s", state.id, e)
 
             # Place new chase
-            chase_id = await self._place_chase_for_slot(state, slot)
+            chase_id = await self._place_chase_for_slot(state, slot, quantity_override=place_qty)
             if chase_id and (state.status != "active" or state.id not in self._active):
                 logger.warning(
                     "Scalper %s: slot restart completed after stop — cancelling orphan chase %s",

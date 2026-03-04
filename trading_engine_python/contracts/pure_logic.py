@@ -62,6 +62,13 @@ def chase_should_reprice(
     if stalk_mode == "none":
         return False
 
+    if current_price <= 0:
+        return new_price > 0
+
+    # Never churn the order when the effective target hasn't changed.
+    if abs(new_price - current_price) <= 1e-12:
+        return False
+
     if stalk_mode == "maintain":
         return True
 

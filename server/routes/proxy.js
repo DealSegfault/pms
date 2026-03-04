@@ -28,6 +28,11 @@ export function initProxy(exchangeModule, riskEngineModule) {
     riskEngine = riskEngineModule;
 }
 
+function computeReservedMargin(totalNotional, leverageCap = 100) {
+    const cap = Number(leverageCap) > 0 ? Number(leverageCap) : 1;
+    return totalNotional / cap;
+}
+
 // ── Middleware: resolve sub-account from API key user ──
 
 async function resolveSubAccount(req, res, next) {
@@ -383,10 +388,14 @@ router.get('/v2/balance',
                 available = Math.max(0, snapshot.availableMargin ?? available);
             } else {
                 // Fallback to DB-only estimate
-                const positions = await prisma.virtualPosition.findMany({
-                    where: { subAccountId: sa.id, status: 'OPEN' },
-                });
-                marginUsed = positions.reduce((s, p) => s + p.margin, 0);
+                const [positions, rule] = await Promise.all([
+                    prisma.virtualPosition.findMany({
+                        where: { subAccountId: sa.id, status: 'OPEN' },
+                    }),
+                    prisma.riskRule.findFirst({ where: { subAccountId: sa.id } }),
+                ]);
+                const totalExposure = positions.reduce((s, p) => s + (p.notional || 0), 0);
+                marginUsed = computeReservedMargin(totalExposure, rule?.maxLeverage || 100);
                 available = Math.max(0, sa.currentBalance - marginUsed);
             }
 

@@ -474,6 +474,13 @@ class TestScalperProperties(unittest.TestCase):
             side = _rand_side()
             self.assertTrue(scalper_is_price_allowed(side, mid, None, None))
 
+    def test_chase_maintain_same_price_is_stable(self):
+        """Maintain mode should not churn when the effective target price is unchanged."""
+        for _ in range(N_TRIALS):
+            price = _rand_price()
+            side = _rand_side()
+            self.assertFalse(chase_should_reprice("maintain", side, price, price))
+
 
 # ══════════════════════════════════════════════════════════════
 # 7. L1 Invariant Properties

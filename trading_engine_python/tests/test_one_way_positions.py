@@ -1,10 +1,12 @@
 import asyncio
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
 
 from trading_engine_python.risk.engine import RiskEngine
 from trading_engine_python.risk.position_book import PositionBook, VirtualPos
+from trading_engine_python.risk.validator import TradeValidator
 
 
 def _account_book() -> PositionBook:
@@ -129,6 +131,100 @@ def test_position_book_rejects_two_open_positions_for_same_symbol():
     book.add(first, {"currentBalance": 1000.0})
     with pytest.raises(RuntimeError):
         book.add(second, {"currentBalance": 1000.0})
+
+
+def test_risk_snapshot_uses_rule_leverage_cap_for_available_margin():
+    book = PositionBook()
+    book.load({
+        "s1": {
+            "account": {
+                "id": "s1",
+                "name": "test",
+                "currentBalance": 100.0,
+                "maintenanceRate": 0.005,
+                "status": "ACTIVE",
+            },
+            "positions": [],
+            "rules": {
+                "max_leverage": 100,
+                "max_notional_per_trade": 10000,
+                "max_total_exposure": 10000,
+                "liquidation_threshold": 0.90,
+            },
+        }
+    })
+    book.add(
+        VirtualPos(
+            id="p1",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="LONG",
+            entry_price=100.0,
+            quantity=5.0,
+            notional=500.0,
+            leverage=3,
+            margin=166.6667,
+            mark_price=104.0,
+            unrealized_pnl=20.0,
+        ),
+        {"currentBalance": 100.0},
+    )
+
+    engine = RiskEngine(book, market_data=None, exchange_client=None, redis_client=None, db=None)
+    snap = engine.get_account_snapshot("s1")
+
+    assert snap["equity"] == pytest.approx(120.0)
+    assert snap["marginUsed"] == pytest.approx(5.0)
+    assert snap["availableMargin"] == pytest.approx(115.0)
+
+
+def test_validator_uses_rule_leverage_cap_for_existing_exposure():
+    async def run():
+        book = PositionBook()
+        book.load({
+            "s1": {
+                "account": {
+                    "id": "s1",
+                    "name": "test",
+                    "currentBalance": 100.0,
+                    "maintenanceRate": 0.005,
+                    "status": "ACTIVE",
+                },
+                "positions": [],
+                "rules": {
+                    "max_leverage": 100,
+                    "max_notional_per_trade": 10000,
+                    "max_total_exposure": 10000,
+                    "liquidation_threshold": 0.90,
+                },
+            }
+        })
+        book.add(
+            VirtualPos(
+                id="p1",
+                sub_account_id="s1",
+                symbol="BTCUSDT",
+                side="LONG",
+                entry_price=100.0,
+                quantity=4.0,
+                notional=400.0,
+                leverage=2,
+                margin=200.0,
+            ),
+            {"currentBalance": 100.0},
+        )
+
+        market_data = SimpleNamespace(get_l1=lambda symbol: {"mid": 100.0})
+        validator = TradeValidator(book, market_data)
+        result = await validator.validate("s1", "ETHUSDT", "LONG", 1.0, 100)
+
+        assert result["valid"] is True
+        assert result["computed_values"]["equity"] == pytest.approx(100.0)
+        assert result["computed_values"]["available_margin"] == pytest.approx(95.0)
+        assert result["computed_values"]["required_margin"] == pytest.approx(1.0)
+        assert result["computed_values"]["margin_usage_ratio"] == pytest.approx(0.05)
+
+    asyncio.run(run())
 
 
 def test_account_update_ignores_manual_exchange_activity_without_pms_evidence():
@@ -370,6 +466,81 @@ def test_external_backing_adl_marks_position_event_for_ws_notification():
         reduced = next(payload for event_type, payload in published if event_type == "position_reduced")
         assert reduced["originType"] == "EXCHANGE_ADL"
         assert reduced["reason"] == "BACKING_SHORTAGE"
+
+    asyncio.run(run())
+
+
+def test_risk_engine_db_persistence_uses_datetime_timestamps():
+    async def run():
+        book = _account_book()
+        db = _RecordingDB({"s1": 1000.0})
+        engine = RiskEngine(
+            position_book=book,
+            market_data=None,
+            exchange_client=None,
+            redis_client=None,
+            db=db,
+        )
+
+        await engine.on_order_fill(SimpleNamespace(
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            filled_qty=2.0,
+            avg_fill_price=100.0,
+            leverage=5,
+            reduce_only=False,
+            origin="MANUAL",
+        ))
+        await engine.on_order_fill(SimpleNamespace(
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            filled_qty=1.0,
+            avg_fill_price=110.0,
+            leverage=5,
+            reduce_only=False,
+            origin="MANUAL",
+        ))
+        await engine.on_order_fill(SimpleNamespace(
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="SELL",
+            filled_qty=1.0,
+            avg_fill_price=120.0,
+            leverage=5,
+            reduce_only=False,
+            origin="MANUAL",
+        ))
+        await engine.on_order_fill(SimpleNamespace(
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="SELL",
+            filled_qty=2.0,
+            avg_fill_price=130.0,
+            leverage=5,
+            reduce_only=False,
+            origin="MANUAL",
+        ))
+
+        trade_inserts = 0
+        balance_inserts = 0
+        for sql, params in db.executed:
+            if "INSERT INTO virtual_positions" in sql:
+                assert isinstance(params[-1], datetime)
+            elif "INSERT INTO trade_executions" in sql:
+                trade_inserts += 1
+                assert isinstance(params[-1], datetime)
+            elif "UPDATE virtual_positions SET status = 'CLOSED'" in sql:
+                assert isinstance(params[1], datetime)
+            elif "UPDATE sub_accounts SET current_balance" in sql:
+                assert isinstance(params[1], datetime)
+            elif "INSERT INTO balance_logs" in sql:
+                balance_inserts += 1
+                assert isinstance(params[-1], datetime)
+
+        assert trade_inserts == 4
+        assert balance_inserts == 2
 
     asyncio.run(run())
 

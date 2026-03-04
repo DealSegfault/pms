@@ -3,8 +3,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from trading_engine_python.algos.chase import ChaseEngine
-from trading_engine_python.algos.scalper import ScalperEngine
+from trading_engine_python.algos.chase import ChaseEngine, ChaseState
+from trading_engine_python.algos.scalper import ScalperEngine, ScalperSlot, ScalperState
 from trading_engine_python.contracts.state import ScalperRedisState
 from trading_engine_python.orders.state import OrderState
 
@@ -243,5 +243,174 @@ def test_scalper_cancel_kills_restart_orphan_created_after_stop():
         chase.cancel_chase.assert_called_with("orphan_after_stop")
         assert slot.chase_id is None
         assert slot.active is False
+
+    asyncio.run(run())
+
+
+def test_chase_fill_event_falls_back_to_callback_when_scalper_slot_lookup_misses():
+    async def run():
+        om = SimpleNamespace(cancel_order=AsyncMock())
+        md = SimpleNamespace(_callbacks={})
+        engine = ChaseEngine(om, md, redis_client=None)
+
+        fills = []
+
+        async def on_fill(fill_price, fill_qty):
+            fills.append((fill_price, fill_qty))
+
+        state = ChaseState(
+            id="chase_race_1",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity=1.0,
+            current_order_id="coid_1",
+            parent_scalper_id="scalper_1",
+            on_chase_fill=on_fill,
+        )
+        engine._active[state.id] = state
+        engine._scalper = SimpleNamespace(on_chase_fill_event=AsyncMock(return_value=False))
+
+        await engine.on_fill_event(state, {
+            "client_order_id": "coid_1",
+            "avg_price": 101.25,
+            "fill_qty": 0.75,
+        })
+
+        engine._scalper.on_chase_fill_event.assert_awaited_once_with(
+            "scalper_1", "chase_race_1", 101.25, 0.75
+        )
+        assert fills == [(101.25, 0.75)]
+        assert "chase_race_1" not in engine._active
+
+    asyncio.run(run())
+
+
+def test_scalper_batch_start_does_not_rebind_slot_after_early_fill_callback():
+    async def run():
+        md = _ImmediateSeedMarketData()
+        batch_calls = 0
+
+        async def start_chase_batch(params_list):
+            nonlocal batch_calls
+            batch_calls += 1
+            if batch_calls == 1:
+                result = params_list[0]["onFill"](100.5, params_list[0]["quantity"])
+                if asyncio.iscoroutine(result):
+                    await result
+                return ["boot_opening_0"]
+            return [f"boot_other_{idx}" for idx, _ in enumerate(params_list)]
+
+        chase = SimpleNamespace(
+            start_chase_batch=AsyncMock(side_effect=start_chase_batch),
+            start_chase=AsyncMock(return_value="restart_after_fill"),
+            cancel_chase=AsyncMock(return_value=True),
+        )
+
+        engine = ScalperEngine(SimpleNamespace(), md, chase, redis_client=None)
+        scalper_id = await engine.start_scalper({
+            "subAccountId": "s1",
+            "symbol": "BTCUSDT",
+            "startSide": "LONG",
+            "leverage": 3,
+            "childCount": 1,
+            "longOffsetPct": 0.1,
+            "shortOffsetPct": 0.1,
+            "longSizeUsd": 100,
+            "shortSizeUsd": 100,
+            "neutralMode": True,
+            "minRefillDelayMs": 60000,
+        })
+
+        await asyncio.sleep(0)
+
+        state = engine.get_state(scalper_id)
+        assert state is not None
+        slot = state.long_slots[0]
+        assert state.fill_count == 1
+        assert slot.fills == 1
+        assert slot.chase_id is None
+        assert slot.active is False
+        assert slot._start_pending is False
+
+        await engine.cancel_scalper(scalper_id)
+
+    asyncio.run(run())
+
+
+def test_reduce_only_restart_clamps_runtime_qty_without_shrinking_slot():
+    async def run():
+        md = _ImmediateSeedMarketData()
+        captured = {}
+
+        async def start_chase(params):
+            captured.update(params)
+            return "reduce_only_clamped"
+
+        actual_pos = SimpleNamespace(quantity=2.0)
+        om = SimpleNamespace(
+            _risk=SimpleNamespace(
+                position_book=SimpleNamespace(find_position=lambda sub_id, symbol, side: actual_pos)
+            )
+        )
+        chase = SimpleNamespace(start_chase=AsyncMock(side_effect=start_chase))
+        engine = ScalperEngine(om, md, chase, redis_client=None)
+
+        state = ScalperState(
+            id="scalper_test_1",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            start_side="LONG",
+            leverage=3,
+            last_known_price=10.0,
+        )
+        slot = ScalperSlot(layer_idx=0, side="SELL", qty=5.0, offset_pct=0.1, reduce_only=True)
+        state.short_slots = [slot]
+        engine._active[state.id] = state
+
+        await engine._restart_slot(state, slot)
+
+        assert captured["quantity"] == 2.0
+        assert slot.qty == 5.0
+        assert slot.chase_id == "reduce_only_clamped"
+
+    asyncio.run(run())
+
+
+def test_reduce_only_restart_uses_dust_override_for_live_position():
+    async def run():
+        md = _ImmediateSeedMarketData()
+        captured = {}
+
+        async def start_chase(params):
+            captured.update(params)
+            return "reduce_only_dust"
+
+        actual_pos = SimpleNamespace(quantity=7.0)
+        om = SimpleNamespace(
+            _risk=SimpleNamespace(
+                position_book=SimpleNamespace(find_position=lambda sub_id, symbol, side: actual_pos)
+            )
+        )
+        chase = SimpleNamespace(start_chase=AsyncMock(side_effect=start_chase))
+        engine = ScalperEngine(om, md, chase, redis_client=None)
+
+        state = ScalperState(
+            id="scalper_test_2",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            start_side="LONG",
+            leverage=3,
+            last_known_price=1.0,
+        )
+        slot = ScalperSlot(layer_idx=0, side="SELL", qty=1.0, offset_pct=0.1, reduce_only=True)
+        state.short_slots = [slot]
+        engine._active[state.id] = state
+
+        await engine._restart_slot(state, slot)
+
+        assert captured["quantity"] == 7.0
+        assert slot.qty == 1.0
+        assert slot.chase_id == "reduce_only_dust"
 
     asyncio.run(run())

@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any, List, Optional
 
-from .math import compute_pnl, compute_available_margin, compute_margin_usage_ratio
+from .math import compute_pnl, compute_margin_usage_ratio, compute_reserved_margin
 from .position_book import PositionBook
 
 logger = logging.getLogger(__name__)
@@ -80,12 +80,13 @@ class TradeValidator:
             return {"valid": False, "errors": ["NO_PRICE"]}
 
         notional = quantity * price
-        required_margin = notional / leverage if leverage > 0 else notional
-
         # ── 3. Leverage check ──
         max_lev = rules.get("max_leverage", DEFAULT_RULES["max_leverage"])
         if leverage > max_lev:
             errors.append(f"MAX_LEVERAGE:{leverage}>{max_lev}")
+        reserve_leverage = max(1.0, float(max_lev))
+
+        required_margin = compute_reserved_margin(notional, reserve_leverage)
 
         # ── 4. Notional check ──
         max_notional = rules.get("max_notional_per_trade", DEFAULT_RULES["max_notional_per_trade"])
@@ -98,7 +99,7 @@ class TradeValidator:
 
         other_positions = [p for p in positions if p is not current_pos]
         base_notional = sum(p.notional for p in other_positions)
-        base_margin_used = sum(p.margin for p in other_positions)
+        base_margin_used = compute_reserved_margin(base_notional, reserve_leverage)
         base_upnl = 0.0
         for p in other_positions:
             p_l1 = self._market_data.get_l1(p.symbol) if self._market_data else None
@@ -108,7 +109,10 @@ class TradeValidator:
         resulting_symbol_notional = notional
         resulting_symbol_margin = required_margin
         resulting_symbol_upnl = 0.0
-        current_symbol_margin = current_pos.margin if current_pos else 0.0
+        current_symbol_margin = (
+            compute_reserved_margin(current_pos.notional, reserve_leverage)
+            if current_pos else 0.0
+        )
 
         if current_pos:
             if current_pos.side == side:
@@ -117,12 +121,12 @@ class TradeValidator:
                     (current_pos.entry_price * current_pos.quantity) + (price * quantity)
                 ) / total_qty
                 resulting_symbol_notional = total_qty * avg_entry
-                resulting_symbol_margin = resulting_symbol_notional / leverage if leverage > 0 else resulting_symbol_notional
+                resulting_symbol_margin = compute_reserved_margin(resulting_symbol_notional, reserve_leverage)
                 resulting_symbol_upnl = compute_pnl(side, avg_entry, price, total_qty)
             elif quantity < current_pos.quantity:
                 remaining_qty = current_pos.quantity - quantity
                 resulting_symbol_notional = remaining_qty * current_pos.entry_price
-                resulting_symbol_margin = current_pos.margin * (remaining_qty / current_pos.quantity)
+                resulting_symbol_margin = compute_reserved_margin(resulting_symbol_notional, reserve_leverage)
                 resulting_symbol_upnl = compute_pnl(
                     current_pos.side, current_pos.entry_price, price, remaining_qty
                 )
@@ -133,7 +137,7 @@ class TradeValidator:
             else:
                 remainder = quantity - current_pos.quantity
                 resulting_symbol_notional = remainder * price
-                resulting_symbol_margin = resulting_symbol_notional / leverage if leverage > 0 else resulting_symbol_notional
+                resulting_symbol_margin = compute_reserved_margin(resulting_symbol_notional, reserve_leverage)
                 resulting_symbol_upnl = 0.0
 
         # Total exposure check
@@ -146,26 +150,21 @@ class TradeValidator:
         total_upnl = base_upnl + resulting_symbol_upnl
         total_notional = post_trade_exposure
         balance = account.get("currentBalance", 0)
-        maintenance_rate = account.get("maintenanceRate", 0.005)
-
-        margin_info = compute_available_margin(
-            balance=balance,
-            maintenance_rate=maintenance_rate,
-            total_upnl=total_upnl,
-            total_notional=total_notional,
-        )
+        equity = balance + total_upnl
+        reserved_margin = compute_reserved_margin(total_notional, reserve_leverage)
+        available_margin = equity - reserved_margin
 
         additional_margin = max(0.0, resulting_symbol_margin - current_symbol_margin)
 
         # ── 6. Margin check ──
-        if additional_margin > margin_info["available_margin"]:
+        if additional_margin > available_margin:
             errors.append(
-                f"INSUFFICIENT_MARGIN:{additional_margin:.2f}>{margin_info['available_margin']:.2f}"
+                f"INSUFFICIENT_MARGIN:{additional_margin:.2f}>{available_margin:.2f}"
             )
 
         # ── 7. Margin usage ratio ──
         usage_ratio = compute_margin_usage_ratio(
-            equity=margin_info["equity"],
+            equity=equity,
             current_margin_used=base_margin_used,
             new_margin=resulting_symbol_margin,
         )
@@ -179,10 +178,10 @@ class TradeValidator:
                 "price": price,
                 "notional": notional,
                 "required_margin": additional_margin,
-                "available_margin": margin_info["available_margin"],
+                "available_margin": available_margin,
                 "current_exposure": current_exposure,
-                "equity": margin_info["equity"],
-                "maintenance_margin": margin_info["maintenance_margin"],
+                "equity": equity,
+                "maintenance_margin": reserved_margin,
                 "margin_usage_ratio": usage_ratio,
             },
         }

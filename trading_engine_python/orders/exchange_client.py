@@ -271,10 +271,18 @@ class ExchangeClient:
 
     # ── Query Methods ──
 
-    async def get_order(self, symbol: str, orderId: Optional[int] = None) -> dict:
+    async def get_order(
+        self,
+        symbol: str,
+        orderId: Optional[int] = None,
+        origClientOrderId: Optional[str] = None,
+    ) -> dict:
         """Get order status."""
         return await self._execute(
-            self._client.get_order, self._to_binance_symbol(symbol), orderId=orderId
+            self._client.get_order,
+            self._to_binance_symbol(symbol),
+            orderId=orderId,
+            origClientOrderId=origClientOrderId,
         )
 
     async def get_open_orders(self, symbol: Optional[str] = None) -> list:

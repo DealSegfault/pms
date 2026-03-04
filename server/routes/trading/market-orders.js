@@ -12,6 +12,11 @@ import { proxyToRedis, pushAndWait } from '../../redis-proxy.js';
 
 const router = Router();
 
+function computeReservedMargin(totalNotional, leverageCap = 100) {
+    const cap = Number(leverageCap) > 0 ? Number(leverageCap) : 1;
+    return totalNotional / cap;
+}
+
 // POST /api/trade — Forward to Python engine
 router.post('/', requireOwnership('body'), proxyToRedis('pms:cmd:trade', (req) => ({
     subAccountId: req.body.subAccountId,
@@ -174,17 +179,20 @@ router.get('/positions/:subAccountId', requireOwnership(), async (req, res) => {
         const positions = await prisma.virtualPosition.findMany({
             where: { subAccountId, status: 'OPEN' },
         });
-        const account = await prisma.subAccount.findUnique({
-            where: { id: subAccountId },
-            select: { currentBalance: true, maintenanceRate: true },
-        });
+        const [account, rule] = await Promise.all([
+            prisma.subAccount.findUnique({
+                where: { id: subAccountId },
+                select: { currentBalance: true, maintenanceRate: true },
+            }),
+            prisma.riskRule.findFirst({ where: { subAccountId } }),
+        ]);
 
         const balance = account?.currentBalance || 0;
-        const maintenanceRate = account?.maintenanceRate || 0.005;
+        const reserveLeverage = rule?.maxLeverage || 100;
 
         // Compute summary fields from positions
-        const marginUsed = positions.reduce((s, p) => s + (p.margin || 0), 0);
         const totalExposure = positions.reduce((s, p) => s + (p.notional || 0), 0);
+        const marginUsed = computeReservedMargin(totalExposure, reserveLeverage);
         // Without live prices, unrealized PnL = 0
         const unrealizedPnl = 0;
         const equity = balance + unrealizedPnl;
@@ -256,7 +264,8 @@ router.get('/margin/:subAccountId', requireOwnership(), async (req, res) => {
         ]);
 
         const balance = account?.currentBalance || 0;
-        const marginUsed = positions.reduce((s, p) => s + (p.margin || 0), 0);
+        const totalExposure = positions.reduce((s, p) => s + (p.notional || 0), 0);
+        const marginUsed = computeReservedMargin(totalExposure, rule?.maxLeverage || 100);
         const equity = balance;
         const availableMargin = Math.max(0, equity - marginUsed);
 

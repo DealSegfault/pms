@@ -570,10 +570,14 @@ class ChaseEngine:
             new_price = self._compute_chase_price(state, l1)
             if not new_price:
                 return
+            if getattr(self._om, "_symbol_info", None):
+                new_price = self._om._symbol_info.round_price(state.symbol, new_price)
 
             # Reprice decision via pure function (handles none/maintain/trail)
             current_order = self._om.get_order(state.current_order_id)
             current_price = current_order.price if (current_order and current_order.price) else state.current_order_price
+            if getattr(self._om, "_symbol_info", None) and current_price:
+                current_price = self._om._symbol_info.round_price(state.symbol, current_price)
             if not chase_should_reprice(state.stalk_mode, state.side, current_price, new_price):
                 return  # Pure function says no reprice needed
 
@@ -743,22 +747,26 @@ class ChaseEngine:
         fill_qty = float(event.get("fill_qty", 0) or state.quantity)
 
         # Notify parent scalper if this chase is owned by one
+        handled = False
         if state.parent_scalper_id and hasattr(self, "_scalper") and self._scalper:
             try:
-                await self._scalper.on_chase_fill_event(
+                handled = bool(await self._scalper.on_chase_fill_event(
                     state.parent_scalper_id, state.id, fill_price, fill_qty
-                )
+                ))
             except Exception as e:
                 logger.error("Chase %s: scalper on_chase_fill_event error: %s", state.id, e)
-        elif state.on_chase_fill:
+        if not handled and state.on_chase_fill:
             # Fallback: old callback path (during migration)
             try:
                 cb = state.on_chase_fill
                 result = cb(fill_price, fill_qty)
                 if asyncio.iscoroutine(result):
                     await result
+                handled = True
             except Exception as e:
                 logger.error("Chase %s on_chase_fill callback error: %s", state.id, e)
+        if state.parent_scalper_id and not handled:
+            logger.warning("Chase %s: fill event was not handled by parent scalper", state.id)
 
         await self._cleanup(state)
         await self._publish_event("chase_filled", state, fillPrice=fill_price)
@@ -790,13 +798,25 @@ class ChaseEngine:
             logger.error("Chase %s FSM violation on cancel event: %s", state.id, e)
 
         # If owned by a scalper, delegate restart
+        handled = False
         if state.parent_scalper_id and hasattr(self, "_scalper") and self._scalper:
             try:
-                await self._scalper.on_chase_cancel_event(
+                handled = bool(await self._scalper.on_chase_cancel_event(
                     state.parent_scalper_id, state.id, reason
-                )
+                ))
             except Exception as e:
                 logger.error("Chase %s: scalper on_chase_cancel_event error: %s", state.id, e)
+            if not handled and state.on_chase_cancel:
+                try:
+                    cb = state.on_chase_cancel
+                    result = cb(reason)
+                    if asyncio.iscoroutine(result):
+                        await result
+                    handled = True
+                except Exception as e:
+                    logger.error("Chase %s on_chase_cancel callback error: %s", state.id, e)
+            if not handled:
+                logger.warning("Chase %s: cancel event was not handled by parent scalper", state.id)
             await self._cleanup(state)
             return
         elif state.on_chase_cancel:

@@ -302,6 +302,9 @@ class TestScalperPriceFilterTable(unittest.TestCase):
                     f"{row.leg_side} mid={mid} vs {row.bound_field}={bound_value}: "
                     f"got {result}, expected {row.should_activate}. {row.description}")
 
+    def test_chase_maintain_does_not_reprice_same_price(self):
+        self.assertFalse(chase_should_reprice("maintain", "BUY", 100.0, 100.0))
+
 
 # ══════════════════════════════════════════════════════════════
 # FSM Transition Sequence Tests

@@ -13,7 +13,7 @@ This is the beating heart of the risk system.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import logging
 import math
@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 from .math import (
     compute_pnl,
     compute_margin,
+    compute_reserved_margin,
     compute_liquidation_price,
     create_trade_signature,
     create_open_trade_signature,
@@ -54,6 +55,11 @@ def _db_timestamp_to_seconds(value: Any) -> Optional[float]:
         except ValueError:
             return None
     return None
+
+
+def _db_now() -> datetime:
+    """Return a DB-compatible timestamp for Prisma DateTime columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class RiskEngine:
@@ -1095,10 +1101,14 @@ class RiskEngine:
         orders alongside positions.
         """
         positions = self._book.get_by_sub_account(sub_account_id)
-        account = self._book.get_account(sub_account_id)
+        entry = self._book.get_entry(sub_account_id) or {}
+        account = entry.get("account", {})
+        rules = entry.get("rules") or {}
         balance = account.get("currentBalance", 0)
+        reserve_leverage = max(1.0, float(rules.get("max_leverage", 100)))
 
-        margin_used = sum(p.margin for p in positions)
+        total_notional = sum(p.notional for p in positions)
+        margin_used = compute_reserved_margin(total_notional, reserve_leverage)
         unrealized_pnl = sum(p.unrealized_pnl for p in positions)
         equity = balance + unrealized_pnl
 
@@ -1215,7 +1225,7 @@ class RiskEngine:
             return
 
         try:
-            now_ms = int(time.time() * 1000)
+            now_dt = _db_now()
             sig = create_open_trade_signature(pos.sub_account_id, pos.symbol, pos.side, pos.quantity)
 
             await self._db.execute(
@@ -1225,7 +1235,7 @@ class RiskEngine:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)""",
                 (pos.id, pos.sub_account_id, pos.symbol, pos.side,
                  pos.entry_price, pos.quantity, pos.notional,
-                 float(pos.leverage), pos.margin, pos.liquidation_price, now_ms),
+                 float(pos.leverage), pos.margin, pos.liquidation_price, now_dt),
             )
 
             trade_id = str(uuid.uuid4())
@@ -1241,7 +1251,7 @@ class RiskEngine:
                  getattr(order, 'client_order_id', ''),
                  pos.symbol, side, getattr(order, 'order_type', 'MARKET'),
                  pos.entry_price, pos.quantity, pos.notional,
-                 getattr(order, 'origin', 'MANUAL'), sig, now_ms),
+                 getattr(order, 'origin', 'MANUAL'), sig, now_dt),
             )
         except Exception as e:
             logger.error("Failed to persist open position: %s", e)
@@ -1254,13 +1264,13 @@ class RiskEngine:
             return
 
         try:
-            now_ms = int(time.time() * 1000)
+            now_dt = _db_now()
             sig = create_trade_signature(pos.sub_account_id, "CLOSE", pos.id)
 
             # Close position
             await self._db.execute(
                 "UPDATE virtual_positions SET status = 'CLOSED', realized_pnl = ?, closed_at = ? WHERE id = ?",
-                (pnl, now_ms, pos.id),
+                (pnl, now_dt, pos.id),
             )
 
             # Trade execution
@@ -1284,7 +1294,7 @@ class RiskEngine:
                  getattr(order, 'client_order_id', ''),
                  pos.symbol, side, getattr(order, 'order_type', 'MARKET'),
                  close_price, pos.quantity, pos.quantity * close_price, pnl,
-                 action, origin, sig, now_ms),
+                 action, origin, sig, now_dt),
             )
 
             # Update balance
@@ -1297,7 +1307,7 @@ class RiskEngine:
                 new_balance = old_balance + pnl
                 await self._db.execute(
                     "UPDATE sub_accounts SET current_balance = ?, updated_at = ? WHERE id = ?",
-                    (new_balance, now_ms, pos.sub_account_id),
+                    (new_balance, now_dt, pos.sub_account_id),
                 )
 
                 # Balance log
@@ -1307,7 +1317,7 @@ class RiskEngine:
                         reason, trade_id, timestamp)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (str(uuid.uuid4()), pos.sub_account_id, old_balance, new_balance,
-                     pnl, f"{action}:{pos.symbol}:{pos.side}", trade_id, now_ms),
+                     pnl, f"{action}:{pos.symbol}:{pos.side}", trade_id, now_dt),
                 )
         except Exception as e:
             logger.error("Failed to persist close position: %s", e)
@@ -1320,7 +1330,7 @@ class RiskEngine:
         if not self._db:
             return
         try:
-            now_ms = int(time.time() * 1000)
+            now_dt = _db_now()
             sig = create_trade_signature(pos.sub_account_id, "PARTIAL_CLOSE", pos.id)
 
             # Update position with reduced quantity + new liquidation price
@@ -1339,13 +1349,13 @@ class RiskEngine:
                    (id, sub_account_id, position_id, exchange_order_id, client_order_id,
                     symbol, side, type, price, quantity, notional, fee, realized_pnl,
                     action, origin_type, status, signature, timestamp)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'FILLED', ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'FILLED', ?, ?)""",
                 (trade_id, pos.sub_account_id, pos.id,
                  getattr(order, 'exchange_order_id', ''),
                  getattr(order, 'client_order_id', ''),
                  pos.symbol, side, getattr(order, 'order_type', 'MARKET'),
                  fill_price, fill_qty, fill_qty * fill_price, pnl,
-                 action, origin, sig, now_ms),
+                 action, origin, sig, now_dt),
             )
 
             # Update balance
@@ -1358,7 +1368,7 @@ class RiskEngine:
                 new_balance = old_balance + pnl
                 await self._db.execute(
                     "UPDATE sub_accounts SET current_balance=?, updated_at=? WHERE id=?",
-                    (new_balance, now_ms, pos.sub_account_id),
+                    (new_balance, now_dt, pos.sub_account_id),
                 )
                 await self._db.execute(
                     """INSERT INTO balance_logs
@@ -1366,7 +1376,7 @@ class RiskEngine:
                         reason, trade_id, timestamp)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (str(uuid.uuid4()), pos.sub_account_id, old_balance, new_balance,
-                     pnl, f"{action}:{pos.symbol}:{pos.side}", trade_id, now_ms),
+                     pnl, f"{action}:{pos.symbol}:{pos.side}", trade_id, now_dt),
                 )
         except Exception as e:
             logger.error("Failed to persist partial close: %s", e)
@@ -1380,7 +1390,7 @@ class RiskEngine:
         if not self._db:
             return
         try:
-            now_ms = int(time.time() * 1000)
+            now_dt = _db_now()
             sig = create_trade_signature(pos.sub_account_id, "ADD", pos.id)
 
             # Update position with new avg entry and total qty
@@ -1405,7 +1415,7 @@ class RiskEngine:
                  getattr(order, 'client_order_id', ''),
                  pos.symbol, side, getattr(order, 'order_type', 'MARKET'),
                  fill_price, fill_qty, fill_qty * fill_price,
-                 getattr(order, 'origin', 'MANUAL'), sig, now_ms),
+                 getattr(order, 'origin', 'MANUAL'), sig, now_dt),
             )
         except Exception as e:
             logger.error("Failed to persist add-to-position: %s", e)

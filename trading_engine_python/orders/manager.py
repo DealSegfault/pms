@@ -1436,15 +1436,19 @@ class OrderManager:
         # ── Step 1: Sync ALL tracked active orders with exchange ──
         active_orders = [
             o for o in self._tracker._by_client_id.values()
-            if not o.is_terminal and o.exchange_order_id
+            if not o.is_terminal and (o.exchange_order_id or o.client_order_id)
         ]
-        logger.info("Reconcile: checking %d tracked active orders against exchange", len(active_orders))
+        logger.info(
+            "Reconcile: checking %d tracked active orders against exchange",
+            len(active_orders),
+        )
 
         for order in active_orders:
             try:
                 exchange_data = await self._exchange.get_order(
                     order.symbol,
-                    orderId=int(order.exchange_order_id),
+                    orderId=int(order.exchange_order_id) if order.exchange_order_id else None,
+                    origClientOrderId=order.client_order_id if not order.exchange_order_id else None,
                 )
             except Exception as e:
                 err_str = str(e)
@@ -1499,6 +1503,7 @@ class OrderManager:
         try:
             exchange_orders = await self._exchange.get_open_orders()
             tracked_eids = set(self._tracker._by_exchange_id.keys())
+            tracked_coids = set(self._tracker._by_client_id.keys())
 
             for eo in (exchange_orders or []):
                 coid = eo.get("clientOrderId", "")
@@ -1507,6 +1512,21 @@ class OrderManager:
                     continue
                 if eid in tracked_eids:
                     continue  # Already tracked
+                if coid in tracked_coids:
+                    tracked = self._tracker.lookup(client_order_id=coid)
+                    if tracked and not tracked.is_terminal:
+                        if not tracked.exchange_order_id:
+                            self._tracker.update_exchange_id(coid, eid)
+                        tracked.price = float(eo.get("price", tracked.price or 0) or 0) or tracked.price
+                        tracked.quantity = float(eo.get("origQty", tracked.quantity) or tracked.quantity)
+                        tracked.reduce_only = eo.get("reduceOnly", tracked.reduce_only)
+                        if tracked.state == "placing":
+                            tracked.transition("active")
+                        else:
+                            tracked.updated_at = time.time()
+                        await self._redis_set_open_order(tracked)
+                        logger.info("Reconcile: reattached exchange ID %s to tracked order %s", eid, coid)
+                        continue
 
                 # Orphan: on exchange but not in our tracker
                 logger.warning(
