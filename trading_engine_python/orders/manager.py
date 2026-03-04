@@ -184,6 +184,7 @@ class OrderManager:
 
         except Exception as e:
             order.transition("failed")
+            order._extra["error"] = str(e)
             logger.error("Market order failed: %s %s %s — %s", symbol, side, quantity, e)
             await self._publish_event("order_failed", order, error=str(e))
 
@@ -350,6 +351,7 @@ class OrderManager:
 
         except Exception as e:
             order.transition("failed")
+            order._extra["error"] = str(e)
             logger.error("Limit order failed: %s %s %s@%s — %s", symbol, side, quantity, price, e)
             await self._publish_event("order_failed", order, error=str(e))
 
@@ -505,6 +507,9 @@ class OrderManager:
                 elif isinstance(result, dict) and "code" in result:
                     # Individual order failed within batch
                     order.transition("failed")
+                    code = result.get("code")
+                    msg = result.get("msg", "")
+                    order._extra["error"] = f"code={code} msg={msg}".strip()
                     logger.error(
                         "Batch order %d failed: code=%s msg=%s",
                         i, result.get("code"), result.get("msg"),
@@ -518,6 +523,7 @@ class OrderManager:
             for order in orders:
                 if order.state == "placing":
                     order.transition("failed")
+                    order._extra["error"] = str(e)
             logger.error("Batch order failed entirely: %s", e)
 
         return orders

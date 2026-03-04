@@ -238,6 +238,51 @@ def _is_price_allowed(state: ScalperState, leg_side: str,
     return True
 
 
+def _is_active_pin_allowed(
+    state: ScalperState,
+    leg_side: str,
+    price: float,
+    get_entry_fn=None,
+) -> bool:
+    """Continuous pin-to-entry guard for already-active child chases.
+
+    This intentionally applies only when the explicit pin flags are enabled.
+    It does not extend the legacy allowLoss=false fallback to active repricing.
+    """
+    if price <= 0:
+        return True
+    if leg_side == "BUY" and not state.pin_long_to_entry:
+        return True
+    if leg_side == "SELL" and not state.pin_short_to_entry:
+        return True
+
+    effective_long_max = state.long_max_price
+    effective_short_min = state.short_min_price
+    long_entry = None
+    short_entry = None
+    if get_entry_fn:
+        long_entry = get_entry_fn(state, "LONG")
+        short_entry = get_entry_fn(state, "SHORT")
+
+    if state.pin_long_to_entry:
+        if short_entry and short_entry > 0:
+            effective_long_max = min(effective_long_max, short_entry) if effective_long_max else short_entry
+        if long_entry and long_entry > 0:
+            effective_long_max = min(effective_long_max, long_entry) if effective_long_max else long_entry
+
+    if state.pin_short_to_entry:
+        if long_entry and long_entry > 0:
+            effective_short_min = max(effective_short_min, long_entry) if effective_short_min else long_entry
+        if short_entry and short_entry > 0:
+            effective_short_min = max(effective_short_min, short_entry) if effective_short_min else short_entry
+
+    if leg_side == "BUY" and effective_long_max and price > effective_long_max:
+        return False
+    if leg_side == "SELL" and effective_short_min and price < effective_short_min:
+        return False
+    return True
+
+
 # Side normalization delegated to contracts.common
 _to_exchange_side = normalize_side
 
@@ -560,6 +605,19 @@ class ScalperEngine:
             pass
         return None
 
+    def _has_active_pin_guard(self, state: ScalperState, leg_side: str) -> bool:
+        """Whether this leg should enforce dynamic pin-to-entry while already active."""
+        return (
+            (leg_side == "BUY" and state.pin_long_to_entry)
+            or (leg_side == "SELL" and state.pin_short_to_entry)
+        )
+
+    def _make_active_pin_guard(self, state: ScalperState, leg_side: str) -> Callable[[float], bool]:
+        """Build a runtime-only price guard callback for ChaseEngine."""
+        return lambda market_price, _s=state, _side=leg_side: _is_active_pin_allowed(
+            _s, _side, market_price, get_entry_fn=self._get_position_entry
+        )
+
     # ── Leg Management ──
 
     async def _start_leg(
@@ -612,6 +670,8 @@ class ScalperEngine:
                 "onFill": lambda fp, fq, _s=state, _sl=slot: self._on_child_fill(_s, _sl, fp, fq),
                 "onCancel": lambda reason, _s=state, _sl=slot: self._on_child_cancel(_s, _sl, reason),
             })
+            if self._has_active_pin_guard(state, slot.side):
+                batch_params[-1]["priceGuard"] = self._make_active_pin_guard(state, slot.side)
             slot._start_pending = True
             batch_slot_indices.append(i)
 
@@ -668,6 +728,8 @@ class ScalperEngine:
                 "onFill": lambda fp, fq, _s=state, _sl=slot: self._on_child_fill(_s, _sl, fp, fq),
                 "onCancel": lambda reason, _s=state, _sl=slot: self._on_child_cancel(_s, _sl, reason),
             }
+            if self._has_active_pin_guard(state, slot.side):
+                chase_params["priceGuard"] = self._make_active_pin_guard(state, slot.side)
             chase_id = await self._chase.start_chase(chase_params)
             return chase_id
         except Exception as e:
@@ -726,8 +788,11 @@ class ScalperEngine:
         async def _restart_after_fill():
             try:
                 # Normal mode: first fill on opening leg → arm reduce-only (closing) leg
-                if not state.neutral_mode and is_opening and not state.reduce_only_armed:
-                    await self._arm_reduce_only_leg(state)
+                if not state.neutral_mode and is_opening:
+                    if not state.reduce_only_armed:
+                        await self._arm_reduce_only_leg(state)
+                    else:
+                        await self._reactivate_reduce_only_leg(state)
 
                 # Re-arm this slot with fill spread/burst guards
                 await self._restart_slot(state, slot, is_fill_restart=True)
@@ -742,6 +807,7 @@ class ScalperEngine:
         if state.status != "active":
             return
 
+        slot._start_pending = False
         slot.chase_id = None
         slot.active = False
 
@@ -877,6 +943,31 @@ class ScalperEngine:
         await self._save_state(state)
         await self._broadcast_progress(state)
 
+    async def _reactivate_reduce_only_leg(self, state: ScalperState) -> None:
+        """Re-arm any unwind slots that were parked only because the position went flat."""
+        if state.status != "active" or state.neutral_mode or not state.reduce_only_armed:
+            return
+
+        ro_slots = state.short_slots if state.start_side == "LONG" else state.long_slots
+        woke = 0
+        for slot in ro_slots:
+            if not slot.reduce_only:
+                continue
+            if slot.active or slot.chase_id or slot._restarting or slot._start_pending:
+                continue
+            if slot.pause_reason != "no_position":
+                continue
+
+            slot.paused = False
+            slot.pause_reason = None
+            slot.retry_at = 0
+            await self._restart_slot(state, slot, is_fill_restart=False)
+            woke += 1
+
+        if woke:
+            logger.info("Scalper %s: reactivated %d reduce-only slot(s) after opening fill",
+                        state.id, woke)
+
     # ── Slot Restart Logic ──
 
     async def _restart_slot(self, state: ScalperState, slot: ScalperSlot,
@@ -979,6 +1070,7 @@ class ScalperEngine:
                     logger.debug("Scalper %s: position clamp check failed: %s", state.id, e)
 
             # Place new chase
+            slot._start_pending = True
             chase_id = await self._place_chase_for_slot(state, slot, quantity_override=place_qty)
             if chase_id and (state.status != "active" or state.id not in self._active):
                 logger.warning(
@@ -992,18 +1084,25 @@ class ScalperEngine:
                 slot.chase_id = None
                 slot.active = False
                 slot.retry_at = 0
+                slot._start_pending = False
+                return
+            if chase_id and not slot._start_pending:
+                logger.info("Scalper %s: %s layer %d start resolved during await",
+                            state.id, slot.side, slot.layer_idx)
                 return
             if chase_id:
                 slot.chase_id = chase_id
                 slot.active = True
                 slot.retry_count = 0
                 slot.retry_at = 0
+                slot._start_pending = False
                 # Reset refill count on successful restart
                 state._fill_refill_count[slot.side] = 0
                 await self._save_state(state)
                 await self._broadcast_progress(state)
             else:
                 # Failed — exponential backoff retry
+                slot._start_pending = False
                 slot.retry_count += 1
                 delay = _backoff_delay(slot.retry_count - 1)
                 slot.retry_at = time.time() + delay

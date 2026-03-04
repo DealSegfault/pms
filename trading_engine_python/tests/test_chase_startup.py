@@ -414,3 +414,276 @@ def test_reduce_only_restart_uses_dust_override_for_live_position():
         assert slot.chase_id == "reduce_only_dust"
 
     asyncio.run(run())
+
+
+def test_reduce_only_deferred_reject_pauses_scalper_slot_when_position_gone():
+    async def run():
+        md = SimpleNamespace(_callbacks={}, get_l1=lambda symbol: None)
+
+        async def place_limit_order(**kwargs):
+            order = OrderState(
+                client_order_id="failed_reduce_only",
+                sub_account_id=kwargs["sub_account_id"],
+                symbol=kwargs["symbol"],
+                side=kwargs["side"],
+                order_type="LIMIT",
+                quantity=kwargs["quantity"],
+                price=kwargs["price"],
+                leverage=kwargs["leverage"],
+                origin=kwargs["origin"],
+                parent_id=kwargs["parent_id"],
+                reduce_only=kwargs["reduce_only"],
+                state="placing",
+            )
+            order.transition("failed")
+            order._extra["error"] = "ReduceOnly Order is rejected."
+            return order
+
+        chase_om = SimpleNamespace(
+            place_limit_order=place_limit_order,
+            get_order=lambda client_order_id: None,
+        )
+        chase = ChaseEngine(chase_om, md, redis_client=None)
+
+        scalper_om = SimpleNamespace(
+            _risk=SimpleNamespace(
+                position_book=SimpleNamespace(find_position=lambda *_args: None)
+            )
+        )
+        scalper = ScalperEngine(scalper_om, md, SimpleNamespace(), redis_client=None)
+        chase.set_scalper(scalper)
+
+        slot = ScalperSlot(
+            layer_idx=0,
+            side="SELL",
+            qty=1.0,
+            offset_pct=0.1,
+            reduce_only=True,
+            chase_id="chase_reduce_only_1",
+            active=True,
+        )
+        scalper_state = ScalperState(
+            id="scalper_reduce_only_1",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            start_side="LONG",
+            short_slots=[slot],
+        )
+        scalper._active[scalper_state.id] = scalper_state
+
+        chase_state = ChaseState(
+            id="chase_reduce_only_1",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="SELL",
+            quantity=1.0,
+            reduce_only=True,
+            parent_scalper_id=scalper_state.id,
+            status="ACTIVE",
+        )
+        chase_state._initializing = False
+        chase._active[chase_state.id] = chase_state
+
+        await chase._on_tick(chase_state, "BTCUSDT", 100.0, 101.0, 100.5)
+
+        assert slot.chase_id is None
+        assert slot.active is False
+        assert slot.paused is True
+        assert slot.pause_reason == "no_position"
+        assert chase_state.id not in chase._active
+
+    asyncio.run(run())
+
+
+def test_reduce_only_restart_does_not_rebind_after_immediate_reject_callback():
+    async def run():
+        md = _ImmediateSeedMarketData()
+
+        lookup_results = iter([
+            SimpleNamespace(quantity=1.0),
+            None,
+        ])
+
+        def find_position(*_args):
+            return next(lookup_results, None)
+
+        async def start_chase(params):
+            result = params["onCancel"]("ReduceOnly Order is rejected.")
+            if asyncio.iscoroutine(result):
+                await result
+            return "reject_immediate"
+
+        om = SimpleNamespace(
+            _risk=SimpleNamespace(
+                position_book=SimpleNamespace(find_position=find_position)
+            )
+        )
+        chase = SimpleNamespace(start_chase=AsyncMock(side_effect=start_chase))
+        engine = ScalperEngine(om, md, chase, redis_client=None)
+
+        state = ScalperState(
+            id="scalper_restart_1",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            start_side="LONG",
+            leverage=3,
+            last_known_price=10.0,
+        )
+        slot = ScalperSlot(layer_idx=0, side="SELL", qty=1.0, offset_pct=0.1, reduce_only=True)
+        state.short_slots = [slot]
+        engine._active[state.id] = state
+
+        await engine._restart_slot(state, slot)
+
+        assert slot.chase_id is None
+        assert slot.active is False
+        assert slot.paused is True
+        assert slot.pause_reason == "no_position"
+        assert slot._start_pending is False
+
+    asyncio.run(run())
+
+
+def test_opening_fill_reactivates_reduce_only_slot_paused_for_no_position():
+    async def run():
+        md = _ImmediateSeedMarketData()
+        chase_ids = iter(["reactivated_unwind", "restarted_opening"])
+
+        async def start_chase(params):
+            return next(chase_ids)
+
+        om = SimpleNamespace(
+            _risk=SimpleNamespace(
+                position_book=SimpleNamespace(
+                    find_position=lambda *_args: SimpleNamespace(quantity=2.0)
+                )
+            )
+        )
+        chase = SimpleNamespace(start_chase=AsyncMock(side_effect=start_chase))
+        engine = ScalperEngine(om, md, chase, redis_client=None)
+
+        opening_slot = ScalperSlot(
+            layer_idx=0,
+            side="BUY",
+            qty=1.0,
+            offset_pct=0.1,
+            reduce_only=False,
+            chase_id="opening_old",
+            active=True,
+        )
+        unwind_slot = ScalperSlot(
+            layer_idx=0,
+            side="SELL",
+            qty=1.0,
+            offset_pct=0.1,
+            reduce_only=True,
+            paused=True,
+            pause_reason="no_position",
+        )
+        state = ScalperState(
+            id="scalper_reactivate_1",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            start_side="LONG",
+            leverage=3,
+            last_known_price=10.0,
+            reduce_only_armed=True,
+            long_slots=[opening_slot],
+            short_slots=[unwind_slot],
+        )
+        engine._active[state.id] = state
+
+        await engine._on_child_fill(state, opening_slot, fill_price=10.0, fill_qty=1.0)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert unwind_slot.chase_id == "reactivated_unwind"
+        assert unwind_slot.active is True
+        assert unwind_slot.pause_reason is None
+        assert opening_slot.chase_id == "restarted_opening"
+        assert opening_slot.active is True
+
+    asyncio.run(run())
+
+
+def test_place_chase_for_slot_only_attaches_price_guard_when_pin_enabled():
+    async def run():
+        md = _ImmediateSeedMarketData()
+        captured = {}
+
+        async def start_chase(params):
+            captured.clear()
+            captured.update(params)
+            return "guarded_chase"
+
+        om = SimpleNamespace(
+            _risk=SimpleNamespace(
+                position_book=SimpleNamespace(
+                    find_position=lambda *_args: SimpleNamespace(entry_price=100.0)
+                )
+            )
+        )
+        chase = SimpleNamespace(start_chase=AsyncMock(side_effect=start_chase))
+        engine = ScalperEngine(om, md, chase, redis_client=None)
+
+        state = ScalperState(
+            id="scalper_guard_1",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            start_side="LONG",
+            leverage=3,
+            last_known_price=101.0,
+        )
+        slot = ScalperSlot(layer_idx=0, side="SELL", qty=1.0, offset_pct=0.1, reduce_only=True)
+
+        await engine._place_chase_for_slot(state, slot)
+        assert "priceGuard" not in captured
+
+        state.pin_short_to_entry = True
+        await engine._place_chase_for_slot(state, slot)
+
+        assert callable(captured["priceGuard"])
+        assert captured["priceGuard"](101.0) is True
+        assert captured["priceGuard"](99.0) is False
+
+    asyncio.run(run())
+
+
+def test_active_price_guard_cancels_parent_chase_on_pin_breach():
+    async def run():
+        om = SimpleNamespace(
+            cancel_order=AsyncMock(return_value=True),
+            replace_order=AsyncMock(),
+            get_order=lambda client_order_id: SimpleNamespace(price=100.0),
+        )
+        md = SimpleNamespace(_callbacks={})
+        engine = ChaseEngine(om, md, redis_client=None)
+
+        cancelled = []
+
+        async def on_cancel(reason):
+            cancelled.append(reason)
+
+        state = ChaseState(
+            id="chase_pin_guard_1",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="SELL",
+            quantity=1.0,
+            current_order_id="coid_guard_1",
+            current_order_price=100.0,
+            status="ACTIVE",
+            on_chase_cancel=on_cancel,
+            price_guard=lambda market_price: market_price >= 100.0,
+        )
+        state._initializing = False
+        engine._active[state.id] = state
+
+        await engine._on_tick(state, "BTCUSDT", 99.0, 99.2, 99.1)
+
+        om.cancel_order.assert_awaited_once_with("coid_guard_1")
+        om.replace_order.assert_not_awaited()
+        assert cancelled == ["price_filter"]
+        assert state.id not in engine._active
+
+    asyncio.run(run())

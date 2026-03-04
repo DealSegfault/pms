@@ -64,6 +64,7 @@ class ChaseState:
     # Callbacks for parent algo (scalper) — NOT serialized
     on_chase_fill: Optional[Callable] = field(default=None, repr=False)
     on_chase_cancel: Optional[Callable] = field(default=None, repr=False)
+    price_guard: Optional[Callable[[float], bool]] = field(default=None, repr=False)
     # Concurrency guard — prevents concurrent _on_tick from stacking orders
     _tick_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     # Bootstrap guard — blocks deferred first-order placement until startup/resume
@@ -242,6 +243,7 @@ class ChaseEngine:
             parent_scalper_id=params.get("parentScalperId"),
             on_chase_fill=params.get("onFill"),
             on_chase_cancel=params.get("onCancel"),
+            price_guard=params.get("priceGuard"),
         )
 
         # ── Invariant check: validate state at creation ──
@@ -291,7 +293,13 @@ class ChaseEngine:
                     state.current_order_price = price
                     logger.info("Chase %s: initial order placed at %.8f", chase_id, price)
                 else:
-                    logger.warning("Chase %s: initial order failed, will retry on tick", chase_id)
+                    reason = str(order._extra.get("error") or "order_failed")
+                    handled = await self._handle_failed_parent_order(
+                        state, reason, "initial order"
+                    )
+                    if not handled:
+                        logger.warning("Chase %s: initial order failed (%s), will retry on tick",
+                                       chase_id, reason)
             else:
                 logger.warning("Chase %s: no L1 data yet, will place on first tick", chase_id)
         finally:
@@ -335,6 +343,7 @@ class ChaseEngine:
                 parent_scalper_id=params.get("parentScalperId"),
                 on_chase_fill=params.get("onFill"),
                 on_chase_cancel=params.get("onCancel"),
+                price_guard=params.get("priceGuard"),
             )
 
             try:
@@ -391,7 +400,13 @@ class ChaseEngine:
                             state.current_order_price = order.price or 0
                             logger.info("Chase %s: batch order placed at %.8f", state.id, state.current_order_price)
                         else:
-                            logger.warning("Chase %s: batch order failed, will retry on tick", state.id)
+                            reason = str(order._extra.get("error") or "order_failed")
+                            handled = await self._handle_failed_parent_order(
+                                state, reason, "batch order"
+                            )
+                            if not handled:
+                                logger.warning("Chase %s: batch order failed (%s), will retry on tick",
+                                               state.id, reason)
                     else:
                         logger.warning("Chase %s: no L1 data, will place on first tick", state.id)
         finally:
@@ -493,6 +508,63 @@ class ChaseEngine:
             await self._on_tick(state, symbol, bid, ask, mid)
         return handler
 
+    async def _handle_failed_parent_order(self, state: ChaseState, reason: str, context: str) -> bool:
+        """Route child order placement failures back to the parent algo instead of retrying forever."""
+        if not (state.parent_scalper_id or state.on_chase_cancel):
+            return False
+
+        handled = False
+        if state.parent_scalper_id and hasattr(self, "_scalper") and self._scalper:
+            try:
+                handled = bool(await self._scalper.on_chase_cancel_event(
+                    state.parent_scalper_id, state.id, reason
+                ))
+            except Exception as e:
+                logger.error("Chase %s: scalper on_chase_cancel_event error after %s failure: %s",
+                             state.id, context, e)
+        if not handled and state.on_chase_cancel:
+            try:
+                cb = state.on_chase_cancel
+                result = cb(reason)
+                if asyncio.iscoroutine(result):
+                    await result
+                handled = True
+            except Exception as e:
+                logger.error("Chase %s on_chase_cancel callback error after %s failure: %s",
+                             state.id, context, e)
+        if not handled and state.parent_scalper_id:
+            logger.warning("Chase %s: %s failure was not handled by parent scalper", state.id, context)
+
+        await self._cleanup(state)
+        return True
+
+    async def _enforce_price_guard(self, state: ChaseState, market_price: float) -> bool:
+        """Cancel a child chase immediately when its active pin-to-entry guard is breached."""
+        if not state.price_guard or not state.current_order_id:
+            return False
+        try:
+            allowed = bool(state.price_guard(market_price))
+        except Exception as e:
+            logger.error("Chase %s: price guard callback error: %s", state.id, e)
+            return False
+        if allowed:
+            return False
+
+        logger.info("Chase %s: active price guard breached at %.8f — cancelling child",
+                    state.id, market_price)
+        state.status = "CANCELLED"
+        current_order_id = state.current_order_id
+        if current_order_id:
+            try:
+                await self._om.cancel_order(current_order_id)
+            except Exception as e:
+                logger.warning("Chase %s: active price guard cancel failed: %s", state.id, e)
+
+        handled = await self._handle_failed_parent_order(state, "price_filter", "active price guard")
+        if not handled:
+            await self._cleanup(state)
+        return True
+
     async def _on_tick(
         self, state: ChaseState, symbol: str, bid: float, ask: float, mid: float
     ) -> None:
@@ -508,6 +580,9 @@ class ChaseEngine:
         if state._tick_lock.locked():
             return
         async with state._tick_lock:
+            if await self._enforce_price_guard(state, mid):
+                return
+
             # Deferred initial order: L1 wasn't available at start, place now
             if not state.current_order_id:
                 # Throttle deferred retries to avoid spamming on repeated failures
@@ -535,7 +610,13 @@ class ChaseEngine:
                             reduce_only=state.reduce_only,
                         )
                         if order.state == "failed":
-                            logger.warning("Chase %s: deferred order failed, will retry on next tick", state.id)
+                            reason = str(order._extra.get("error") or "order_failed")
+                            handled = await self._handle_failed_parent_order(
+                                state, reason, "deferred order"
+                            )
+                            if not handled:
+                                logger.warning("Chase %s: deferred order failed (%s), will retry on next tick",
+                                               state.id, reason)
                             return
                         state.current_order_id = order.client_order_id
                         state.current_order_price = price
@@ -609,11 +690,17 @@ class ChaseEngine:
             elif new_order and new_order.state == "failed":
                 # replace_order cancelled the old order but failed to place the new one.
                 # Reset current_order_id so the deferred initial order logic recovers it on next tick.
-                logger.warning("Chase %s: replace_order failed to place new order — resetting state to recover", state.id)
-                state.current_order_id = None
-                state.current_order_price = 0
-                state.last_reprice_time = now
-                await self._save_state(state)
+                reason = str(new_order._extra.get("error") or "order_failed")
+                handled = await self._handle_failed_parent_order(
+                    state, reason, "replace_order"
+                )
+                if not handled:
+                    logger.warning("Chase %s: replace_order failed to place new order (%s) — resetting state to recover",
+                                   state.id, reason)
+                    state.current_order_id = None
+                    state.current_order_price = 0
+                    state.last_reprice_time = now
+                    await self._save_state(state)
             elif new_order is None:
                 # replace_order returned None — old order may have filled during cancel
                 # Let _on_fill handle it (will arrive via UserStream or fill checker)
