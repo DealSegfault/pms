@@ -481,6 +481,8 @@ async def test_scalper_fill_flow():
     slot0 = state.long_slots[0]
     old_chase_id = slot0.chase_id
     await engine._on_child_fill(state, slot0, 65000.0, 0.001)
+    # Yield to let ensure_future(_restart_after_fill) run
+    await asyncio.sleep(0.05)
 
     # Verify: slot was filled and re-armed
     assert slot0.fills == 1

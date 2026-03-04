@@ -805,7 +805,11 @@ class ScalperEngine:
         qtys = [(ro_size_usd * w) / price for w in weights]
 
         logger.info("Scalper %s: arming reduce-only %s leg (first opening fill)", state.id, ro_side)
-        slots = await self._start_leg(state, ro_side, offsets, qtys, reduce_only=True)
+        try:
+            slots = await self._start_leg(state, ro_side, offsets, qtys, reduce_only=True)
+        except Exception:
+            state.reduce_only_armed = False  # Reset — allow next fill to retry
+            raise
 
         if state.status != "active":
             for s in slots:
@@ -1216,6 +1220,21 @@ class ScalperEngine:
                         state.long_slots = other_slots
                     else:
                         state.short_slots = other_slots
+                elif state.reduce_only_armed:
+                    # Non-neutral: restore the reduce-only (unwind) leg
+                    ro_side = "SELL" if start_side == "LONG" else "BUY"
+                    ro_offset = short_offset if start_side == "LONG" else long_offset
+                    ro_size_usd = short_size_usd if start_side == "LONG" else long_size_usd
+                    ro_offsets = _generate_layer_offsets(ro_offset, child_count)
+                    ro_qtys = [(ro_size_usd * w) / price for w in weights]
+                    ro_slots = await self._start_leg(state, ro_side, ro_offsets, ro_qtys,
+                                                      reduce_only=True)
+                    if ro_side == "BUY":
+                        state.long_slots = ro_slots
+                    else:
+                        state.short_slots = ro_slots
+                    logger.info("Scalper %s: resumed reduce-only %s leg (%d slots)",
+                                scalper_id, ro_side, sum(1 for s in ro_slots if s.chase_id))
 
                 # Schedule restart for any failed slots
                 for slot in state.long_slots + state.short_slots:
