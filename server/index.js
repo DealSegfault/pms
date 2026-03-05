@@ -50,9 +50,9 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Request logging
+// Request logging (disabled for production clarity — enable with LOG_REQUESTS=1)
 app.use((req, res, next) => {
-    if (req.url.startsWith('/api') || req.url.startsWith('/fapi')) {
+    if (process.env.LOG_REQUESTS === '1' && (req.url.startsWith('/api') || req.url.startsWith('/fapi'))) {
         console.log(`[API] ${req.method} ${req.url}`);
     }
     next();

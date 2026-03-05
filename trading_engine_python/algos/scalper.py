@@ -381,7 +381,7 @@ class ScalperEngine:
                                 self._md._last_l1[params["symbol"]] = {
                                     "bid": bid, "ask": ask, "mid": mid, "ts": _t.time()
                                 }
-                                logger.info("Pre-warmed L1 for %s from bookTicker: bid=%.6f ask=%.6f", params["symbol"], bid, ask)
+                                logger.debug("Pre-warmed L1 for %s from bookTicker: bid=%.6f ask=%.6f", params["symbol"], bid, ask)
             except Exception as e:
                 logger.debug("bookTicker pre-warm failed for %s: %s", params["symbol"], e)
 
@@ -944,7 +944,7 @@ class ScalperEngine:
         weights = _generate_skew_weights(state.child_count, state.skew)
         qtys = [(ro_size_usd * w) / price for w in weights]
 
-        logger.info("Scalper %s: arming reduce-only %s leg (first opening fill)", state.id, ro_side)
+        logger.debug("Scalper %s: arming reduce-only %s leg (first opening fill)", state.id, ro_side)
         try:
             slots = await self._start_leg(state, ro_side, offsets, qtys, reduce_only=True)
         except Exception:
@@ -995,7 +995,7 @@ class ScalperEngine:
             woke += 1
 
         if woke:
-            logger.info("Scalper %s: reactivated %d reduce-only slot(s) after opening fill",
+            logger.debug("Scalper %s: reactivated %d reduce-only slot(s) after opening fill",
                         state.id, woke)
 
     # ── Slot Restart Logic ──
@@ -1117,7 +1117,7 @@ class ScalperEngine:
                 slot._start_pending = False
                 return
             if chase_id and not slot._start_pending:
-                logger.info("Scalper %s: %s layer %d start resolved during await",
+                logger.debug("Scalper %s: %s layer %d start resolved during await",
                             state.id, slot.side, slot.layer_idx)
                 return
             if chase_id:

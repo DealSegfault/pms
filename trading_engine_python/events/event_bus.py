@@ -131,7 +131,7 @@ class TradeEventBus:
         """
         group = group_name or self.group_name(consumer_name)
         await self.ensure_group(group)
-        logger.info("Consumer '%s' starting on stream '%s' group '%s'",
+        logger.debug("Consumer '%s' starting on stream '%s' group '%s'",
                      consumer_name, STREAM_KEY, group)
 
         # First: process any pending events (from previous crash/restart)

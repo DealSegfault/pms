@@ -202,7 +202,7 @@ class ExchangeClient:
             )
         except ClientError as e:
             if e.error_code in CANCEL_IGNORABLE_CODES:
-                logger.info(
+                logger.debug(
                     "Cancel ignored (code=%d, order already gone): %s",
                     e.error_code, origClientOrderId or orderId,
                 )

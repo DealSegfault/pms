@@ -314,7 +314,7 @@ class BinanceFutures:
                 type=orderType,
                 **kwargs
             )
-            self.logger.info(_fmt_order("ORDER", response))
+            self.logger.debug(_fmt_order("ORDER", response))
             return response
         except ClientError as error:
             self.logger.error(
@@ -439,7 +439,7 @@ class BinanceFutures:
                 orderId=orderId,
                 origClientOrderId=origClientOrderId
             )
-            self.logger.info(_fmt_order("ORDER", response))
+            self.logger.debug(_fmt_order("ORDER", response))
             return response
         except ClientError as error:
             self.logger.error(
@@ -455,7 +455,7 @@ class BinanceFutures:
         """
         try:
             response = self.client.cancel_all_open_orders(symbol=symbol)
-            self.logger.info(f"{_C['YELLOW']}{_C['BOLD']}✖ CANCEL ALL{_C['R']} {_C['BOLD']}{symbol}{_C['R']} {_C['DIM']}{response}{_C['R']}")
+            self.logger.debug(f"{_C['YELLOW']}{_C['BOLD']}✖ CANCEL ALL{_C['R']} {_C['BOLD']}{symbol}{_C['R']} {_C['DIM']}{response}{_C['R']}")
             return response
         except ClientError as error:
             self.logger.error(
@@ -482,7 +482,7 @@ class BinanceFutures:
             response = self.client.new_batch_order(batchOrders=json.dumps(orders))
             for r in response:
                 if isinstance(r, dict) and 'status' in r:
-                    self.logger.info(_fmt_order("BATCH", r))
+                    self.logger.debug(_fmt_order("BATCH", r))
                 elif isinstance(r, dict) and 'code' in r:
                     self.logger.error(f"BATCH order failed: code={r.get('code')} msg={r.get('msg')}")
             return response
@@ -514,7 +514,7 @@ class BinanceFutures:
             response = self.client.cancel_batch_order(**kwargs)
             for r in response:
                 if isinstance(r, dict) and 'status' in r:
-                    self.logger.info(_fmt_order("BATCH_CANCEL", r))
+                    self.logger.debug(_fmt_order("BATCH_CANCEL", r))
             return response
         except ClientError as error:
             self.logger.error(

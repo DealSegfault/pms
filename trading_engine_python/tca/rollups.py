@@ -128,7 +128,7 @@ class TCARollupWorker:
                 summary = await self.recompute_once()
                 changed = summary.get("change_digest") != self._last_log_digest
                 if changed and (summary["sub_account_rollups"] or summary["strategy_rollups"]):
-                    logger.info(
+                    logger.debug(
                         "TCARollupWorker rebuilt %d sub-account rollup(s) and %d strategy rollup(s)",
                         summary["sub_account_rollups"],
                         summary["strategy_rollups"],

@@ -99,7 +99,7 @@ async def main() -> int:
         # ── 0b. Thread pool — increase from default ~12 to 32 for high-latency REST calls ──
         loop = asyncio.get_running_loop()
         loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=32))
-        logger.info("ThreadPoolExecutor set to 32 workers")
+        logger.debug("ThreadPoolExecutor set to 32 workers")
 
         # ── 1. Configuration ──
         api_key = os.getenv("api_key", "")
@@ -135,7 +135,7 @@ async def main() -> int:
         from trading_engine_python.db.base import Database
         db = Database()
         await db.connect()
-        logger.info("DB connected")
+        logger.debug("DB connected")
 
         # ── 4. ExchangeClient ──
         paper_mode = os.getenv("PAPER_TRADING", "0") == "1"
@@ -155,7 +155,7 @@ async def main() -> int:
                 api_key=api_key,
                 api_secret=api_secret,
             )
-        logger.info("ExchangeClient created (%s)", "PAPER" if paper_mode else "LIVE")
+        logger.debug("ExchangeClient created (%s)", "PAPER" if paper_mode else "LIVE")
 
         if not paper_mode and api_key and api_secret:
             mode = await exchange.get_position_mode()
@@ -167,13 +167,13 @@ async def main() -> int:
                     "Binance position mode must be one-way (dualSidePosition=false) "
                     "for the net-position virtual model."
                 )
-            logger.info("Verified Binance position mode: one-way")
+            logger.debug("Verified Binance position mode: one-way")
 
         # ── 4b. Exchange Info (tick sizes, step sizes, min notional) ──
         from trading_engine_python.feeds.symbol_info import SymbolInfoCache
         symbol_info = SymbolInfoCache()
         await symbol_info.load(exchange)
-        logger.info("Loaded %d symbol specs", len(symbol_info))
+        logger.debug("Loaded %d symbol specs", len(symbol_info))
 
         # ── 5. OrderManager ──
         from trading_engine_python.orders.manager import OrderManager
@@ -184,7 +184,7 @@ async def main() -> int:
             symbol_info=symbol_info,
             db=db,
         )
-        logger.info("OrderManager created")
+        logger.debug("OrderManager created")
 
         # ── 6. DepthSupervisor + MarketDataService ──
         from trading_engine_python.feeds.depth_supervisor import DepthSupervisor
@@ -198,7 +198,7 @@ async def main() -> int:
             quote_store=quote_store,
         )
         order_manager.set_market_data(market_data)
-        logger.info("DepthSupervisor + MarketDataService created")
+        logger.debug("DepthSupervisor + MarketDataService created")
 
         # ── 7. RiskEngine ──
         from trading_engine_python.risk.position_book import PositionBook
@@ -251,7 +251,7 @@ async def main() -> int:
                 await db.execute(
                     "UPDATE pending_orders SET client_order_id = id WHERE client_order_id IS NULL"
                 )
-                logger.info("PendingOrder schema migration complete")
+                logger.debug("PendingOrder schema migration complete")
             except Exception as e:
                 logger.debug("PendingOrder migration (may already be done): %s", e)
 
@@ -276,13 +276,13 @@ async def main() -> int:
                    ON virtual_positions(sub_account_id, symbol)
                    WHERE status = 'OPEN'"""
             )
-            logger.info("Verified one-way DB invariant: one OPEN virtual position per symbol")
+            logger.debug("Verified one-way DB invariant: one OPEN virtual position per symbol")
 
         # Load positions from DB
         pos_count = await risk_engine.load_positions()
         logger.info("RiskEngine loaded %d positions", pos_count)
         await risk_engine.write_all_risk_snapshots()
-        logger.info("Published fresh startup risk snapshots")
+        logger.debug("Published fresh startup risk snapshots")
 
         # ── 7c. Reconcile with exchange — close ghosts + fix quantity drift ──
         if not paper_mode and pos_count > 0:
@@ -304,7 +304,7 @@ async def main() -> int:
                         adjusted_symbols,
                     )
                 else:
-                    logger.info("Startup backing reconcile found no unsupported virtual exposure")
+                    logger.debug("Startup backing reconcile found no unsupported virtual exposure")
             except Exception as e:
                 logger.error("Position reconciliation failed (non-fatal): %s", e)
         elif paper_mode:
@@ -338,7 +338,7 @@ async def main() -> int:
         scalper = ScalperEngine(order_manager, market_data, chase, redis_client)
         twap = TWAPEngine(order_manager, market_data, redis_client)
         trail_stop = TrailStopEngine(order_manager, market_data, redis_client)
-        logger.info("Algo engines created (Chase, Scalper, TWAP, TrailStop)")
+        logger.debug("Algo engines created (Chase, Scalper, TWAP, TrailStop)")
 
         chase.set_scalper(scalper)
 
@@ -347,7 +347,7 @@ async def main() -> int:
 
         event_bus = TradeEventBus(redis_client)
         order_manager.set_event_bus(event_bus)
-        logger.info("TradeEventBus created (stream: pms:stream:trade_events)")
+        logger.debug("TradeEventBus created (stream: pms:stream:trade_events)")
 
         # ── 8a.1 Stream Consumers ──
         from trading_engine_python.events.algo_consumer import AlgoConsumer
@@ -396,7 +396,7 @@ async def main() -> int:
         cmd_handler.set_scalper_engine(scalper)
         cmd_handler.set_twap_engine(twap)
         cmd_handler.set_trail_stop_engine(trail_stop)
-        logger.info("CommandHandler wired to all engines")
+        logger.debug("CommandHandler wired to all engines")
 
         # ── 10. UserStreamService ──
         if paper_mode:
@@ -430,10 +430,18 @@ async def main() -> int:
         # ── 11. Subscribe RiskEngine to L1 for all active position symbols ──
         for symbol in position_book._symbol_accounts:
             market_data.subscribe(symbol, risk_engine.on_price_tick)
-            logger.info("Subscribed RiskEngine to L1 for %s", symbol)
+            logger.debug("Subscribed RiskEngine to L1 for %s", symbol)
 
         # ── 12. Run All Services Concurrently ──
-        logger.info("All components wired — starting services...")
+        symbols_list = ", ".join(sorted(position_book._symbol_accounts)[:8])
+        logger.info(
+            "Engine ready: %s | %d positions | %d sub-accounts | %d symbols%s",
+            "PAPER" if paper_mode else "LIVE",
+            pos_count,
+            len(managed_ids),
+            len(position_book._symbol_accounts),
+            f" ({symbols_list})" if symbols_list else "",
+        )
 
         shutdown_event = asyncio.Event()
         parent_pid = os.getppid()

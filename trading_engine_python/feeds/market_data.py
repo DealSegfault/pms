@@ -74,7 +74,7 @@ class MarketDataService:
         if callback not in self._callbacks[symbol]:
             self._callbacks[symbol].append(callback)
             self._subscribed_symbols.add(symbol)
-            logger.info("Subscribed to L1 for %s (total callbacks: %d)", symbol, len(self._callbacks[symbol]))
+            logger.debug("Subscribed to L1 for %s (total callbacks: %d)", symbol, len(self._callbacks[symbol]))
 
         # Start depth stream via supervisor
         if is_new_symbol and self._depth:

@@ -420,7 +420,7 @@ class OrderManager:
                 **kwargs,
             )
             latency_ms = (time.perf_counter() - t0) * 1000
-            logger.info("Limit order placed in %.1fms: %s %s qty=%.6f @ %.8f", latency_ms, symbol, side, quantity, price)
+            logger.debug("Limit order placed in %.1fms: %s %s qty=%.6f @ %.8f", latency_ms, symbol, side, quantity, price)
             eid = str(result.get("orderId", ""))
             if eid:
                 self._tracker.update_exchange_id(order.client_order_id, eid)
@@ -624,7 +624,7 @@ class OrderManager:
 
         # Terminal states — nothing to cancel
         if order.state in ("cancelled", "filled", "expired", "failed"):
-            logger.warning(
+            logger.debug(
                 "cancel_order: order already in terminal state=%s (coid=%s)",
                 order.state, client_order_id,
             )
@@ -653,12 +653,12 @@ class OrderManager:
                     origClientOrderId=order.client_order_id,
                 )
             latency_ms = (time.perf_counter() - t0) * 1000
-            logger.info("Cancel sent in %.1fms: %s %s", latency_ms, order.symbol, client_order_id)
+            logger.debug("Cancel sent in %.1fms: %s %s", latency_ms, order.symbol, client_order_id)
         except Exception as e:
             err_str = str(e)
             # -2011 = "Unknown order" = order already gone (filled or expired)
             if "-2011" in err_str:
-                logger.info("cancel_order: order already gone (filled/expired?): %s", client_order_id)
+                logger.debug("cancel_order: order already gone (filled/expired?): %s", client_order_id)
                 # Let the feed confirm actual state — don't revert
             else:
                 logger.warning("Cancel request failed (feed will resolve): %s — %s", client_order_id, e)

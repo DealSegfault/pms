@@ -152,7 +152,7 @@ export async function subscribeToPmsEvents(broadcastFn) {
             try {
                 const data = JSON.parse(message);
                 const type = channel.replace('pms:events:', '');
-                console.log(`[RedisProxy] ◀ ${type} (subAccountId: ${data.subAccountId || 'none'})`);
+                // Per-event logging removed for production clarity
                 broadcastFn(type, data);
             } catch (err) {
                 console.error('[RedisProxy] Failed to parse PMS event:', err.message);

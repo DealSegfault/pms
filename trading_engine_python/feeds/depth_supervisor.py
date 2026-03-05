@@ -99,7 +99,7 @@ class DepthSupervisor:
             sub.redis_store = self._create_redis_store()
             sub.task = asyncio.create_task(self._supervise(sub))
             self._subs[symbol] = sub
-            logger.info("DepthSupervisor: starting depth stream for %s", symbol)
+            logger.debug("DepthSupervisor: starting depth stream for %s", symbol)
 
     def unsubscribe(self, symbol: str, callback: Callable) -> None:
         """Remove callback. Stops depth stream if no more consumers."""
@@ -181,9 +181,9 @@ class DepthSupervisor:
                 update_buffer = []
 
                 session = aiohttp.ClientSession()
-                logger.info("DepthSupervisor [%s]: connecting to %s", sub.symbol, url)
+                logger.debug("DepthSupervisor [%s]: connecting to %s", sub.symbol, url)
                 ws = await session.ws_connect(url, heartbeat=20)
-                logger.info("DepthSupervisor [%s]: connected", sub.symbol)
+                logger.debug("DepthSupervisor [%s]: connected", sub.symbol)
                 backoff = 1
 
                 # Fetch snapshot in parallel
@@ -231,7 +231,7 @@ class DepthSupervisor:
                         break
 
             except asyncio.CancelledError:
-                logger.info("DepthSupervisor [%s]: cancelled", sub.symbol)
+                logger.debug("DepthSupervisor [%s]: cancelled", sub.symbol)
                 break
             except Exception as e:
                 if sub.stop_event.is_set():
@@ -261,7 +261,7 @@ class DepthSupervisor:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
-        logger.info("DepthSupervisor [%s]: stopped", sub.symbol)
+        logger.debug("DepthSupervisor [%s]: stopped", sub.symbol)
 
     async def _fetch_snapshot(self, session: aiohttp.ClientSession, sub: _DepthSubscription) -> None:
         """Fetch full orderbook snapshot from REST API."""
@@ -278,7 +278,7 @@ class DepthSupervisor:
 
             sub.last_update_id = snapshot["lastUpdateId"]
             sub.snapshot_received = True
-            logger.info("DepthSupervisor [%s]: snapshot fetched (lastUpdateId=%d)",
+            logger.debug("DepthSupervisor [%s]: snapshot fetched (lastUpdateId=%d)",
                         sub.symbol, sub.last_update_id)
 
         except Exception as e:

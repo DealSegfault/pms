@@ -291,7 +291,7 @@ class ChaseEngine:
                 if order.state != "failed":
                     state.current_order_id = order.client_order_id
                     state.current_order_price = price
-                    logger.info("Chase %s: initial order placed at %.8f", chase_id, price)
+                    logger.debug("Chase %s: initial order placed at %.8f", chase_id, price)
                 else:
                     reason = str(order._extra.get("error") or "order_failed")
                     handled = await self._handle_failed_parent_order(
@@ -308,7 +308,7 @@ class ChaseEngine:
         await self._save_state(state)
         await self._publish_event("chase_started", state)
 
-        logger.info("Chase started: %s %s %s qty=%.6f", chase_id, state.symbol, state.side, state.quantity)
+        logger.debug("Chase started: %s %s %s qty=%.6f", chase_id, state.symbol, state.side, state.quantity)
         return chase_id
 
     async def start_chase_batch(self, params_list: list[dict]) -> list[str]:
@@ -398,7 +398,7 @@ class ChaseEngine:
                         if order.state != "failed":
                             state.current_order_id = order.client_order_id
                             state.current_order_price = order.price or 0
-                            logger.info("Chase %s: batch order placed at %.8f", state.id, state.current_order_price)
+                            logger.debug("Chase %s: batch order placed at %.8f", state.id, state.current_order_price)
                         else:
                             reason = str(order._extra.get("error") or "order_failed")
                             handled = await self._handle_failed_parent_order(
@@ -420,7 +420,7 @@ class ChaseEngine:
             await self._publish_event("chase_started", state)
             chase_ids.append(state.id)
 
-        logger.info("Batch started %d chases", len(chase_ids))
+        logger.debug("Batch started %d chases", len(chase_ids))
         return chase_ids
 
     async def cancel_chase(self, chase_id: str) -> bool:
@@ -620,7 +620,7 @@ class ChaseEngine:
                             return
                         state.current_order_id = order.client_order_id
                         state.current_order_price = price
-                        logger.info("Chase %s: deferred initial order placed at %.8f", state.id, price)
+                        logger.debug("Chase %s: deferred initial order placed at %.8f", state.id, price)
                         await self._save_state(state)
                         await self._publish_event("chase_progress", state, currentOrderPrice=price)
                     except Exception as e:
@@ -669,7 +669,7 @@ class ChaseEngine:
             # Chase may have been cancelled/filled while we awaited replace_order.
             if state.status != "ACTIVE" or state.id not in self._active:
                 if new_order:
-                    logger.warning("Chase %s: killed during reprice — cancelling orphan %s",
+                    logger.debug("Chase %s: killed during reprice — cancelling orphan %s",
                                    state.id, new_order.client_order_id)
                     try:
                         await self._om.cancel_order(new_order.client_order_id)
@@ -745,7 +745,7 @@ class ChaseEngine:
                 logger.error("Chase %s on_chase_fill callback error: %s", state.id, e)
         await self._cleanup(state)
         await self._publish_event("chase_filled", state, fillPrice=order.avg_fill_price if order else 0)
-        logger.info("Chase filled: %s", state.id)
+        logger.debug("Chase filled: %s", state.id)
 
     async def _on_cancel(self, state: ChaseState, order: Any, reason: str) -> None:
         """Handle unexpected cancel (not from us)."""

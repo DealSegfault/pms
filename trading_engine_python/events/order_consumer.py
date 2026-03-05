@@ -178,7 +178,7 @@ class OrderConsumer:
             self._tracker.update_exchange_id(order.client_order_id, exchange_order_id)
 
         if order.is_terminal:
-            logger.info(
+            logger.debug(
                 "OrderConsumer: ignoring late NEW for terminal order %s (state=%s)",
                 order.client_order_id,
                 order.state,
@@ -188,7 +188,7 @@ class OrderConsumer:
             logger.debug("OrderConsumer: duplicate NEW for active order %s", order.client_order_id)
             return
         if not order.transition("active"):
-            logger.warning(
+            logger.debug(
                 "OrderConsumer: rejecting NEW for %s in state=%s",
                 order.client_order_id,
                 order.state,
