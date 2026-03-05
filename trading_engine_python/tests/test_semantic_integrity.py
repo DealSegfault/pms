@@ -108,19 +108,17 @@ class TestFloatPrecision:
 
 class TestTimestampConsistency:
     """
-    BUG FOUND: Chase/Scalper use startedAt in MILLISECONDS.
-    OrderState uses createdAt in SECONDS (float).
-    Frontend formatRelativeTime now handles both, but the inconsistency
-    is a landmine for anyone adding new code.
+    External DTO timestamps must stay in milliseconds across order, algo,
+    and risk payloads even though some internal runtime state still uses
+    Python seconds.
     """
 
-    def test_order_created_at_is_seconds(self):
+    def test_order_created_at_is_milliseconds(self):
         from orders.state import OrderState
         o = OrderState(client_order_id="x")
         d = o.to_event_dict()
-        # Seconds float — should be ~1.7e9 range (year 2024+)
-        assert d["createdAt"] < 2e10, \
-            f"createdAt looks like milliseconds: {d['createdAt']}"
+        assert d["createdAt"] > 1e12, \
+            f"createdAt should be ms: {d['createdAt']}"
 
     def test_chase_started_at_is_ms(self):
         from contracts.state import ChaseRedisState
@@ -141,12 +139,17 @@ class TestTimestampConsistency:
         d = t.to_dict()
         assert d["startedAt"] > 1e12
 
+    def test_position_snapshot_opened_at_is_ms(self):
+        from contracts.state import PositionSnapshot
+        d = PositionSnapshot(position_id="x", opened_at=1709000000.123).to_dict()
+        assert d["openedAt"] == 1709000000123
+
     def test_timestamp_unit_documented(self):
         """
         Ensure we know the convention:
+        - Orders: createdAt = MILLISECONDS (int)
         - Algo states: startedAt = MILLISECONDS (int)
-        - Orders: createdAt = SECONDS (float)
-        This test documents the inconsistency so no one assumes uniformity.
+        - Risk snapshots: openedAt = MILLISECONDS (int)
         """
         from orders.state import OrderState
         from contracts.state import ChaseRedisState
@@ -154,9 +157,8 @@ class TestTimestampConsistency:
         chase_ts = ChaseRedisState(
             chase_id="x", started_at=int(time.time() * 1000)
         ).to_dict()["startedAt"]
-        # order is seconds, chase is ms — they differ by ~1000x
-        assert chase_ts / order_ts > 500, \
-            "Timestamp units should differ: algo=ms, order=seconds"
+        assert abs(chase_ts - order_ts) < 60_000, \
+            "Timestamp units should match: external DTOs use ms everywhere"
 
 
 # ═══════════════════════════════════════════════════════════════

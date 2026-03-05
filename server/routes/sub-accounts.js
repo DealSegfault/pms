@@ -1,9 +1,11 @@
 import { Router } from 'express';
+import { randomUUID } from 'crypto';
 import prisma from '../db/prisma.js';
 import { sanitize } from '../sanitize.js';
 import { requireOwnership } from '../ownership.js';
 import { validate } from '../middleware/validate.js';
 import { CreateSubAccountBody, PatchSubAccountBody, SubAccountIdParam } from '../contracts/sub-accounts.contracts.js';
+import { deriveRoutingPrefix } from '../routing-prefix.js';
 
 const router = Router();
 
@@ -46,11 +48,14 @@ router.get('/:id', requireOwnership('params', 'id'), async (req, res) => {
 router.post('/', validate(CreateSubAccountBody), async (req, res) => {
     try {
         const { name, initialBalance, type } = req.body;
+        const id = randomUUID();
         const account = await prisma.subAccount.create({
             data: {
+                id,
                 name,
                 type,
                 userId: req.user?.id || null,
+                routingPrefix: deriveRoutingPrefix(id),
                 initialBalance,
                 currentBalance: initialBalance,
             },

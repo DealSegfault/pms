@@ -33,6 +33,35 @@ def test_risk_consumer_reads_normalized_account_update_payload():
     asyncio.run(run())
 
 
+def test_risk_consumer_persists_order_intent_to_lifecycle_store_only():
+    async def run():
+        lifecycle_store = MagicMock()
+        lifecycle_store.record = AsyncMock()
+        om = MagicMock()
+        om.get_order = MagicMock(return_value=None)
+        consumer = RiskConsumer(
+            order_manager=om,
+            risk_engine=MagicMock(),
+            redis_client=MagicMock(),
+            db=MagicMock(),
+            lifecycle_store=lifecycle_store,
+        )
+
+        event = {
+            "type": "ORDER_INTENT",
+            "client_order_id": "PMS12345678abcd_LMT_deadbeef0010",
+            "sub_account_id": "12345678-aaaa-bbbb-cccc-1234567890ab",
+            "symbol": "BTCUSDT",
+            "_event_id": "1-0",
+        }
+        await consumer.handle([event])
+
+        lifecycle_store.record.assert_awaited_once_with(event, order=None)
+        om.get_order.assert_not_called()
+
+    asyncio.run(run())
+
+
 def test_frontend_consumer_publishes_on_contract_channel():
     async def run():
         redis = MagicMock()
@@ -91,6 +120,73 @@ def test_order_consumer_ignores_late_new_after_fill():
     asyncio.run(run())
 
 
+def test_order_consumer_registers_placeholder_from_order_intent():
+    async def run():
+        tracker = OrderTracker()
+        bus = MagicMock()
+        bus.publish = AsyncMock()
+        om = MagicMock()
+        om._create_bot_order_from_feed = AsyncMock()
+        consumer = OrderConsumer(tracker, bus, om)
+
+        client_order_id = "PMS12345678abcd_LMT_deadbeef0004"
+        await consumer.handle([{
+            "type": "ORDER_INTENT",
+            "client_order_id": client_order_id,
+            "sub_account_id": "12345678-aaaa-bbbb-cccc-1234567890ab",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "quantity": "2.5",
+            "price": "101.5",
+            "origin": "BOT",
+            "intent_ts": "1700000000123",
+        }])
+
+        order = tracker.lookup(client_order_id=client_order_id)
+        assert order is not None
+        assert order.state == "placing"
+        assert order.quantity == 2.5
+        assert order.price == 101.5
+        bus.publish.assert_not_called()
+
+    asyncio.run(run())
+
+
+def test_order_consumer_rejected_event_publishes_failed_state():
+    async def run():
+        tracker = OrderTracker()
+        bus = MagicMock()
+        bus.publish = AsyncMock()
+        om = MagicMock()
+        om._create_bot_order_from_feed = AsyncMock()
+        consumer = OrderConsumer(tracker, bus, om)
+
+        order = OrderState(
+            client_order_id="PMS12345678abcd_LMT_deadbeef0005",
+            sub_account_id="12345678-aaaa-bbbb-cccc-1234567890ab",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=1.0,
+        )
+        order.transition("placing")
+        tracker.register(order)
+
+        await consumer.handle([{
+            "type": "ORDER_REJECTED",
+            "client_order_id": order.client_order_id,
+            "status": "REJECTED",
+            "error": "insufficient margin",
+        }])
+
+        assert order.state == "failed"
+        assert bus.publish.await_args.args[0] == "ORDER_STATE_REJECTED"
+        assert bus.publish.await_args.args[1]["error"] == "insufficient margin"
+
+    asyncio.run(run())
+
+
 def test_risk_consumer_does_not_publish_order_active_for_market_orders():
     async def run():
         order = OrderState(
@@ -118,6 +214,124 @@ def test_risk_consumer_does_not_publish_order_active_for_market_orders():
         om._redis_set_open_order.assert_not_called()
         publish_types = [call.args[0] for call in om._publish_event.await_args_list]
         assert publish_types == []
+
+    asyncio.run(run())
+
+
+def test_risk_consumer_persists_limit_order_on_order_state_new():
+    async def run():
+        order = OrderState(
+            client_order_id="PMS12345678abcd_LMT_deadbeef0006",
+            sub_account_id="12345678-aaaa-bbbb-cccc-1234567890ab",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=1.0,
+            price=100.0,
+            state="active",
+            origin="BOT",
+        )
+        om = MagicMock()
+        om.get_order.return_value = order
+        om._db_persist_pending_order = AsyncMock()
+        om._redis_set_open_order = AsyncMock()
+        om._publish_event = AsyncMock()
+        consumer = RiskConsumer(
+            order_manager=om,
+            risk_engine=MagicMock(),
+            redis_client=MagicMock(),
+            db=MagicMock(),
+        )
+
+        await consumer.handle([{"type": "ORDER_STATE_NEW", "client_order_id": order.client_order_id}])
+
+        om._db_persist_pending_order.assert_awaited_once_with(order)
+        om._redis_set_open_order.assert_awaited_once_with(order)
+
+    asyncio.run(run())
+
+
+def test_risk_consumer_records_lifecycle_before_processing_filled_event():
+    async def run():
+        order = OrderState(
+            client_order_id="PMS12345678abcd_LMT_deadbeef0011",
+            sub_account_id="12345678-aaaa-bbbb-cccc-1234567890ab",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=1.0,
+            price=100.0,
+            filled_qty=1.0,
+            avg_fill_price=100.0,
+            state="filled",
+        )
+        om = MagicMock()
+        om.get_order.return_value = order
+        om._redis_remove_open_order = AsyncMock()
+        om._db_update_pending_order = AsyncMock()
+        om._publish_event = AsyncMock()
+        risk = MagicMock()
+        risk.on_order_fill = AsyncMock()
+        lifecycle_store = MagicMock()
+        lifecycle_store.record = AsyncMock()
+        consumer = RiskConsumer(
+            order_manager=om,
+            risk_engine=risk,
+            redis_client=MagicMock(),
+            db=MagicMock(),
+            lifecycle_store=lifecycle_store,
+        )
+
+        event = {
+            "type": "ORDER_STATE_FILLED",
+            "client_order_id": order.client_order_id,
+            "fill_price": "100.0",
+            "fill_qty": "1.0",
+            "_event_id": "2-0",
+        }
+        await consumer.handle([event])
+
+        lifecycle_store.record.assert_awaited_once_with(event, order=order)
+        risk.on_order_fill.assert_awaited_once_with(order)
+
+    asyncio.run(run())
+
+
+def test_risk_consumer_maps_rejected_state_to_order_failed():
+    async def run():
+        order = OrderState(
+            client_order_id="PMS12345678abcd_LMT_deadbeef0007",
+            sub_account_id="12345678-aaaa-bbbb-cccc-1234567890ab",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=1.0,
+            price=100.0,
+            state="failed",
+        )
+        om = MagicMock()
+        om.get_order.return_value = order
+        om._redis_remove_open_order = AsyncMock()
+        om._publish_event = AsyncMock()
+        consumer = RiskConsumer(
+            order_manager=om,
+            risk_engine=MagicMock(),
+            redis_client=MagicMock(),
+            db=MagicMock(),
+        )
+
+        await consumer.handle([{
+            "type": "ORDER_STATE_REJECTED",
+            "client_order_id": order.client_order_id,
+            "error": "exchange rejected order",
+        }])
+
+        om._redis_remove_open_order.assert_awaited_once_with(order)
+        om._publish_event.assert_awaited_once_with(
+            "order_failed",
+            order,
+            error="exchange rejected order",
+        )
 
     asyncio.run(run())
 

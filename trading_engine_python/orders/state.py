@@ -18,10 +18,13 @@ State machine (feed-driven — transitions come from exchange feed, NOT REST res
 
 from __future__ import annotations
 
+import hashlib
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Any
+
+from contracts.common import normalize_symbol, ts_s_to_ms
 
 # Valid state transitions (current_state → set of allowed next states)
 VALID_TRANSITIONS = {
@@ -39,6 +42,32 @@ VALID_TRANSITIONS = {
 TERMINAL_STATES = {"filled", "cancelled", "expired", "failed"}
 
 
+ROUTING_PREFIX_LEN = 12
+LEGACY_ROUTING_PREFIX_LEN = 8
+
+
+def derive_routing_prefix(sub_account_id: str) -> str:
+    """
+    Derive a stable routing prefix from the full sub-account ID.
+
+    We avoid raw UUID slicing because 32-bit prefixes collide too early once the
+    account set grows. A 12-hex SHA-256 prefix gives 48 bits while staying well
+    within Binance's 36-char clientOrderId limit.
+    """
+    normalized = str(sub_account_id or "").strip().lower()
+    if not normalized:
+        raise ValueError("sub_account_id is required")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:ROUTING_PREFIX_LEN]
+
+
+def derive_legacy_routing_prefix(sub_account_id: str) -> str:
+    """Legacy UUID-slice prefix kept only for migration compatibility."""
+    normalized = str(sub_account_id or "").strip().lower()
+    if not normalized:
+        raise ValueError("sub_account_id is required")
+    return normalized[:LEGACY_ROUTING_PREFIX_LEN]
+
+
 def generate_client_order_id(sub_account_id: str, order_type: str) -> str:
     """
     Generate a unique client order ID for Binance.
@@ -46,13 +75,13 @@ def generate_client_order_id(sub_account_id: str, order_type: str) -> str:
     Format: PMS{sub_prefix}_{type}_{uid}
     - Must be ≤ 36 chars (Binance limit)
     - Prefix PMS enables instant routing from exchange feed
-    - 8-char sub-account prefix enables sub-account resolution without DB lookup
+    - 12-char routing prefix enables sub-account resolution without raw UUID slicing
 
     Examples:
-        PMS_a1b2c3d4_MKT_f9e8d7c6b5a4
-        PMS_a1b2c3d4_LMT_1234abcd5678
+        PMS5994471abb01_MKT_f9e8d7c6b5a4
+        PMS5994471abb01_LMT_1234abcd5678
     """
-    prefix = sub_account_id[:8]
+    prefix = derive_routing_prefix(sub_account_id)
     uid = uuid.uuid4().hex[:12]
     return f"PMS{prefix}_{order_type}_{uid}"
 
@@ -69,7 +98,7 @@ class OrderState:
     """
 
     # ── Identity ──
-    client_order_id: str                          # PMS{sub[:8]}_{type}_{uuid}
+    client_order_id: str                          # PMS{routing_prefix}_{type}_{uuid}
     sub_account_id: str = ""
     exchange_order_id: Optional[str] = None
 
@@ -174,7 +203,7 @@ class OrderState:
             "clientOrderId": self.client_order_id,
             "exchangeOrderId": self.exchange_order_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "orderType": self.order_type,
             "quantity": self.quantity,
@@ -188,8 +217,8 @@ class OrderState:
             "origin": self.origin,
             "parentId": self.parent_id,
             "leverage": self.leverage,
-            "createdAt": self.created_at,
-            "updatedAt": self.updated_at,
+            "createdAt": ts_s_to_ms(self.created_at),
+            "updatedAt": ts_s_to_ms(self.updated_at),
         }
 
     def __repr__(self) -> str:

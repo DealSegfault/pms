@@ -15,6 +15,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
+from contracts.common import normalize_symbol, ts_external_to_s
+
 logger = logging.getLogger(__name__)
 
 
@@ -140,11 +142,11 @@ class PositionBook:
                 seen_symbols.add(symbol_key)
                 vp = VirtualPos(
                     id=p["id"], sub_account_id=sub_id,
-                    symbol=p["symbol"], side=p["side"],
+                    symbol=normalize_symbol(p["symbol"]) if p.get("symbol") else "", side=p["side"],
                     entry_price=p["entryPrice"], quantity=p["quantity"],
                     notional=p["notional"], leverage=int(p["leverage"]),
                     margin=p["margin"], liquidation_price=p.get("liquidationPrice", 0),
-                    opened_at=p.get("openedAt"),
+                    opened_at=ts_external_to_s(p.get("openedAt")),
                 )
                 pos_map[p["id"]] = vp
                 self._add_symbol_index(p["symbol"], sub_id)

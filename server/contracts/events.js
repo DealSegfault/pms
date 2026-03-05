@@ -61,6 +61,56 @@ export const EVENT_TYPES = {
     MARGIN_WARNING: 'margin_warning',
 };
 
+// Raw Redis Stream lifecycle events (internal, not WebSocket payloads).
+export const LIFECYCLE_STREAM_EVENTS = {
+    ORDER_INTENT: 'ORDER_INTENT',
+    ORDER_NEW: 'ORDER_NEW',
+    ORDER_PARTIALLY_FILLED: 'ORDER_PARTIALLY_FILLED',
+    ORDER_FILLED: 'ORDER_FILLED',
+    ORDER_CANCELLED: 'ORDER_CANCELLED',
+    ORDER_EXPIRED: 'ORDER_EXPIRED',
+    ORDER_REJECTED: 'ORDER_REJECTED',
+};
+
+/**
+ * @typedef {Object} OrderIntentLifecyclePayload
+ * @property {"ORDER_INTENT"} type
+ * @property {string} client_order_id
+ * @property {string} sub_account_id
+ * @property {string} routing_prefix
+ * @property {string} symbol
+ * @property {string} side
+ * @property {string} order_type
+ * @property {string|number} quantity
+ * @property {string|number} price
+ * @property {string|boolean} reduce_only
+ * @property {string} origin
+ * @property {string} execution_scope
+ * @property {string|number} decision_bid
+ * @property {string|number} decision_ask
+ * @property {string|number} decision_mid
+ * @property {string|number} decision_spread_bps
+ * @property {string|number} intent_ts
+ * @property {string|number} source_ts
+ * @property {string|number} ingested_ts
+ */
+
+/**
+ * @typedef {Object} OrderRejectedLifecyclePayload
+ * @property {"ORDER_REJECTED"} type
+ * @property {string} client_order_id
+ * @property {string} sub_account_id
+ * @property {string} symbol
+ * @property {string} side
+ * @property {string} order_type
+ * @property {string} error
+ * @property {string} reason
+ * @property {string} status
+ * @property {string|number} rejected_ts
+ * @property {string|number} source_ts
+ * @property {string|number} ingested_ts
+ */
+
 // ── Chase State Shape (REST + Redis) ────────────────────────
 /**
  * @typedef {Object} ChaseState
@@ -176,7 +226,7 @@ export const EVENT_TYPES = {
  * @property {number} unrealizedPnl
  * @property {number} pnlPercent
  * @property {number} markPrice
- * @property {number} openedAt
+ * @property {number} openedAt                 - ms timestamp
  */
 
 /**

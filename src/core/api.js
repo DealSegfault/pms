@@ -56,6 +56,15 @@ export async function api(path, options = {}) {
         const message = payload?.error || payload?.reasons?.join(', ') || 'Request failed';
         const error = new Error(message);
         if (payload?.errors) error.errors = payload.errors;
+        if (payload && typeof payload === 'object') {
+            error.payload = payload;
+            error.errorCode = payload.errorCode || payload.error?.code;
+            error.errorCategory = payload.errorCategory || payload.error?.category;
+            error.details = payload.details || payload.error?.details;
+            if (!error.message && payload.message) {
+                error.message = payload.message;
+            }
+        }
         throw error;
     }
 

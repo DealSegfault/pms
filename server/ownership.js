@@ -6,6 +6,7 @@
  * Sets req.subAccount on success.
  */
 import prisma from './db/prisma.js';
+import { buildApiErrorBody } from './http/api-taxonomy.js';
 
 /**
  * Factory: returns middleware that extracts subAccountId from the given source.
@@ -21,7 +22,11 @@ export function requireOwnership(source = 'params', key = 'subAccountId') {
                         null;
 
         if (!subAccountId) {
-            return res.status(400).json({ error: `Missing ${key}` });
+            return res.status(400).json(buildApiErrorBody({
+                code: 'VALIDATION_MISSING_SUBACCOUNT',
+                category: 'VALIDATION',
+                message: `Missing ${key}`,
+            }));
         }
 
         // Admins can access any sub-account
@@ -36,11 +41,19 @@ export function requireOwnership(source = 'params', key = 'subAccountId') {
         });
 
         if (!account) {
-            return res.status(404).json({ error: 'Sub-account not found' });
+            return res.status(404).json(buildApiErrorBody({
+                code: 'OWNERSHIP_SUBACCOUNT_NOT_FOUND',
+                category: 'OWNERSHIP',
+                message: 'Sub-account not found',
+            }));
         }
 
         if (account.userId !== req.user?.id) {
-            return res.status(403).json({ error: 'You do not own this sub-account' });
+            return res.status(403).json(buildApiErrorBody({
+                code: 'OWNERSHIP_FORBIDDEN',
+                category: 'OWNERSHIP',
+                message: 'You do not own this sub-account',
+            }));
         }
 
         next();
@@ -56,7 +69,11 @@ export function requirePositionOwnership(paramKey = 'positionId') {
     return async (req, res, next) => {
         const positionId = req.params[paramKey];
         if (!positionId) {
-            return res.status(400).json({ error: `Missing ${paramKey}` });
+            return res.status(400).json(buildApiErrorBody({
+                code: 'VALIDATION_MISSING_POSITION_ID',
+                category: 'VALIDATION',
+                message: `Missing ${paramKey}`,
+            }));
         }
 
         if (req.user?.role === 'ADMIN') {
@@ -70,7 +87,11 @@ export function requirePositionOwnership(paramKey = 'positionId') {
 
         if (position) {
             if (position.subAccount?.userId !== req.user?.id) {
-                return res.status(403).json({ error: 'You do not own this position' });
+                return res.status(403).json(buildApiErrorBody({
+                    code: 'OWNERSHIP_POSITION_FORBIDDEN',
+                    category: 'OWNERSHIP',
+                    message: 'You do not own this position',
+                }));
             }
             req.subAccountId = position.subAccountId;
             return next();
@@ -78,7 +99,11 @@ export function requirePositionOwnership(paramKey = 'positionId') {
 
         const hintedSubAccountId = req.body?.subAccountId || req.query?.subAccountId || null;
         if (!hintedSubAccountId) {
-            return res.status(404).json({ error: 'Position not found' });
+            return res.status(404).json(buildApiErrorBody({
+                code: 'POSITION_NOT_FOUND',
+                category: 'VALIDATION',
+                message: 'Position not found',
+            }));
         }
 
         const account = await prisma.subAccount.findUnique({
@@ -86,10 +111,18 @@ export function requirePositionOwnership(paramKey = 'positionId') {
             select: { userId: true },
         });
         if (!account) {
-            return res.status(404).json({ error: 'Sub-account not found' });
+            return res.status(404).json(buildApiErrorBody({
+                code: 'OWNERSHIP_SUBACCOUNT_NOT_FOUND',
+                category: 'OWNERSHIP',
+                message: 'Sub-account not found',
+            }));
         }
         if (account.userId !== req.user?.id) {
-            return res.status(403).json({ error: 'You do not own this sub-account' });
+            return res.status(403).json(buildApiErrorBody({
+                code: 'OWNERSHIP_FORBIDDEN',
+                category: 'OWNERSHIP',
+                message: 'You do not own this sub-account',
+            }));
         }
 
         req.subAccountId = hintedSubAccountId;
@@ -104,7 +137,11 @@ export function requireOrderOwnership(paramKey = 'orderId') {
     return async (req, res, next) => {
         const orderId = req.params[paramKey];
         if (!orderId) {
-            return res.status(400).json({ error: `Missing ${paramKey}` });
+            return res.status(400).json(buildApiErrorBody({
+                code: 'VALIDATION_MISSING_ORDER_ID',
+                category: 'VALIDATION',
+                message: `Missing ${paramKey}`,
+            }));
         }
 
         if (req.user?.role === 'ADMIN') {
@@ -117,11 +154,19 @@ export function requireOrderOwnership(paramKey = 'orderId') {
         });
 
         if (!order) {
-            return res.status(404).json({ error: 'Order not found' });
+            return res.status(404).json(buildApiErrorBody({
+                code: 'ORDER_NOT_FOUND',
+                category: 'VALIDATION',
+                message: 'Order not found',
+            }));
         }
 
         if (order.subAccount?.userId !== req.user?.id) {
-            return res.status(403).json({ error: 'You do not own this order' });
+            return res.status(403).json(buildApiErrorBody({
+                code: 'OWNERSHIP_ORDER_FORBIDDEN',
+                category: 'OWNERSHIP',
+                message: 'You do not own this order',
+            }));
         }
 
         next();

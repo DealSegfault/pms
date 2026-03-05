@@ -24,9 +24,17 @@ import logging
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from .state import OrderState, generate_client_order_id, TERMINAL_STATES
+from .state import (
+    OrderState,
+    TERMINAL_STATES,
+    derive_legacy_routing_prefix,
+    derive_routing_prefix,
+    generate_client_order_id,
+)
 from .tracker import OrderTracker
 from .exchange_client import ExchangeClient
+from contracts.common import StreamEventType, ts_ms
+from contracts.events import OrderIntentStreamEvent, OrderRejectedStreamEvent
 from contracts.invariants import InvariantViolation
 
 logger = logging.getLogger(__name__)
@@ -38,6 +46,12 @@ _TYPE_PREFIX = {
     "STOP_MARKET": "STP",
     "TAKE_PROFIT_MARKET": "TPM",
 }
+
+
+def _spread_bps(bid: float, ask: float, mid: float) -> Optional[float]:
+    if bid <= 0 or ask <= 0 or mid <= 0:
+        return None
+    return ((ask - bid) / mid) * 10_000.0
 
 
 class OrderManager:
@@ -65,10 +79,21 @@ class OrderManager:
         self._seq: int = 0  # Monotonic event sequence number
         self._ignored_prefixes: set = set()  # sub-account prefixes we can't resolve (other server)
         self._managed_accounts: Optional[set] = None  # sub-account IDs this server manages (None = all)
+        self._sub_account_cache: Dict[str, str] = {}
+        self._event_bus: Any = None
+        self._market_data: Any = None
 
     def set_risk_engine(self, risk_engine: Any) -> None:
         """Wire up the risk engine after it's created (Step 7)."""
         self._risk = risk_engine
+
+    def set_event_bus(self, event_bus: Any) -> None:
+        """Wire the Redis Stream bus used for lifecycle events."""
+        self._event_bus = event_bus
+
+    def set_market_data(self, market_data: Any) -> None:
+        """Wire the market-data cache used for decision-time context."""
+        self._market_data = market_data
 
     def set_managed_accounts(self, sub_ids: set) -> None:
         """Set the sub-account IDs this server manages.
@@ -77,6 +102,8 @@ class OrderManager:
         When None, all PMS-tagged fills are processed (single-server mode).
         """
         self._managed_accounts = sub_ids
+        self._ignored_prefixes.clear()
+        self._sub_account_cache.clear()
         logger.info("OrderManager: managing %d sub-accounts", len(sub_ids))
 
     def set_symbol_info(self, symbol_info: Any) -> None:
@@ -92,6 +119,56 @@ class OrderManager:
         """Monotonic sequence number for event ordering."""
         self._seq += 1
         return self._seq
+
+    async def _publish_order_intent(self, order: OrderState) -> bool:
+        """Publish a submit-time lifecycle intent when the stream bus is active."""
+        if not self._event_bus:
+            return False
+
+        intent_ts = ts_ms()
+        event = OrderIntentStreamEvent.from_order_state(order, source_ts=intent_ts)
+        event.routing_prefix = derive_routing_prefix(order.sub_account_id)
+        event.intent_ts = intent_ts
+        if self._market_data:
+            l1 = self._market_data.get_l1(order.symbol)
+            if l1:
+                bid = float(l1.get("bid", 0) or 0)
+                ask = float(l1.get("ask", 0) or 0)
+                mid = float(l1.get("mid", 0) or 0)
+                if bid > 0:
+                    event.decision_bid = bid
+                if ask > 0:
+                    event.decision_ask = ask
+                if mid > 0:
+                    event.decision_mid = mid
+                    event.decision_spread_bps = _spread_bps(bid, ask, mid)
+        event_id = await self._event_bus.publish(
+            StreamEventType.ORDER_INTENT,
+            event.to_stream_dict(),
+        )
+        return bool(event_id)
+
+    async def _publish_order_rejected(self, order: OrderState, error: str) -> bool:
+        """Publish a submit-time rejection when the stream bus is active."""
+        if not self._event_bus:
+            return False
+
+        rejected_ts = ts_ms()
+        event = OrderRejectedStreamEvent.from_order_state(order, source_ts=rejected_ts)
+        event.error = error
+        event.reason = error
+        event.rejected_ts = rejected_ts
+        event_id = await self._event_bus.publish(
+            StreamEventType.ORDER_REJECTED,
+            event.to_stream_dict(),
+        )
+        return bool(event_id)
+
+    async def _handle_submit_failure(self, order: OrderState, error: str) -> None:
+        """Preserve the legacy failure event when stream publication is unavailable."""
+        published = await self._publish_order_rejected(order, error)
+        if not published:
+            await self._publish_event("order_failed", order, error=error)
 
     # ── Public API: Place Orders ──
 
@@ -141,6 +218,7 @@ class OrderManager:
 
         order.transition("placing")
         self._tracker.register(order)
+        await self._publish_order_intent(order)
 
         try:
             t0 = time.perf_counter()
@@ -186,7 +264,7 @@ class OrderManager:
             order.transition("failed")
             order._extra["error"] = str(e)
             logger.error("Market order failed: %s %s %s — %s", symbol, side, quantity, e)
-            await self._publish_event("order_failed", order, error=str(e))
+            await self._handle_submit_failure(order, str(e))
 
         return order
 
@@ -328,6 +406,7 @@ class OrderManager:
 
         order.transition("placing")
         self._tracker.register(order)
+        await self._publish_order_intent(order)
 
         try:
             t0 = time.perf_counter()
@@ -353,7 +432,7 @@ class OrderManager:
             order.transition("failed")
             order._extra["error"] = str(e)
             logger.error("Limit order failed: %s %s %s@%s — %s", symbol, side, quantity, price, e)
-            await self._publish_event("order_failed", order, error=str(e))
+            await self._handle_submit_failure(order, str(e))
 
         return order
 
@@ -476,6 +555,7 @@ class OrderManager:
 
             order.transition("placing")
             self._tracker.register(order)
+            await self._publish_order_intent(order)
             orders.append(order)
 
             exchange_params.append({
@@ -514,9 +594,11 @@ class OrderManager:
                         "Batch order %d failed: code=%s msg=%s",
                         i, result.get("code"), result.get("msg"),
                     )
+                    await self._handle_submit_failure(order, order._extra["error"])
                 else:
                     order.transition("failed")
                     logger.error("Batch order %d: unexpected result: %s", i, result)
+                    await self._handle_submit_failure(order, "unexpected batch order result")
 
         except Exception as e:
             # Entire batch failed — mark all as failed
@@ -524,6 +606,7 @@ class OrderManager:
                 if order.state == "placing":
                     order.transition("failed")
                     order._extra["error"] = str(e)
+                    await self._handle_submit_failure(order, str(e))
             logger.error("Batch order failed entirely: %s", e)
 
         return orders
@@ -957,7 +1040,7 @@ class OrderManager:
                 # Fallback: parse from client order ID prefix
                 parts = coid[3:].split("_", 2)
                 sub_prefix = parts[0] if len(parts) >= 1 else ""
-                sub_account_id = self._resolve_sub_account(sub_prefix)
+                sub_account_id = await self._resolve_sub_account_async(sub_prefix)
                 leverage = 1
                 if not sub_account_id:
                     logger.debug("Cannot resolve sub-account for order %s", coid)
@@ -985,7 +1068,7 @@ class OrderManager:
             await self._redis_set_open_order(order)
             count += 1
             logger.debug("Recovered order: %s %s %s qty=%.6f @ %.2f (sub=%s)",
-                         coid, order.symbol, order.side, order.quantity, order.price or 0, sub_account_id[:8])
+                         coid, order.symbol, order.side, order.quantity, order.price or 0, derive_routing_prefix(sub_account_id))
 
         # Step 4: Mark stale DB orders (not on exchange) as CANCELLED
         if self._db:
@@ -1008,7 +1091,7 @@ class OrderManager:
         return count
 
     def _resolve_sub_account(self, prefix: str) -> Optional[str]:
-        """Resolve 8-char sub-account prefix to full ID.
+        """Resolve a routing prefix to the full sub-account ID.
 
         Checks PositionBook first (fast, in-memory), falls back to
         cached DB lookup for sub-accounts that don't yet have positions.
@@ -1021,14 +1104,21 @@ class OrderManager:
             book = getattr(self._risk, 'position_book', None) or getattr(self._risk, '_book', None)
             if book:
                 for sub_id in book._entries:
-                    if sub_id.startswith(prefix):
+                    account = book.get_account(sub_id) or {}
+                    candidate = (
+                        account.get("routingPrefix")
+                        or account.get("routing_prefix")
+                        or derive_routing_prefix(sub_id)
+                    )
+                    legacy_candidate = derive_legacy_routing_prefix(sub_id)
+                    if prefix in (candidate, legacy_candidate):
+                        self._sub_account_cache[prefix] = sub_id
                         return sub_id
 
         # 2. Check local cache (populated from DB on misses)
-        if hasattr(self, '_sub_account_cache'):
-            cached = self._sub_account_cache.get(prefix)
-            if cached:
-                return cached
+        cached = self._sub_account_cache.get(prefix)
+        if cached:
+            return cached
 
         return None
 
@@ -1039,18 +1129,24 @@ class OrderManager:
         if result:
             return result
 
-        # DB fallback: find sub-account whose ID starts with this prefix
+        # DB fallback: scan active sub-accounts and compare routingPrefix or
+        # deterministic derivation. This remains compatible before the schema
+        # migration adds the routing_prefix column.
         if self._db:
             try:
-                row = await self._db.fetch_one(
-                    "SELECT id FROM sub_accounts WHERE id LIKE ? AND status = 'ACTIVE' LIMIT 1",
-                    (f"{prefix}%",),
+                rows = await self._db.fetch_all(
+                    "SELECT * FROM sub_accounts WHERE status = ?",
+                    ("ACTIVE",),
                 )
-                if row:
+                for row in rows or []:
                     full_id = row["id"]
-                    # Cache for future lookups
-                    if not hasattr(self, '_sub_account_cache'):
-                        self._sub_account_cache = {}
+                    candidate = (
+                        row.get("routing_prefix")
+                        or derive_routing_prefix(full_id)
+                    )
+                    legacy_candidate = derive_legacy_routing_prefix(full_id)
+                    if prefix not in (candidate, legacy_candidate):
+                        continue
                     self._sub_account_cache[prefix] = full_id
                     logger.info("Resolved sub-account prefix %s → %s (DB fallback)", prefix, full_id[:12])
                     return full_id
@@ -1078,7 +1174,7 @@ class OrderManager:
         if not client_order_id.startswith("PMS"):
             return None
 
-        # Parse: PMS{sub8}_{type}_{uid} → extract sub-account prefix
+        # Parse: PMS{routingPrefix}_{type}_{uid} → extract sub-account prefix
         stripped = client_order_id[3:]  # Remove 'PMS'
         parts = stripped.split("_", 2)
         if len(parts) < 1 or not parts[0]:
@@ -1091,7 +1187,7 @@ class OrderManager:
         if sub_prefix in self._ignored_prefixes:
             return None
 
-        sub_account_id = await self._resolve_sub_account_async(sub_prefix)
+        sub_account_id = data.get("sub_account_id") or await self._resolve_sub_account_async(sub_prefix)
         if not sub_account_id:
             self._ignored_prefixes.add(sub_prefix)
             logger.info(
@@ -1130,7 +1226,8 @@ class OrderManager:
             quantity=float(data.get("orig_qty", 0)),
             price=float(data.get("price", 0)) if data.get("price") else None,
             state=initial_state,
-            origin="BOT",
+            origin=data.get("origin", "BOT"),
+            parent_id=data.get("parent_id") or None,
             leverage=1,  # Bot manages its own leverage
             reduce_only=data.get("reduce_only", False),
         )
@@ -1139,7 +1236,7 @@ class OrderManager:
         logger.info(
             "Created bot order from feed: %s %s %s qty=%.6f (sub=%s)",
             client_order_id, order.symbol, order.side,
-            order.quantity, sub_account_id[:8],
+            order.quantity, derive_routing_prefix(sub_account_id),
         )
         return order
 

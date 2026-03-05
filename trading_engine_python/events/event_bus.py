@@ -90,9 +90,19 @@ class TradeEventBus:
             Stream event ID, or None on error.
         """
         try:
+            now_ms = int(time.time() * 1000)
+            source_ts = (
+                data.get("source_ts")
+                or data.get("intent_ts")
+                or data.get("order_trade_time")
+                or data.get("event_time")
+                or now_ms
+            )
             entry = {
                 "type": event_type,
-                "ts": str(int(time.time() * 1000)),
+                "ts": str(now_ms),
+                "ingested_ts": str(now_ms),
+                "source_ts": str(source_ts),
                 **{k: str(v) for k, v in data.items()},
             }
             event_id = await self._redis.xadd(

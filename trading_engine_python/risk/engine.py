@@ -33,9 +33,19 @@ from .math import (
 from .position_book import PositionBook, VirtualPos
 from .validator import TradeValidator
 from .liquidation import LiquidationEngine
+from contracts.common import normalize_symbol, ts_external_to_s, ts_s_to_ms
+from orders.state import derive_routing_prefix
 
 logger = logging.getLogger(__name__)
 RECENT_FILL_TTL_SEC = 10.0
+
+
+def _account_ref(sub_account_id: str) -> str:
+    """Short stable account reference for logs and synthetic IDs."""
+    try:
+        return derive_routing_prefix(sub_account_id)
+    except ValueError:
+        return str(sub_account_id or "")[:8]
 
 
 def _db_timestamp_to_seconds(value: Any) -> Optional[float]:
@@ -232,7 +242,7 @@ class RiskEngine:
         hydrated = VirtualPos(
             id=pos_id,
             sub_account_id=sub_account_id,
-            symbol=target.get("symbol", symbol or ""),
+            symbol=normalize_symbol(target.get("symbol", symbol or "")) if target.get("symbol", symbol or "") else "",
             side=target.get("side", ""),
             entry_price=float(target.get("entryPrice", 0) or 0),
             quantity=float(target.get("quantity", 0) or 0),
@@ -240,7 +250,7 @@ class RiskEngine:
             leverage=int(target.get("leverage", 1) or 1),
             margin=float(target.get("margin", 0) or 0),
             liquidation_price=float(target.get("liquidationPrice", 0) or 0),
-            opened_at=target.get("openedAt"),
+            opened_at=ts_external_to_s(target.get("openedAt")),
             mark_price=float(target.get("markPrice", 0) or 0),
             unrealized_pnl=float(target.get("unrealizedPnl", 0) or 0),
         )
@@ -314,7 +324,7 @@ class RiskEngine:
             filled_qty=close_qty,
             avg_fill_price=fill_price,
             exchange_order_id="",
-            client_order_id=f"SYSADL_{pos.sub_account_id[:8]}_{ts}",
+            client_order_id=f"SYSADL_{_account_ref(pos.sub_account_id)}_{ts}",
             origin="EXCHANGE_ADL",
             reduce_only=True,
             leverage=pos.leverage,
@@ -586,6 +596,7 @@ class RiskEngine:
                     "currentBalance": acct["current_balance"],
                     "maintenanceRate": acct.get("maintenance_rate", 0.005),
                     "liquidationMode": acct.get("liquidation_mode", "ADL_30"),
+                    "routingPrefix": acct.get("routing_prefix") or derive_routing_prefix(acct_id),
                     "status": acct["status"],
                 },
                 "positions": [
@@ -937,7 +948,8 @@ class RiskEngine:
                     )
                 continue
 
-            evidence_subs = self._get_active_order_accounts(binance_symbol).intersection(candidate_subs)
+            active_evidence_subs = self._get_active_order_accounts(binance_symbol).intersection(candidate_subs)
+            evidence_subs = set(active_evidence_subs)
             hint_sub = self._get_recent_fill_hint(binance_symbol)
             if hint_sub in candidate_subs:
                 evidence_subs.add(hint_sub)
@@ -991,6 +1003,22 @@ class RiskEngine:
             qty_diff_pct = abs(pos.quantity - abs_qty) / max(pos.quantity, abs_qty, 1e-10) * 100
 
             if side_changed or qty_diff_pct > 1.0:
+                has_strong_direct_evidence = target_sub in active_evidence_subs
+                if not has_strong_direct_evidence:
+                    logger.debug(
+                        "ACCOUNT_UPDATE direct reconcile skipped for %s qty=%.6f: no active PMS order evidence (target=%s, hint=%s)",
+                        binance_symbol,
+                        abs_qty,
+                        target_sub[:8],
+                        (hint_sub[:8] if hint_sub else "none"),
+                    )
+                    await self._apply_external_backing_guard(
+                        symbol=binance_symbol,
+                        exchange_qty=exchange_qty,
+                        entry_price=entry_price,
+                    )
+                    continue
+
                 new_notional = abs_qty * (entry_price if entry_price > 0 else pos.entry_price)
                 new_entry = entry_price if entry_price > 0 else pos.entry_price
                 new_margin = compute_margin(new_notional, pos.leverage)
@@ -1121,7 +1149,7 @@ class RiskEngine:
                     {
                         "clientOrderId": o.client_order_id,
                         "exchangeOrderId": o.exchange_order_id,
-                        "symbol": o.symbol,
+                        "symbol": normalize_symbol(o.symbol) if o.symbol else "",
                         "side": o.side,
                         "orderType": o.order_type,
                         "price": o.price,
@@ -1131,7 +1159,7 @@ class RiskEngine:
                         "leverage": o.leverage,
                         "reduceOnly": o.reduce_only,
                         "state": o.state,
-                        "createdAt": o.created_at,
+                        "createdAt": ts_s_to_ms(o.created_at),
                     }
                     for o in active
                     if o.order_type == "LIMIT"
@@ -1147,7 +1175,7 @@ class RiskEngine:
             "positions": [
                 {
                     "id": p.id,
-                    "symbol": p.symbol,
+                    "symbol": normalize_symbol(p.symbol) if p.symbol else "",
                     "side": p.side,
                     "entryPrice": p.entry_price,
                     "quantity": p.quantity,
@@ -1158,7 +1186,7 @@ class RiskEngine:
                     "unrealizedPnl": p.unrealized_pnl,
                     "pnlPercent": (p.unrealized_pnl / p.margin * 100) if p.margin else 0,
                     "markPrice": p.mark_price,
-                    "openedAt": p.opened_at,
+                    "openedAt": ts_s_to_ms(p.opened_at or 0.0),
                 }
                 for p in positions
             ],

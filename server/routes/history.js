@@ -9,6 +9,7 @@ import prisma from '../db/prisma.js';
 import { flexAuthMiddleware } from '../auth.js';
 import { validate } from '../middleware/validate.js';
 import { HistoryQuery, AllHistoryQuery, BackfillBody, SubAccountIdParam } from '../contracts/history.contracts.js';
+import { getAcceptedRoutingPrefixes } from '../routing-prefix.js';
 
 const router = Router();
 
@@ -120,7 +121,7 @@ router.post('/backfill/:subAccountId', validate(SubAccountIdParam, 'params'), va
         const sa = await prisma.subAccount.findUnique({ where: { id: subAccountId } });
         if (!sa) return res.status(404).json({ error: 'Sub-account not found' });
 
-        const prefix = subAccountId.substring(0, 8);
+        const prefixes = getAcceptedRoutingPrefixes(sa);
         const startMs = Date.now() - days * 86400 * 1000;
         const endMs = Date.now();
 
@@ -140,7 +141,7 @@ router.post('/backfill/:subAccountId', validate(SubAccountIdParam, 'params'), va
                     const filtered = orders.filter(o => {
                         const ts = o.timestamp || 0;
                         const clientId = o.clientOrderId || '';
-                        return ts >= startMs && ts <= endMs && clientId.startsWith(`PMS${prefix}`);
+                        return ts >= startMs && ts <= endMs && prefixes.some((prefix) => clientId.startsWith(`PMS${prefix}`));
                     });
 
                     const orderIds = filtered.map((o) => String(o.id));
@@ -168,7 +169,7 @@ router.post('/backfill/:subAccountId', validate(SubAccountIdParam, 'params'), va
                                 notional: (order.average || order.price || 0) * order.filled,
                                 fee: order.fee?.cost || 0,
                                 action: order.reduceOnly ? 'CLOSE' : 'OPEN',
-                                originType: 'BOT',
+                                originType: 'BACKFILL',
                                 status: 'FILLED',
                                 signature: `backfill_${order.id}_${subAccountId}`.substring(0, 32),
                                 timestamp: new Date(order.timestamp),

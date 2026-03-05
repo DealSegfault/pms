@@ -189,8 +189,15 @@ async def main() -> int:
         # ── 6. DepthSupervisor + MarketDataService ──
         from trading_engine_python.feeds.depth_supervisor import DepthSupervisor
         from trading_engine_python.feeds.market_data import MarketDataService
+        from trading_engine_python.tca.quote_store import MarketQuoteStore
         depth_supervisor = DepthSupervisor()
-        market_data = MarketDataService(redis_client=redis_client, depth_supervisor=depth_supervisor)
+        quote_store = MarketQuoteStore(db) if db else None
+        market_data = MarketDataService(
+            redis_client=redis_client,
+            depth_supervisor=depth_supervisor,
+            quote_store=quote_store,
+        )
+        order_manager.set_market_data(market_data)
         logger.info("DepthSupervisor + MarketDataService created")
 
         # ── 7. RiskEngine ──
@@ -339,16 +346,26 @@ async def main() -> int:
         from trading_engine_python.events.event_bus import TradeEventBus
 
         event_bus = TradeEventBus(redis_client)
+        order_manager.set_event_bus(event_bus)
         logger.info("TradeEventBus created (stream: pms:stream:trade_events)")
 
         # ── 8a.1 Stream Consumers ──
         from trading_engine_python.events.algo_consumer import AlgoConsumer
+        from trading_engine_python.events.lifecycle_store import LifecycleStore
         from trading_engine_python.events.order_consumer import OrderConsumer
         from trading_engine_python.events.risk_consumer import RiskConsumer
+        from trading_engine_python.tca.collector import TCACollector
+        from trading_engine_python.tca.market_sampler import TCAMarketSampler
+        from trading_engine_python.tca.reconciler import TCAReconciler
+        from trading_engine_python.tca.rollups import TCARollupWorker
 
         order_consumer = OrderConsumer(order_manager._tracker, event_bus, order_manager)
         risk_consumer = RiskConsumer(order_manager, risk_engine, redis_client, db)
         algo_consumer = AlgoConsumer(chase, scalper, twap, trail_stop)
+        tca_collector = TCACollector(LifecycleStore(db)) if db else None
+        tca_reconciler = TCAReconciler(db) if db else None
+        tca_market_sampler = TCAMarketSampler(db, market_data, quote_store=quote_store) if db else None
+        tca_rollups = TCARollupWorker(db) if db else None
 
         # ── 8b. Resume active algos from Redis (crash recovery) ──
         try:
@@ -457,6 +474,20 @@ async def main() -> int:
                         handler=algo_consumer.handle,
                     )
                 )
+                if tca_collector:
+                    tg.create_task(
+                        event_bus.consume(
+                            consumer_name=f"tca_collector:{consumer_suffix}",
+                            group_name=TradeEventBus.group_name("tca_collector"),
+                            handler=tca_collector.handle,
+                        )
+                    )
+                if tca_reconciler:
+                    tg.create_task(tca_reconciler.run(shutdown_event))
+                if tca_market_sampler:
+                    tg.create_task(tca_market_sampler.run(shutdown_event))
+                if tca_rollups:
+                    tg.create_task(tca_rollups.run(shutdown_event))
                 tg.create_task(_periodic_cleanup(order_manager, shutdown_event))
                 tg.create_task(_shutdown_waiter(
                     shutdown_event, cmd_handler, user_stream, chase, scalper, twap, trail_stop

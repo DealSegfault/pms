@@ -6,6 +6,7 @@
  */
 import { Router } from 'express';
 import prisma from '../../db/prisma.js';
+import { buildApiErrorBody, commandFailureResponse } from '../../http/api-taxonomy.js';
 import { requireOwnership } from '../../ownership.js';
 import { proxyToRedis, pushAndWait } from '../../redis-proxy.js';
 
@@ -37,9 +38,18 @@ router.delete('/orders/all/:subAccountId', requireOwnership(), async (req, res) 
         const result = await pushAndWait('pms:cmd:cancel_all', {
             subAccountId: req.params.subAccountId,
         });
+        if (!result.success) {
+            const failure = commandFailureResponse(result);
+            return res.status(failure.status).json(failure.body);
+        }
         res.json({ cancelled: result.cancelledCount || 0, failed: result.failedCount || 0 });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(500).json(buildApiErrorBody({
+            code: 'INTERNAL_CANCEL_ALL_ERROR',
+            category: 'INFRA',
+            message: err.message || 'Cancel all failed',
+            retryable: true,
+        }));
     }
 });
 
@@ -48,8 +58,8 @@ router.delete('/orders/:id', async (req, res) => {
     try {
         const clientOrderId = req.params.id;
 
-        // Ownership check: extract subAccountId from clientOrderId prefix (#7)
-        // Format: PMS{sub[:8]}_{type}_{uuid} — first 8 chars after PMS are sub-account prefix
+        // Ownership check: resolve subAccountId from live open-order state.
+        // Tagged IDs now use PMS{routingPrefix}_{type}_{uuid}.
         if (req.user?.role !== 'ADMIN') {
             const { getRedis } = await import('../../redis.js');
             const r = getRedis();
@@ -82,9 +92,18 @@ router.delete('/orders/:id', async (req, res) => {
         const result = await pushAndWait('pms:cmd:cancel', {
             clientOrderId,
         });
+        if (!result.success) {
+            const failure = commandFailureResponse(result);
+            return res.status(failure.status).json(failure.body);
+        }
         res.json(result);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(500).json(buildApiErrorBody({
+            code: 'INTERNAL_CANCEL_ERROR',
+            category: 'INFRA',
+            message: err.message || 'Cancel failed',
+            retryable: true,
+        }));
     }
 });
 
@@ -113,7 +132,7 @@ router.get('/orders/:subAccountId', requireOwnership(), async (req, res) => {
             const st = (o.state || o.status || '').toLowerCase();
             return st !== 'filled' && st !== 'cancelled' && st !== 'expired' && st !== 'failed';
         });
-        // Sort by createdAt desc (seconds float)
+        // Sort by createdAt desc (ms epoch)
         orders.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
         res.json(orders);
     } catch (err) {

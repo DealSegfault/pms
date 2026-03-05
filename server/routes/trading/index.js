@@ -11,6 +11,7 @@ import marketOrdersRouter from './market-orders.js';
 import limitOrdersRouter from './limit-orders.js';
 import basketRouter from './basket.js';
 import algosRouter from './algos.js';
+import tcaRouter from './tca.js';
 
 const router = Router();
 
@@ -20,5 +21,6 @@ router.use(marketOrdersRouter);
 router.use(limitOrdersRouter);
 router.use(basketRouter);
 router.use(algosRouter);
+router.use(tcaRouter);
 
 export default router;

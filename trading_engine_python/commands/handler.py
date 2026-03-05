@@ -20,10 +20,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 from typing import Any, Dict, Optional
 
 from contracts.common import normalize_side, normalize_symbol, RedisKey
+from orders.state import derive_routing_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +119,38 @@ class CommandHandler:
     def set_trail_stop_engine(self, engine: Any) -> None:
         self._trail_stop_engine = engine
 
+    def _failure(
+        self,
+        code: str,
+        message: str,
+        *,
+        category: str,
+        retryable: bool = False,
+        details: Optional[Any] = None,
+    ) -> dict:
+        payload = {
+            "success": False,
+            "error": message,
+            "errorCode": code,
+            "errorCategory": category,
+            "retryable": retryable,
+        }
+        if details:
+            payload["details"] = details
+        return payload
+
+    def _classify_failure(self, message: str) -> dict:
+        text = str(message or "").lower()
+        if "timeout" in text or "timed out" in text:
+            return self._failure("INFRA_TIMEOUT", str(message), category="TIMEOUT", retryable=True)
+        if "redis not available" in text or "engine not available" in text or "unreachable" in text:
+            return self._failure("INFRA_UNAVAILABLE", str(message), category="INFRA", retryable=True)
+        if "reduceonly" in text or "reduce only" in text or "insufficient margin" in text or "risk" in text:
+            return self._failure("RISK_REJECTED", str(message), category="RISK")
+        if "required" in text or "missing" in text or "invalid" in text or "mismatch" in text:
+            return self._failure("VALIDATION_FAILED", str(message), category="VALIDATION")
+        return self._failure("EXCHANGE_REJECTED", str(message), category="EXCHANGE")
+
     # ── Main Loop ──
 
     async def run(self) -> None:
@@ -159,7 +191,7 @@ class CommandHandler:
 
                 except Exception as e:
                     logger.error("Command failed: queue=%s, requestId=%s — %s", queue, request_id, e)
-                    await self._respond(request_id, {"success": False, "error": str(e)})
+                    await self._respond(request_id, self._classify_failure(str(e)))
 
             except asyncio.CancelledError:
                 break
@@ -199,6 +231,8 @@ class CommandHandler:
             leverage=int(cmd.get("leverage", 1)),
             reduce_only=bool(cmd.get("reduceOnly", False)),
         )
+        if order.state == "failed":
+            return self._classify_failure(order._extra.get("error", "Market order failed"))
         return {"success": True, "clientOrderId": order.client_order_id, "state": order.state}
 
     async def handle_limit(self, cmd: dict) -> dict:
@@ -212,6 +246,8 @@ class CommandHandler:
             leverage=int(cmd.get("leverage", 1)),
             reduce_only=bool(cmd.get("reduceOnly", False)),
         )
+        if order.state == "failed":
+            return self._classify_failure(order._extra.get("error", "Limit order failed"))
         return {"success": True, "clientOrderId": order.client_order_id, "state": order.state}
 
     async def handle_scale(self, cmd: dict) -> dict:
@@ -265,13 +301,16 @@ class CommandHandler:
                 )
 
         if not existing:
-            return {"success": False, "error": "Position not found"}
+            return self._failure("POSITION_NOT_FOUND", "Position not found", category="VALIDATION")
 
         expected_close_side = "SELL" if existing.side == "LONG" else "BUY"
         if side != expected_close_side:
             return {
-                "success": False,
-                "error": f"Close side mismatch: expected {expected_close_side} for {existing.side} position",
+                **self._failure(
+                    "POSITION_SIDE_MISMATCH",
+                    f"Close side mismatch: expected {expected_close_side} for {existing.side} position",
+                    category="VALIDATION",
+                ),
             }
 
         cleanup_if_unexecutable = quantity >= (existing.quantity - 1e-12)
@@ -287,7 +326,7 @@ class CommandHandler:
 
         order = close_result.get("order")
         if not order or order.state == "failed":
-            return {"success": False, "error": close_result.get("reason", "Close order failed")}
+            return self._classify_failure(close_result.get("reason", "Close order failed"))
 
         return {"success": True, "clientOrderId": order.client_order_id, "state": order.state}
 
@@ -296,12 +335,12 @@ class CommandHandler:
         """Handle close all positions for a sub-account."""
         sub_id = cmd.get("subAccountId")
         if not sub_id:
-            return {"success": False, "error": "subAccountId required"}
+            return self._failure("VALIDATION_SUBACCOUNT_REQUIRED", "subAccountId required", category="VALIDATION")
 
         # 1. Cancel all pending orders first
         try:
             cancelled = await self._order_manager.cancel_all_orders_for_account(sub_id)
-            logger.info("close_all: cancelled %d orders for %s", cancelled, sub_id[:8])
+            logger.info("close_all: cancelled %d orders for %s", cancelled, derive_routing_prefix(sub_id))
         except Exception as e:
             logger.error("close_all: cancel orders failed: %s", e)
 
@@ -339,7 +378,7 @@ class CommandHandler:
         """Handle cancel single order."""
         client_order_id = cmd.get("clientOrderId")
         if not client_order_id:
-            return {"success": False, "error": "clientOrderId required"}
+            return self._failure("VALIDATION_CLIENT_ORDER_ID_REQUIRED", "clientOrderId required", category="VALIDATION")
         ok = await self._order_manager.cancel_order(client_order_id)
         return {"success": ok}
 
@@ -378,7 +417,7 @@ class CommandHandler:
     async def handle_chase(self, cmd: dict) -> dict:
         """Start chase order — delegates to ChaseEngine."""
         if not self._chase_engine:
-            return {"success": False, "error": "Chase engine not available"}
+            return self._failure("INFRA_CHASE_UNAVAILABLE", "Chase engine not available", category="INFRA", retryable=True)
         # Normalize side: LONG→BUY, SHORT→SELL (matching all other handlers)
         cmd["side"] = self._normalize_side(cmd["side"])
         chase_id = await self._chase_engine.start_chase(cmd)
@@ -396,14 +435,14 @@ class CommandHandler:
     async def handle_chase_cancel(self, cmd: dict) -> dict:
         """Cancel chase order."""
         if not self._chase_engine:
-            return {"success": False, "error": "Chase engine not available"}
+            return self._failure("INFRA_CHASE_UNAVAILABLE", "Chase engine not available", category="INFRA", retryable=True)
         ok = await self._chase_engine.cancel_chase(cmd.get("chaseId"))
         return {"success": ok}
 
     async def handle_scalper(self, cmd: dict) -> dict:
         """Start scalper — delegates to ScalperEngine."""
         if not self._scalper_engine:
-            return {"success": False, "error": "Scalper engine not available"}
+            return self._failure("INFRA_SCALPER_UNAVAILABLE", "Scalper engine not available", category="INFRA", retryable=True)
         # Symbol passed through as-is (ccxt format) — same pattern as chase handler.
         # normalize_symbol would convert to Binance native (STEEMUSDT) which breaks
         # MarketData.get_l1() lookups (keyed by ccxt format STEEM/USDT:USDT).
@@ -425,7 +464,7 @@ class CommandHandler:
     async def handle_scalper_cancel(self, cmd: dict) -> dict:
         """Cancel scalper."""
         if not self._scalper_engine:
-            return {"success": False, "error": "Scalper engine not available"}
+            return self._failure("INFRA_SCALPER_UNAVAILABLE", "Scalper engine not available", category="INFRA", retryable=True)
         close_positions = bool(cmd.get("closePositions", False))
         ok = await self._scalper_engine.cancel_scalper(
             cmd.get("scalperId"),
@@ -436,41 +475,69 @@ class CommandHandler:
     async def handle_twap(self, cmd: dict) -> dict:
         """Start TWAP — delegates to TWAPEngine."""
         if not self._twap_engine:
-            return {"success": False, "error": "TWAP engine not available"}
-        twap_id = await self._twap_engine.start_twap(cmd)
+            return self._failure("INFRA_TWAP_UNAVAILABLE", "TWAP engine not available", category="INFRA", retryable=True)
+        try:
+            twap_id = await self._twap_engine.start_twap(cmd)
+        except Exception as exc:
+            code = getattr(exc, "error_code", "")
+            category = getattr(exc, "error_category", "")
+            if str(code).startswith("VALIDATION_") or str(category).upper() == "VALIDATION":
+                return self._failure(
+                    code or "VALIDATION_FAILED",
+                    str(exc),
+                    category="VALIDATION",
+                    details=getattr(exc, "error_details", None),
+                )
+            raise
         return {"success": True, "twapId": twap_id}
 
     async def handle_twap_cancel(self, cmd: dict) -> dict:
         """Cancel TWAP."""
         if not self._twap_engine:
-            return {"success": False, "error": "TWAP engine not available"}
+            return self._failure("INFRA_TWAP_UNAVAILABLE", "TWAP engine not available", category="INFRA", retryable=True)
         ok = await self._twap_engine.cancel_twap(cmd.get("twapId"))
         return {"success": ok}
 
     async def handle_twap_basket(self, cmd: dict) -> dict:
         """Start TWAP basket — grouped multi-symbol TWAPs."""
         if not self._twap_engine:
-            return {"success": False, "error": "TWAP engine not available"}
-        result = await self._twap_engine.start_basket_twap(cmd)
+            return self._failure("INFRA_TWAP_UNAVAILABLE", "TWAP engine not available", category="INFRA", retryable=True)
+        try:
+            result = await self._twap_engine.start_basket_twap(cmd)
+        except Exception as exc:
+            code = getattr(exc, "error_code", "")
+            category = getattr(exc, "error_category", "")
+            if str(code).startswith("VALIDATION_") or str(category).upper() == "VALIDATION":
+                return self._failure(
+                    code or "VALIDATION_FAILED",
+                    str(exc),
+                    category="VALIDATION",
+                    details=getattr(exc, "error_details", None),
+                )
+            raise
         return {"success": True, **result}
 
     async def handle_twap_basket_cancel(self, cmd: dict) -> dict:
         """Cancel TWAP basket — cancels all child TWAPs."""
         if not self._twap_engine:
-            return {"success": False, "error": "TWAP engine not available"}
+            return self._failure("INFRA_TWAP_UNAVAILABLE", "TWAP engine not available", category="INFRA", retryable=True)
         ok = await self._twap_engine.cancel_basket_twap(cmd.get("twapBasketId"))
         return {"success": ok}
 
     async def handle_trail_stop(self, cmd: dict) -> dict:
         """Start trail stop — delegates to TrailStopEngine."""
         if not self._trail_stop_engine:
-            return {"success": False, "error": "Trail stop engine not available"}
+            return self._failure("INFRA_TRAIL_STOP_UNAVAILABLE", "Trail stop engine not available", category="INFRA", retryable=True)
 
         # Enrich from positionId — frontend sends only positionId + callbackPct
         if "positionId" in cmd and self._risk:
             pos = self._risk.position_book.get_position(cmd["subAccountId"], cmd["positionId"])
             if not pos:
-                return {"success": False, "error": f"Position {cmd['positionId']} not found"}
+                return self._failure(
+                    "POSITION_NOT_FOUND",
+                    f"Position {cmd['positionId']} not found",
+                    category="VALIDATION",
+                )
             cmd.setdefault("symbol", pos.symbol)
             cmd.setdefault("quantity", pos.quantity)
             cmd.setdefault("positionSide", pos.side)
@@ -494,7 +561,7 @@ class CommandHandler:
     async def handle_trail_stop_cancel(self, cmd: dict) -> dict:
         """Cancel trail stop."""
         if not self._trail_stop_engine:
-            return {"success": False, "error": "Trail stop engine not available"}
+            return self._failure("INFRA_TRAIL_STOP_UNAVAILABLE", "Trail stop engine not available", category="INFRA", retryable=True)
         ok = await self._trail_stop_engine.cancel_trail_stop(cmd.get("trailStopId"))
         return {"success": ok}
 
@@ -516,4 +583,7 @@ class CommandHandler:
             )
             return {"success": True, **validation}
         except Exception as e:
-            return {"success": False, "valid": False, "error": str(e)}
+            return {
+                **self._failure("RISK_VALIDATION_ERROR", str(e), category="RISK"),
+                "valid": False,
+            }

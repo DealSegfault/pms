@@ -452,6 +452,15 @@ export function buildTradingHTML() {
                 </div>
               </div>
             </div>
+            <div style="margin-bottom:8px;">
+              <label style="display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none; font-size:10px; color:var(--text-muted);">
+                <input type="checkbox" id="scalper-allow-loss" checked style="accent-color:#f43f5e; cursor:pointer;" />
+                Allow trading at loss
+              </label>
+              <div id="scalper-allow-loss-hint" style="font-size:8px; color:var(--text-muted); opacity:0.7; margin-top:2px;">
+                When off, closes that lock in loss are paused until price re-enters allowed range.
+              </div>
+            </div>
             <!-- Anti-overtrading settings (shown in Neutral mode) -->
             <div id="scalper-neutral-settings" style="display:none;">
               <div style="border-top:1px solid rgba(255,255,255,0.07); padding-top:8px; margin-bottom:8px;">
@@ -483,11 +492,6 @@ export function buildTradingHTML() {
                   <input type="range" id="scalper-min-refill-delay" min="0" max="120" value="0" step="1" style="width:100%;" />
                   <div style="font-size:8px; color:var(--text-muted); opacity:0.7; margin-top:2px;">Min wait after a fill before re-placing (doubles each fill)</div>
                 </div>
-                <!-- Allow loss -->
-                <label style="display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none; font-size:10px; color:var(--text-muted);">
-                  <input type="checkbox" id="scalper-allow-loss" style="accent-color:#f43f5e; cursor:pointer;" />
-                  Allow trading at loss <span style="opacity:0.6;">(by default, short min &amp; long max are pinned to entry)</span>
-                </label>
                 <!-- Risk guards + PnL feedback — compact 3-col row -->
                 <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; margin-top:6px; padding-top:6px; border-top:1px solid rgba(255,255,255,0.06);">
                   <!-- Max loss bps -->

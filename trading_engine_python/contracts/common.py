@@ -8,7 +8,7 @@ All engines must import from here — no inline copies.
 from __future__ import annotations
 
 import time
-from typing import Optional
+from typing import Any, Optional
 
 
 # ── Side Normalization ───────────────────────────────────────
@@ -47,10 +47,11 @@ def close_side_from_position(position_side: str) -> str:
 # ── Symbol Normalization ─────────────────────────────────────
 
 def normalize_symbol(symbol: str) -> str:
-    """Convert any symbol format to Binance-native — ONLY for exchange boundary.
+    """Convert any inbound symbol format to canonical Binance-native.
 
-    Internal code should use ccxt format (DOGE/USDT:USDT).
-    Use this ONLY when calling Binance REST/WS APIs.
+    External contracts, lifecycle payloads, Redis snapshots, and risk/order DTOs
+    all standardize on Binance-native symbols. Convert only at explicit display
+    boundaries when slash/ccxt formatting is required.
 
     'DOGE/USDT:USDT' → 'DOGEUSDT'
     'DOGE/USDT'      → 'DOGEUSDT'
@@ -90,6 +91,21 @@ def ts_ms() -> int:
 def ts_s_to_ms(ts_seconds: float) -> int:
     """Convert Python time.time() seconds to milliseconds."""
     return int(ts_seconds * 1000)
+
+
+def ts_external_to_s(value: Any) -> Optional[float]:
+    """Convert external timestamp payloads to internal seconds.
+
+    External JSON contracts use milliseconds. Legacy seconds values are still
+    accepted during migration/replay so old Redis snapshots continue to hydrate.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric / 1000.0 if numeric > 10_000_000_000 else numeric
 
 
 # ── Event Type Constants ─────────────────────────────────────
@@ -146,6 +162,26 @@ class EventType:
     FULL_LIQUIDATION = "full_liquidation"
     ADL_TRIGGERED = "adl_triggered"
     MARGIN_WARNING = "margin_warning"
+
+
+class StreamEventType:
+    """Canonical Redis Stream lifecycle events."""
+
+    ORDER_INTENT = "ORDER_INTENT"
+    ORDER_NEW = "ORDER_NEW"
+    ORDER_PARTIALLY_FILLED = "ORDER_PARTIALLY_FILLED"
+    ORDER_FILLED = "ORDER_FILLED"
+    ORDER_CANCELLED = "ORDER_CANCELLED"
+    ORDER_EXPIRED = "ORDER_EXPIRED"
+    ORDER_REJECTED = "ORDER_REJECTED"
+    TRADE_LITE = "TRADE_LITE"
+    ACCOUNT_UPDATE = "ACCOUNT_UPDATE"
+
+    ORDER_STATE_NEW = "ORDER_STATE_NEW"
+    ORDER_STATE_PARTIAL = "ORDER_STATE_PARTIAL"
+    ORDER_STATE_FILLED = "ORDER_STATE_FILLED"
+    ORDER_STATE_CANCELLED = "ORDER_STATE_CANCELLED"
+    ORDER_STATE_REJECTED = "ORDER_STATE_REJECTED"
 
 
 # ── Redis Key Prefixes ───────────────────────────────────────

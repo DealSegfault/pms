@@ -46,9 +46,10 @@ class MarketDataService:
     to algo callbacks.
     """
 
-    def __init__(self, redis_client: Any = None, depth_supervisor: Any = None):
+    def __init__(self, redis_client: Any = None, depth_supervisor: Any = None, quote_store: Any = None):
         self._redis = redis_client
         self._depth = depth_supervisor                     # DepthSupervisor instance
+        self._quote_store = quote_store                   # Optional replay-safe quote buffer
         self._callbacks: Dict[str, List[Callable]] = {}    # symbol → [callbacks]
         self._last_l1: Dict[str, dict] = {}                # symbol → {bid, ask, mid, ts}
         self._last_publish_ts: Dict[str, float] = {}       # symbol → last Redis publish time
@@ -65,16 +66,8 @@ class MarketDataService:
         Callbacks are fired via asyncio.create_task() — non-blocking.
 
         Automatically starts a depth stream for the symbol if not running.
-        Symbol should be in ccxt format (e.g., 'BTC/USDT:USDT').
+        Symbol should use the canonical Binance-native format (e.g., 'BTCUSDT').
         """
-        # Guard: warn if symbol looks like Binance native format (no '/')
-        if "/" not in symbol and symbol != "":
-            logger.warning(
-                "MarketData.subscribe() received non-ccxt symbol '%s' — "
-                "this will cause get_l1() mismatches. Use ccxt format (e.g., 'BTC/USDT:USDT').",
-                symbol,
-            )
-
         is_new_symbol = symbol not in self._callbacks
         if is_new_symbol:
             self._callbacks[symbol] = []
@@ -114,6 +107,10 @@ class MarketDataService:
         l1 = self._last_l1.get(symbol)
         return l1["mid"] if l1 else None
 
+    def set_quote_store(self, quote_store: Any) -> None:
+        """Attach a replay-safe quote history store."""
+        self._quote_store = quote_store
+
     def get_bid_ask(self, symbol: str) -> Optional[tuple]:
         """Get (bid, ask) tuple for a symbol, or None if no data."""
         l1 = self._last_l1.get(symbol)
@@ -145,6 +142,19 @@ class MarketDataService:
 
         # Update cache
         self._last_l1[symbol] = {"bid": bid, "ask": ask, "mid": mid, "ts": ts}
+
+        if self._quote_store:
+            try:
+                await self._quote_store.record_quote(
+                    symbol,
+                    bid=bid,
+                    ask=ask,
+                    mid=mid,
+                    ts_ms=int(ts * 1000),
+                    source="L1",
+                )
+            except Exception as e:
+                logger.debug("Failed to persist quote for %s: %s", symbol, e)
 
         # Publish pms:price to Redis (throttled)
         await self._publish_l1(symbol, bid, ask, mid, ts)

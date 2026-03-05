@@ -10,12 +10,19 @@
 
 import { Router } from 'express';
 import prisma from '../db/prisma.js';
-import crypto from 'crypto';
 import { botApiKeyMiddleware } from '../auth.js';
+import { getRoutingPrefix, tagClientOrderId } from '../routing-prefix.js';
+import {
+    buildOrderIntentLifecycleEvent,
+    buildOrderRejectedLifecycleEvent,
+    LIFECYCLE_STREAM_EVENTS,
+    publishLifecycleEvent,
+} from '../lifecycle-stream.js';
 import {
     setOrderMapping, getOrderMapping, checkRateLimit,
-    getRiskSnapshot,
+    getRiskSnapshot, getPriceCache,
 } from '../redis.js';
+import { proxyFailureResponse } from '../http/api-taxonomy.js';
 
 const router = Router();
 
@@ -33,6 +40,37 @@ function computeReservedMargin(totalNotional, leverageCap = 100) {
     return totalNotional / cap;
 }
 
+function sendProxyFailure(res, errorLike, options = {}) {
+    const failure = proxyFailureResponse(errorLike, options);
+    return res.status(failure.status).json(failure.body);
+}
+
+function spreadBps(bid, ask, mid) {
+    if (!(bid > 0) || !(ask > 0) || !(mid > 0)) return null;
+    return ((ask - bid) / mid) * 10000;
+}
+
+async function getDecisionContext(symbol) {
+    const snapshot = await getPriceCache(symbol);
+    const bid = Number(snapshot?.bid);
+    const ask = Number(snapshot?.ask);
+    const mid = Number(snapshot?.mid);
+    if (!(bid > 0) || !(ask > 0) || !(mid > 0)) {
+        return {
+            decisionBid: null,
+            decisionAsk: null,
+            decisionMid: null,
+            decisionSpreadBps: null,
+        };
+    }
+    return {
+        decisionBid: bid,
+        decisionAsk: ask,
+        decisionMid: mid,
+        decisionSpreadBps: spreadBps(bid, ask, mid),
+    };
+}
+
 // ── Middleware: resolve sub-account from API key user ──
 
 async function resolveSubAccount(req, res, next) {
@@ -42,8 +80,8 @@ async function resolveSubAccount(req, res, next) {
         const sa = await prisma.subAccount.findFirst({
             where: { id: subAccountId, userId: req.user.id },
         });
-        if (!sa) return res.status(403).json({ code: -1, msg: 'Sub-account not found or not owned by you' });
-        if (sa.status !== 'ACTIVE') return res.status(403).json({ code: -1, msg: 'Sub-account is not active' });
+        if (!sa) return sendProxyFailure(res, { message: 'Sub-account not found or not owned by you' });
+        if (sa.status !== 'ACTIVE') return sendProxyFailure(res, { message: 'Sub-account is not active' });
         req.subAccount = sa;
         return next();
     }
@@ -53,28 +91,9 @@ async function resolveSubAccount(req, res, next) {
         where: { userId: req.user.id, status: 'ACTIVE' },
         orderBy: { createdAt: 'asc' },
     });
-    if (!sa) return res.status(403).json({ code: -1, msg: 'No active sub-account. Create one first.' });
+    if (!sa) return sendProxyFailure(res, { message: 'No active sub-account. Create one first.' });
     req.subAccount = sa;
     next();
-}
-
-// ── Helper: generate PMS-tagged clientOrderId ──
-
-function tagClientOrderId(subAccountId, orderType, originalId) {
-    const prefix = subAccountId.substring(0, 8);
-    const typePrefix = { MARKET: 'MKT', LIMIT: 'LMT', STOP_MARKET: 'STP', TAKE_PROFIT_MARKET: 'TPM' }[orderType] || 'ORD';
-    const uid = originalId || crypto.randomBytes(6).toString('hex');
-    return `PMS${prefix}_${typePrefix}_${uid}`;
-}
-
-function parseClientOrderId(clientOrderId) {
-    if (!clientOrderId?.startsWith('PMS')) return null;
-    const parts = clientOrderId.split('_');
-    if (parts.length < 2) return null;
-    return {
-        subAccountPrefix: parts[0].substring(3), // 8-char sub-account prefix
-        originalId: parts.slice(1).join('_'),
-    };
 }
 
 /**
@@ -95,23 +114,26 @@ router.post('/v1/order',
     botApiKeyMiddleware(),
     resolveSubAccount,
     async (req, res) => {
+        let intentEvent = null;
         try {
             const { symbol, side, type, quantity, price, timeInForce, newClientOrderId, reduceOnly } = req.body;
 
             if (!symbol || !side || !type) {
-                return res.status(400).json({ code: -1100, msg: 'Missing required parameters' });
+                return sendProxyFailure(res, { message: 'Missing required parameters' }, { fallbackBinanceCode: -1100 });
             }
 
             // Rate limit
             const allowed = await checkRateLimit(req.subAccount.id);
             if (!allowed) {
-                return res.status(429).json({ code: -1015, msg: 'Rate limit exceeded' });
+                return sendProxyFailure(res, { message: 'Rate limit exceeded', code: -1015 }, { fallbackBinanceCode: -1015 });
             }
 
             const qty = parseFloat(quantity);
             const prc = price ? parseFloat(price) : null;
             const ccxtSymbol = rawToCcxt(symbol);
-            const taggedClientId = tagClientOrderId(req.subAccount.id, type?.toUpperCase(), newClientOrderId);
+            const normalizedType = type?.toUpperCase();
+            const taggedClientId = tagClientOrderId(req.subAccount, normalizedType, newClientOrderId);
+            const decisionContext = await getDecisionContext(symbol);
 
             // If not reduceOnly, run risk checks
             if (!reduceOnly) {
@@ -137,16 +159,32 @@ router.post('/v1/order',
                             req.subAccount.id, ccxtSymbol, side.toUpperCase(), qty, leverage,
                         );
                         if (!validation.valid) {
-                            return res.status(400).json({
-                                code: -2027,
-                                msg: `Risk check failed: ${validation.errors.join(', ')}`,
-                            });
+                            return sendProxyFailure(
+                                res,
+                                { message: `Risk check failed: ${validation.errors.join(', ')}`, code: -2027 },
+                                { fallbackBinanceCode: -2027 },
+                            );
                         }
                     }
                 }
             }
 
             // Forward to Binance via ccxt
+            intentEvent = buildOrderIntentLifecycleEvent({
+                subAccount: req.subAccount,
+                clientOrderId: taggedClientId,
+                symbol,
+                side: side.toUpperCase(),
+                orderType: normalizedType,
+                quantity: qty,
+                price: prc,
+                reduceOnly: Boolean(reduceOnly),
+                origin: 'BOT',
+                userId: req.user?.id || '',
+                ...decisionContext,
+            });
+            await publishLifecycleEvent(LIFECYCLE_STREAM_EVENTS.ORDER_INTENT, intentEvent);
+
             const orderType = type.toLowerCase();
             const orderSide = side.toLowerCase();
             const params = {};
@@ -162,6 +200,7 @@ router.post('/v1/order',
             const exchangeOrderId = String(ccxtOrder.id);
             await setOrderMapping(exchangeOrderId, {
                 subAccountId: req.subAccount.id,
+                routingPrefix: getRoutingPrefix(req.subAccount),
                 clientOrderId: taggedClientId,
                 symbol: ccxtSymbol,
                 side: side.toUpperCase(),
@@ -169,36 +208,20 @@ router.post('/v1/order',
                 ts: Date.now(),
             });
 
-            // Also record in PMS DB
-            const sig = crypto.createHash('sha256')
-                .update(`${req.subAccount.id}:${exchangeOrderId}:${Date.now()}`)
-                .digest('hex').substring(0, 16);
-
-            await prisma.tradeExecution.create({
-                data: {
-                    subAccountId: req.subAccount.id,
-                    exchangeOrderId,
-                    clientOrderId: taggedClientId,
-                    symbol: ccxtSymbol,
-                    side: side.toUpperCase(),
-                    type: type.toUpperCase(),
-                    price: ccxtOrder.average || ccxtOrder.price || prc || 0,
-                    quantity: ccxtOrder.filled || qty,
-                    notional: (ccxtOrder.average || prc || 0) * (ccxtOrder.filled || qty),
-                    fee: ccxtOrder.fee?.cost || 0,
-                    action: reduceOnly ? 'CLOSE' : 'OPEN',
-                    originType: 'BOT',
-                    status: ccxtOrder.status === 'closed' ? 'FILLED' : ccxtOrder.status?.toUpperCase() || 'PENDING',
-                    signature: sig,
-                },
-            });
+            const responseStatus = ccxtOrder.status?.toUpperCase() || 'NEW';
+            if (responseStatus === 'REJECTED') {
+                await publishLifecycleEvent(
+                    LIFECYCLE_STREAM_EVENTS.ORDER_REJECTED,
+                    buildOrderRejectedLifecycleEvent(intentEvent, 'Exchange rejected order'),
+                );
+            }
 
             // Return Binance-compatible response
             res.json({
                 orderId: parseInt(exchangeOrderId) || exchangeOrderId,
                 symbol,
                 clientOrderId: taggedClientId,
-                status: ccxtOrder.status?.toUpperCase() || 'NEW',
+                status: responseStatus,
                 origQty: String(qty),
                 executedQty: String(ccxtOrder.filled || 0),
                 avgPrice: String(ccxtOrder.average || 0),
@@ -209,8 +232,14 @@ router.post('/v1/order',
             });
 
         } catch (err) {
+            if (intentEvent) {
+                await publishLifecycleEvent(
+                    LIFECYCLE_STREAM_EVENTS.ORDER_REJECTED,
+                    buildOrderRejectedLifecycleEvent(intentEvent, err.message),
+                );
+            }
             console.error('[Proxy] Order error:', err.message);
-            res.status(400).json({ code: -1, msg: err.message });
+            sendProxyFailure(res, err, { fallbackBinanceCode: -1 });
         }
     },
 );
@@ -224,13 +253,13 @@ router.delete('/v1/order',
         try {
             const { symbol, orderId } = req.query;
             if (!symbol || !orderId) {
-                return res.status(400).json({ code: -1100, msg: 'symbol and orderId required' });
+                return sendProxyFailure(res, { message: 'symbol and orderId required' }, { fallbackBinanceCode: -1100 });
             }
 
             // Verify ownership via Redis mapping
             const mapping = await getOrderMapping(orderId);
             if (mapping && mapping.subAccountId !== req.subAccount.id) {
-                return res.status(403).json({ code: -1, msg: 'Order not owned by this sub-account' });
+                return sendProxyFailure(res, { message: 'Order not owned by this sub-account' });
             }
 
             const ccxtSymbol = rawToCcxt(symbol);
@@ -238,7 +267,7 @@ router.delete('/v1/order',
 
             res.json({ orderId, symbol, status: 'CANCELED' });
         } catch (err) {
-            res.status(400).json({ code: -1, msg: err.message });
+            sendProxyFailure(res, err, { fallbackBinanceCode: -1 });
         }
     },
 );
@@ -252,12 +281,12 @@ router.put('/v1/order',
         try {
             const { symbol, orderId, quantity, price, side } = req.body;
             if (!symbol || !orderId) {
-                return res.status(400).json({ code: -1100, msg: 'symbol and orderId required' });
+                return sendProxyFailure(res, { message: 'symbol and orderId required' }, { fallbackBinanceCode: -1100 });
             }
 
             const mapping = await getOrderMapping(orderId);
             if (mapping && mapping.subAccountId !== req.subAccount.id) {
-                return res.status(403).json({ code: -1, msg: 'Order not owned by this sub-account' });
+                return sendProxyFailure(res, { message: 'Order not owned by this sub-account' });
             }
 
             const ccxtSymbol = rawToCcxt(symbol);
@@ -276,7 +305,7 @@ router.put('/v1/order',
                 price: String(prc),
             });
         } catch (err) {
-            res.status(400).json({ code: -1, msg: err.message });
+            sendProxyFailure(res, err, { fallbackBinanceCode: -1 });
         }
     },
 );

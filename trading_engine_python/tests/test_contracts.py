@@ -15,10 +15,10 @@ import time
 import sys; sys.path.insert(0, '..')
 
 from contracts.common import (
-    normalize_side, normalize_symbol, ts_ms, ts_s_to_ms,
+    normalize_side, normalize_symbol, ts_external_to_s, ts_ms, ts_s_to_ms,
     position_side_from_order, close_side_from_position,
     to_ccxt_symbol, to_slash_symbol,
-    EventType, RedisKey,
+    EventType, RedisKey, StreamEventType,
 )
 from contracts.commands import (
     TradeCommand, LimitCommand, ScaleCommand,
@@ -35,6 +35,7 @@ from contracts.events import (
     TrailStopProgressEvent, TrailStopTriggeredEvent, TrailStopCancelledEvent,
     PositionUpdatedEvent, PositionClosedEvent, PositionReducedEvent,
     MarginUpdateEvent, PnlUpdateEvent,
+    OrderIntentStreamEvent, OrderRejectedStreamEvent,
     ScalperSlotInfo,
 )
 from contracts.state import (
@@ -113,6 +114,12 @@ class TestTimestamps:
         s = 1709000000.123
         ms = ts_s_to_ms(s)
         assert ms == 1709000000123
+
+    def test_ts_external_to_s_accepts_ms(self):
+        assert ts_external_to_s(1709000000123) == 1709000000.123
+
+    def test_ts_external_to_s_accepts_legacy_seconds(self):
+        assert ts_external_to_s(1709000000.123) == 1709000000.123
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -245,6 +252,69 @@ class TestChaseEvents:
         d = ChaseCancelledEvent(chase_id="c1", reason="user").to_dict()
         _assert_keys(d, ["type", "chaseId", "reason", "status"])
         assert d["status"] == "CANCELLED"
+
+
+class TestLifecycleStreamEvents:
+    def test_order_intent_keys(self):
+        d = OrderIntentStreamEvent(
+            client_order_id="PMSabc_LMT_123",
+            sub_account_id="sub-1",
+            routing_prefix="abc123def456",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=1.25,
+            price=50000,
+            intent_ts=ts_ms(),
+        ).to_stream_dict()
+        _assert_keys(d, [
+            "type", "client_order_id", "sub_account_id", "routing_prefix",
+            "symbol", "side", "order_type", "quantity", "price",
+            "execution_scope", "decision_bid", "decision_ask", "decision_mid",
+            "decision_spread_bps", "intent_ts", "source_ts",
+        ])
+        assert d["type"] == StreamEventType.ORDER_INTENT
+        _assert_json_roundtrip(d)
+
+    def test_order_intent_normalizes_symbol(self):
+        d = OrderIntentStreamEvent(
+            client_order_id="PMSabc_LMT_123",
+            sub_account_id="sub-1",
+            symbol="BTC/USDT:USDT",
+        ).to_stream_dict()
+        assert d["symbol"] == "BTCUSDT"
+
+    def test_order_rejected_keys(self):
+        d = OrderRejectedStreamEvent(
+            client_order_id="PMSabc_LMT_123",
+            sub_account_id="sub-1",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            error="insufficient margin",
+            rejected_ts=ts_ms(),
+        ).to_stream_dict()
+        _assert_keys(d, [
+            "type", "client_order_id", "sub_account_id", "symbol",
+            "side", "order_type", "error", "reason", "status",
+            "rejected_ts", "source_ts",
+        ])
+        assert d["type"] == StreamEventType.ORDER_REJECTED
+        assert d["status"] == "REJECTED"
+        _assert_json_roundtrip(d)
+
+
+class TestOrderEventBase:
+    def test_base_dict_normalizes_symbol_and_timestamps(self):
+        d = OrderEventBase(
+            client_order_id="coid-1",
+            symbol="BTC/USDT:USDT",
+            created_at=1709000000.123,
+            updated_at=1709000001.456,
+        )._base_dict()
+        assert d["symbol"] == "BTCUSDT"
+        assert d["createdAt"] == 1709000000123
+        assert d["updatedAt"] == 1709000001456
 
 
 class TestScalperEvents:
@@ -409,6 +479,24 @@ class TestRiskSnapshot:
                          "positions", "openOrders"])
         assert len(d["positions"]) == 1
         _assert_keys(d["positions"][0], ["id", "symbol", "side", "entryPrice"])
+
+    def test_position_snapshot_normalizes_symbol_and_opened_at_ms(self):
+        d = PositionSnapshot(
+            position_id="p1",
+            symbol="BTC/USDT:USDT",
+            opened_at=1709000000.123,
+        ).to_dict()
+        assert d["symbol"] == "BTCUSDT"
+        assert d["openedAt"] == 1709000000123
+
+    def test_open_order_snapshot_normalizes_symbol_and_created_at_ms(self):
+        d = OpenOrderSnapshot(
+            client_order_id="coid-1",
+            symbol="ETH/USDT:USDT",
+            created_at=1709000000.123,
+        ).to_dict()
+        assert d["symbol"] == "ETHUSDT"
+        assert d["createdAt"] == 1709000000123
 
 
 # ═══════════════════════════════════════════════════════════════

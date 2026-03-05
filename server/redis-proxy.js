@@ -8,6 +8,7 @@
  * Used by thin trading routes after Python engine migration.
  */
 import { v4 as uuidv4 } from 'uuid';
+import { buildApiErrorBody, commandFailureResponse } from './http/api-taxonomy.js';
 
 let redis = null;
 
@@ -48,7 +49,15 @@ export async function waitForResult(requestId, timeoutMs = 5000) {
  * @returns {Promise<Object>}
  */
 export async function pushAndWait(queue, payload, timeoutMs = 5000) {
-    if (!redis) throw new Error('Redis not available');
+    if (!redis) {
+        return {
+            success: false,
+            error: 'Redis not available',
+            errorCode: 'INFRA_REDIS_UNAVAILABLE',
+            errorCategory: 'INFRA',
+            retryable: true,
+        };
+    }
 
     const requestId = uuidv4();
     const command = { requestId, ...payload };
@@ -57,7 +66,13 @@ export async function pushAndWait(queue, payload, timeoutMs = 5000) {
     const result = await waitForResult(requestId, timeoutMs);
 
     if (!result) {
-        return { success: false, error: 'Execution timeout — Python engine may be unavailable' };
+        return {
+            success: false,
+            error: 'Execution timeout — Python engine may be unavailable',
+            errorCode: 'INFRA_TIMEOUT',
+            errorCategory: 'TIMEOUT',
+            retryable: true,
+        };
     }
     return result;
 }
@@ -88,11 +103,17 @@ export function proxyToRedis(queue, extractFields = null) {
             res.set('X-Server-Latency-Ms', String(serverLatencyMs));
 
             if (!result.success) {
-                return res.status(400).json(result);
+                const failure = commandFailureResponse(result);
+                return res.status(failure.status).json(failure.body);
             }
             res.status(201).json({ ...result, serverLatencyMs });
         } catch (err) {
-            res.status(500).json({ success: false, error: err.message });
+            res.status(503).json(buildApiErrorBody({
+                code: 'INFRA_PROXY_FAILURE',
+                category: 'INFRA',
+                message: err.message || 'Redis proxy failed',
+                retryable: true,
+            }));
         }
     };
 }

@@ -6,6 +6,7 @@
  */
 import { Router } from 'express';
 import prisma from '../../db/prisma.js';
+import { buildApiErrorBody, commandFailureResponse } from '../../http/api-taxonomy.js';
 import { getRiskSnapshot } from '../../redis.js';
 import { requireOwnership, requirePositionOwnership } from '../../ownership.js';
 import { proxyToRedis, pushAndWait } from '../../redis-proxy.js';
@@ -43,7 +44,11 @@ router.post('/close/:positionId', requirePositionOwnership(), async (req, res) =
         );
 
         if (!livePosition && (!dbPosition || dbPosition.status !== 'OPEN')) {
-            return res.status(404).json({ error: 'Position not found or already closed' });
+            return res.status(404).json(buildApiErrorBody({
+                code: 'POSITION_NOT_FOUND',
+                category: 'VALIDATION',
+                message: 'Position not found or already closed',
+            }));
         }
 
         const position = livePosition || dbPosition;
@@ -86,7 +91,12 @@ router.post('/close/:positionId', requirePositionOwnership(), async (req, res) =
                 return res.json({ success: true, staleCleanup: true, positionId });
             }
             // Position exists live but Python timed out — real error
-            return res.status(500).json({ error: cmdErr.message });
+            return res.status(504).json(buildApiErrorBody({
+                code: 'INFRA_TIMEOUT',
+                category: 'TIMEOUT',
+                message: cmdErr.message || 'Execution timeout — Python engine may be unavailable',
+                retryable: true,
+            }));
         }
 
         // Python successfully cleaned the ghost position from its side
@@ -97,9 +107,13 @@ router.post('/close/:positionId', requirePositionOwnership(), async (req, res) =
         // Python failed to close AND failed to find the position in its book.
         if (!result.success) {
             if (livePosition) {
-                return res.status(409).json({
-                    error: result.error || 'Close rejected while position is still live',
-                });
+                return res.status(409).json(buildApiErrorBody({
+                    code: result.errorCode || 'AMBIGUOUS_CLOSE_REJECTED',
+                    category: result.errorCategory || 'AMBIGUITY',
+                    message: result.error || 'Close rejected while position is still live',
+                    retryable: Boolean(result.retryable),
+                    details: result.details,
+                }));
             }
             const errorStr = (result.error || '').toLowerCase();
             const isGhost = errorStr.includes('reduceonly')
@@ -124,12 +138,18 @@ router.post('/close/:positionId', requirePositionOwnership(), async (req, res) =
                 return res.json({ success: true, staleCleanup: true, positionId });
             }
 
-            return res.status(400).json(result);
+            const failure = commandFailureResponse(result);
+            return res.status(failure.status).json(failure.body);
         }
 
         res.json(result);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(500).json(buildApiErrorBody({
+            code: 'INTERNAL_CLOSE_ERROR',
+            category: 'INFRA',
+            message: err.message || 'Close request failed',
+            retryable: true,
+        }));
     }
 });
 

@@ -10,10 +10,11 @@ Responsibilities:
 """
 
 from __future__ import annotations
-
 import json
 import logging
 from typing import Any
+
+from contracts.common import StreamEventType
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +28,13 @@ class RiskConsumer:
         risk_engine: Any,
         redis_client: Any,
         db: Any,
+        lifecycle_store: Any = None,
     ) -> None:
         self._om = order_manager
         self._risk = risk_engine
         self._redis = redis_client
         self._db = db
+        self._lifecycle = lifecycle_store
 
     async def handle(self, events: list[dict]) -> None:
         """Process a batch of order state events."""
@@ -46,6 +49,22 @@ class RiskConsumer:
         event_type = event.get("type", "")
         client_order_id = event.get("client_order_id", "")
 
+        if self._lifecycle and event_type in (
+            StreamEventType.ORDER_INTENT,
+            "ORDER_STATE_NEW",
+            "ORDER_STATE_PARTIAL",
+            "ORDER_STATE_FILLED",
+            "ORDER_STATE_CANCELLED",
+            "ORDER_STATE_REJECTED",
+        ):
+            order = None
+            if event_type != StreamEventType.ORDER_INTENT and hasattr(self._om, "get_order"):
+                order = self._om.get_order(client_order_id)
+            await self._lifecycle.record(event, order=order)
+
+        if event_type == StreamEventType.ORDER_INTENT:
+            return
+
         if event_type == "ORDER_STATE_NEW":
             await self._on_new(event)
 
@@ -58,6 +77,9 @@ class RiskConsumer:
         elif event_type == "ORDER_STATE_PARTIAL":
             await self._on_partial(event)
 
+        elif event_type == "ORDER_STATE_REJECTED":
+            await self._on_rejected(event)
+
         elif event_type == "ACCOUNT_UPDATE":
             await self._on_account_update(event)
 
@@ -66,6 +88,7 @@ class RiskConsumer:
         order = self._om.get_order(event.get("client_order_id", ""))
         if order:
             if not order.is_terminal and order.order_type != "MARKET":
+                await self._om._db_persist_pending_order(order)
                 await self._om._redis_set_open_order(order)
             # Publish for frontend
             if order.order_type == "LIMIT":
@@ -112,6 +135,14 @@ class RiskConsumer:
         order = self._om.get_order(event.get("client_order_id", ""))
         if order:
             await self._om._publish_event("order_partial", order)
+
+    async def _on_rejected(self, event: dict) -> None:
+        """Submission rejected → publish failure event."""
+        order = self._om.get_order(event.get("client_order_id", ""))
+        if not order:
+            return
+        await self._om._redis_remove_open_order(order)
+        await self._om._publish_event("order_failed", order, error=event.get("error", "REJECTED"))
 
     async def _on_account_update(self, event: dict) -> None:
         """Account update from exchange → risk engine."""

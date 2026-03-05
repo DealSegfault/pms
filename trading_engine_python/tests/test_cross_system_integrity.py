@@ -15,6 +15,7 @@ Python to_dict() output directly. These tests ensure:
 import json
 import re
 import time
+from pathlib import Path
 
 import sys; sys.path.insert(0, '..')
 
@@ -30,6 +31,7 @@ from contracts.events import (
     TWAPBasketProgressEvent, TWAPBasketCompletedEvent,
     TrailStopProgressEvent, TrailStopTriggeredEvent, TrailStopCancelledEvent,
     PositionUpdatedEvent, PositionClosedEvent, PositionReducedEvent, MarginUpdateEvent,
+    OrderIntentStreamEvent, OrderRejectedStreamEvent,
     ScalperSlotInfo,
 )
 
@@ -269,6 +271,43 @@ class TestEventIntegrity:
         self._check_event(d, "MarginUpdateEvent")
 
 
+class TestLifecycleContractAlignment:
+    def test_stream_event_docs_include_order_intent_and_rejected(self):
+        server_contracts = Path(__file__).resolve().parents[2] / "server" / "contracts" / "events.js"
+        frontend_contracts = Path(__file__).resolve().parents[2] / "src" / "lib" / "contracts.js"
+        server_text = server_contracts.read_text(encoding="utf-8")
+        frontend_text = frontend_contracts.read_text(encoding="utf-8")
+
+        for marker in (
+            "ORDER_INTENT",
+            "ORDER_REJECTED",
+            "client_order_id",
+            "sub_account_id",
+            "decision_bid",
+            "decision_mid",
+        ):
+            assert marker in server_text
+            assert marker in frontend_text
+
+    def test_stream_dtos_share_core_field_names(self):
+        intent_keys = set(OrderIntentStreamEvent(
+            client_order_id="coid",
+            sub_account_id="sub-1",
+            routing_prefix="abc123def456",
+        ).to_stream_dict().keys())
+        rejected_keys = set(OrderRejectedStreamEvent(
+            client_order_id="coid",
+            sub_account_id="sub-1",
+            error="boom",
+        ).to_stream_dict().keys())
+
+        shared_required = {"client_order_id", "sub_account_id", "source_ts"}
+        intent_required = {"decision_bid", "decision_ask", "decision_mid", "decision_spread_bps"}
+        assert shared_required <= intent_keys
+        assert shared_required <= rejected_keys
+        assert intent_required <= intent_keys
+
+
 # ═══════════════════════════════════════════════════════════════
 # 3. Comprehensive field name consistency
 # ═══════════════════════════════════════════════════════════════
@@ -416,11 +455,17 @@ class TestOrderShapeConsistency:
         assert "orderType" in d
         assert "type" not in d
 
-    def test_created_at_is_number(self):
-        """createdAt must be seconds float, not ISO string."""
+    def test_created_at_is_ms_number(self):
+        """createdAt must be a millisecond timestamp number."""
         d = self._make_order().to_event_dict()
         assert isinstance(d["createdAt"], (int, float)), \
             f"createdAt should be number, got {type(d['createdAt'])}"
+        assert d["createdAt"] > 1_700_000_000_000, \
+            f"createdAt should be ms, got {d['createdAt']}"
+
+    def test_symbol_is_binance_native(self):
+        d = self._make_order().to_event_dict()
+        assert d["symbol"] == "BTCUSDT"
 
     def test_no_snake_case_keys(self):
         """All keys camelCase."""
@@ -479,6 +524,16 @@ class TestPositionShapeConsistency:
     def test_json_roundtrip(self):
         d = self._make_position().to_dict()
         _assert_json_roundtrip(d, "PositionSnapshot.to_dict")
+
+    def test_symbol_is_binance_native(self):
+        d = self._make_position().to_dict()
+        assert d["symbol"] == "BTCUSDT"
+
+    def test_opened_at_is_ms_number(self):
+        from contracts.state import PositionSnapshot
+        d = PositionSnapshot(position_id="pos-abc-123", opened_at=1709000000.123).to_dict()
+        assert isinstance(d["openedAt"], (int, float))
+        assert d["openedAt"] == 1709000000123
 
     def test_risk_snapshot_positions_use_id(self):
         """RiskSnapshot.to_dict() positions array must use 'id' key."""

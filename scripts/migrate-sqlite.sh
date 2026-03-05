@@ -71,7 +71,7 @@ table_columns = {
         "current_challenge", "created_at", "updated_at",
     ],
     "sub_accounts": [
-        "id", "user_id", "name", "type", "initial_balance", "current_balance",
+        "id", "user_id", "routing_prefix", "name", "type", "initial_balance", "current_balance",
         "status", "liquidation_mode", "maintenance_rate", "created_at", "updated_at",
     ],
     "risk_rules": [
@@ -201,7 +201,7 @@ copy_table() {
 }
 
 copy_table "users" "\"id\", \"username\", \"password_hash\", \"role\", \"status\", \"api_key\", \"current_challenge\", \"created_at\", \"updated_at\""
-copy_table "sub_accounts" "\"id\", \"user_id\", \"name\", \"type\", \"initial_balance\", \"current_balance\", \"status\", \"liquidation_mode\", \"maintenance_rate\", \"created_at\", \"updated_at\""
+copy_table "sub_accounts" "\"id\", \"user_id\", \"routing_prefix\", \"name\", \"type\", \"initial_balance\", \"current_balance\", \"status\", \"liquidation_mode\", \"maintenance_rate\", \"created_at\", \"updated_at\""
 copy_table "risk_rules" "\"id\", \"sub_account_id\", \"is_global\", \"max_leverage\", \"max_notional_per_trade\", \"max_total_exposure\", \"liquidation_threshold\""
 copy_table "virtual_positions" "\"id\", \"sub_account_id\", \"symbol\", \"side\", \"entry_price\", \"quantity\", \"notional\", \"leverage\", \"margin\", \"liquidation_price\", \"status\", \"realized_pnl\", \"taken_over\", \"taken_over_by\", \"taken_over_at\", \"opened_at\", \"closed_at\""
 copy_table "trade_executions" "\"id\", \"sub_account_id\", \"position_id\", \"exchange_order_id\", \"client_order_id\", \"symbol\", \"side\", \"type\", \"price\", \"quantity\", \"notional\", \"fee\", \"realized_pnl\", \"action\", \"origin_type\", \"status\", \"signature\", \"timestamp\""

@@ -192,6 +192,110 @@ def test_resume_scalper_restores_reduce_only_leg_when_armed():
     asyncio.run(run())
 
 
+def test_scalper_allow_loss_defaults_are_mode_aware_and_explicit_value_wins():
+    async def run():
+        md = _ImmediateSeedMarketData()
+
+        async def start_chase_batch(params_list):
+            return [f"chase_{idx}" for idx, _ in enumerate(params_list)]
+
+        chase = SimpleNamespace(
+            start_chase_batch=AsyncMock(side_effect=start_chase_batch),
+            cancel_chase=AsyncMock(return_value=True),
+        )
+
+        engine = ScalperEngine(SimpleNamespace(), md, chase, redis_client=None)
+
+        regular_id = await engine.start_scalper({
+            "subAccountId": "s1",
+            "symbol": "BTCUSDT",
+            "startSide": "LONG",
+            "leverage": 3,
+            "childCount": 1,
+            "longOffsetPct": 0.1,
+            "shortOffsetPct": 0.1,
+            "longSizeUsd": 100,
+            "shortSizeUsd": 100,
+        })
+        regular_state = engine.get_state(regular_id)
+        assert regular_state is not None
+        assert regular_state.allow_loss is True
+        await engine.cancel_scalper(regular_id)
+
+        neutral_id = await engine.start_scalper({
+            "subAccountId": "s1",
+            "symbol": "BTCUSDT",
+            "startSide": "LONG",
+            "neutralMode": True,
+            "leverage": 3,
+            "childCount": 1,
+            "longOffsetPct": 0.1,
+            "shortOffsetPct": 0.1,
+            "longSizeUsd": 100,
+            "shortSizeUsd": 100,
+        })
+        neutral_state = engine.get_state(neutral_id)
+        assert neutral_state is not None
+        assert neutral_state.allow_loss is False
+        await engine.cancel_scalper(neutral_id)
+
+        explicit_false_id = await engine.start_scalper({
+            "subAccountId": "s1",
+            "symbol": "BTCUSDT",
+            "startSide": "SHORT",
+            "allowLoss": False,
+            "leverage": 3,
+            "childCount": 1,
+            "longOffsetPct": 0.1,
+            "shortOffsetPct": 0.1,
+            "longSizeUsd": 100,
+            "shortSizeUsd": 100,
+        })
+        explicit_false_state = engine.get_state(explicit_false_id)
+        assert explicit_false_state is not None
+        assert explicit_false_state.allow_loss is False
+        await engine.cancel_scalper(explicit_false_id)
+
+    asyncio.run(run())
+
+
+def test_scalper_progress_payload_preserves_pause_reason():
+    async def run():
+        class _RedisCapture:
+            def __init__(self):
+                self.events = []
+
+            async def publish(self, channel, payload):
+                self.events.append((channel, json.loads(payload)))
+
+        redis = _RedisCapture()
+        engine = ScalperEngine(SimpleNamespace(), _ImmediateSeedMarketData(), SimpleNamespace(), redis_client=redis)
+        state = ScalperState(
+            id="scalper_pause_reason_1",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            start_side="LONG",
+            long_slots=[
+                ScalperSlot(
+                    layer_idx=0,
+                    side="BUY",
+                    qty=1.0,
+                    offset_pct=0.1,
+                    paused=True,
+                    pause_reason="price_filter",
+                )
+            ],
+        )
+
+        await engine._broadcast_progress(state)
+
+        assert redis.events, "Expected scalper_progress publish"
+        _, payload = redis.events[-1]
+        assert payload["longSlots"][0]["pauseReason"] == "price_filter"
+
+    asyncio.run(run())
+
+
 def test_scalper_cancel_kills_restart_orphan_created_after_stop():
     async def run():
         md = _ImmediateSeedMarketData()

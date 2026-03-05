@@ -762,9 +762,27 @@ export function setupAppEventListeners() {
                     badge.style.color = '#22c55e';
                     badge.title = 'Active';
                 } else if (slot.paused) {
-                    badge.textContent = '⏸ paused';
+                    const reason = String(slot.pauseReason || '').toLowerCase();
+                    if (reason === 'price_filter') {
+                        badge.textContent = '⏸ price filter';
+                        badge.title = 'Paused: price filter (loss gate / entry pin / bounds) blocks this slot';
+                    } else if (reason === 'no_position') {
+                        badge.textContent = '⏸ no position';
+                        badge.title = 'Paused: no matching position available for reduce-only close';
+                    } else if (reason === 'burst_limit') {
+                        badge.textContent = '⏸ burst limit';
+                        badge.title = 'Paused: burst cooldown after rapid fills';
+                    } else if (reason === 'refill_delay') {
+                        badge.textContent = '⏸ refill delay';
+                        badge.title = 'Paused: configured refill delay after fill';
+                    } else if (reason) {
+                        badge.textContent = `⏸ ${reason.replace(/_/g, ' ')}`;
+                        badge.title = `Paused: ${reason}`;
+                    } else {
+                        badge.textContent = '⏸ paused';
+                        badge.title = 'Paused';
+                    }
                     badge.style.color = '#f59e0b';
-                    badge.title = 'Price filter active — waiting for price to re-enter range';
                 } else if (slot.retryAt) {
                     const secsLeft = Math.max(0, Math.ceil((slot.retryAt - now) / 1000));
                     badge.textContent = secsLeft > 0 ? `⟳ ${secsLeft}s` : '⟳ soon';

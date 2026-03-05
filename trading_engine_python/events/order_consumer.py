@@ -14,6 +14,9 @@ import logging
 import time
 from typing import Any, Optional
 
+from contracts.common import StreamEventType
+from orders.state import OrderState
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,9 +61,16 @@ class OrderConsumer:
         event_type = event.get("type", "")
 
         # Only handle order events
-        if event_type not in ("ORDER_NEW", "ORDER_FILLED", "ORDER_PARTIALLY_FILLED",
-                               "ORDER_CANCELLED", "ORDER_EXPIRED", "ORDER_REJECTED",
-                               "TRADE_LITE"):
+        if event_type not in (
+            StreamEventType.ORDER_INTENT,
+            StreamEventType.ORDER_NEW,
+            StreamEventType.ORDER_FILLED,
+            StreamEventType.ORDER_PARTIALLY_FILLED,
+            StreamEventType.ORDER_CANCELLED,
+            StreamEventType.ORDER_EXPIRED,
+            StreamEventType.ORDER_REJECTED,
+            StreamEventType.TRADE_LITE,
+        ):
             return
 
         client_order_id = event.get("client_order_id", "")
@@ -69,6 +79,10 @@ class OrderConsumer:
 
         # Skip non-PMS orders
         if client_order_id and not client_order_id.startswith("PMS"):
+            return
+
+        if event_type == StreamEventType.ORDER_INTENT:
+            await self._on_intent(event)
             return
 
         # Look up order in tracker
@@ -84,7 +98,9 @@ class OrderConsumer:
                 return
 
         # Process based on status
-        if status == "NEW":
+        if event_type == StreamEventType.ORDER_REJECTED or status == "REJECTED":
+            await self._on_rejected(order, event)
+        elif status == "NEW":
             await self._on_new(order, event)
         elif status == "PARTIALLY_FILLED":
             await self._on_partial(order, event)
@@ -92,6 +108,68 @@ class OrderConsumer:
             await self._on_filled(order, event)
         elif status in ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED"):
             await self._on_cancelled(order, event, status)
+
+    async def _on_intent(self, event: dict) -> None:
+        """Register a placeholder order from submit-time intent."""
+        client_order_id = event.get("client_order_id", "")
+        if not client_order_id:
+            return
+
+        existing = self._tracker.lookup(client_order_id=client_order_id)
+        if existing:
+            return
+
+        sub_account_id = event.get("sub_account_id", "")
+        if not sub_account_id:
+            return
+
+        order = OrderState(
+            client_order_id=client_order_id,
+            sub_account_id=sub_account_id,
+            exchange_order_id=event.get("exchange_order_id") or None,
+            symbol=event.get("symbol", ""),
+            side=event.get("side", ""),
+            order_type=event.get("order_type", "LIMIT"),
+            quantity=self._to_float(event.get("quantity")),
+            price=self._to_optional_float(event.get("price")),
+            state="placing",
+            origin=event.get("origin", "BOT"),
+            parent_id=event.get("parent_id") or None,
+            reduce_only=self._to_bool(event.get("reduce_only")),
+            leverage=int(self._to_float(event.get("leverage"), 1.0)),
+            created_at=self._to_float(event.get("intent_ts"), time.time() * 1000.0) / 1000.0,
+            updated_at=self._to_float(event.get("intent_ts"), time.time() * 1000.0) / 1000.0,
+        )
+
+        self._tracker.register(order)
+
+    async def _on_rejected(self, order: Any, event: dict) -> None:
+        """Handle submission-time rejection/failure."""
+        if order.state == "failed":
+            logger.debug("OrderConsumer: duplicate REJECTED for %s", order.client_order_id)
+            return
+        if not order.transition("failed"):
+            logger.warning(
+                "OrderConsumer: rejecting REJECTED for %s in state=%s",
+                order.client_order_id,
+                order.state,
+            )
+            return
+
+        await self._bus.publish("ORDER_STATE_REJECTED", {
+            "client_order_id": order.client_order_id,
+            "exchange_order_id": order.exchange_order_id or "",
+            "symbol": order.symbol,
+            "side": order.side,
+            "order_type": order.order_type,
+            "price": str(order.price or 0),
+            "quantity": str(order.quantity),
+            "origin": order.origin,
+            "parent_id": order.parent_id or "",
+            "sub_account_id": order.sub_account_id,
+            "reduce_only": str(order.reduce_only),
+            "error": event.get("error", event.get("reason", "REJECTED")),
+        })
 
     async def _on_new(self, order: Any, event: dict) -> None:
         """Handle NEW status."""
@@ -224,4 +302,27 @@ class OrderConsumer:
             "last_filled_price": event.get("fill_price", "0"),
             "accumulated_filled_qty": event.get("accumulated_filled_qty", "0"),
             "avg_price": event.get("avg_price", "0"),
+            "reduce_only": event.get("reduce_only", False),
+            "parent_id": event.get("parent_id", ""),
+            "origin": event.get("origin", "BOT"),
+            "sub_account_id": event.get("sub_account_id", ""),
         }
+
+    @staticmethod
+    def _to_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes")
+
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _to_optional_float(cls, value: Any) -> Optional[float]:
+        if value in (None, "", "None"):
+            return None
+        return cls._to_float(value)

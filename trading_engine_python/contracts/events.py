@@ -14,7 +14,113 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .common import ts_ms, EventType
+from .common import EventType, StreamEventType, normalize_symbol, ts_ms, ts_s_to_ms
+
+
+# ══════════════════════════════════════════════════════════════
+# Stream Lifecycle Events (Redis Stream, internal)
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class LifecycleStreamEventBase:
+    """Base payload for canonical lifecycle stream events."""
+
+    client_order_id: str = ""
+    exchange_order_id: Optional[str] = None
+    sub_account_id: str = ""
+    symbol: str = ""
+    side: str = ""
+    order_type: str = "LIMIT"
+    quantity: float = 0.0
+    price: Optional[float] = None
+    reduce_only: bool = False
+    origin: str = "MANUAL"
+    parent_id: Optional[str] = None
+    execution_scope: str = "SUB_ACCOUNT"
+    source_ts: int = 0
+
+    def _base_stream_dict(self) -> dict:
+        return {
+            "client_order_id": self.client_order_id,
+            "exchange_order_id": self.exchange_order_id or "",
+            "sub_account_id": self.sub_account_id,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
+            "side": self.side,
+            "order_type": self.order_type,
+            "quantity": self.quantity,
+            "price": "" if self.price is None else self.price,
+            "reduce_only": self.reduce_only,
+            "origin": self.origin,
+            "parent_id": self.parent_id or "",
+            "execution_scope": self.execution_scope,
+            "source_ts": self.source_ts or ts_ms(),
+        }
+
+    @classmethod
+    def from_order_state(
+        cls,
+        order: Any,
+        *,
+        source_ts: Optional[int] = None,
+    ) -> "LifecycleStreamEventBase":
+        return cls(
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+            sub_account_id=order.sub_account_id,
+            symbol=order.symbol,
+            side=order.side,
+            order_type=order.order_type,
+            quantity=order.quantity,
+            price=order.price,
+            reduce_only=order.reduce_only,
+            origin=order.origin,
+            parent_id=order.parent_id,
+            source_ts=source_ts or ts_ms(),
+        )
+
+
+@dataclass
+class OrderIntentStreamEvent(LifecycleStreamEventBase):
+    """Submit-time lifecycle event published before venue submission."""
+
+    routing_prefix: str = ""
+    intent_ts: int = 0
+    decision_bid: Optional[float] = None
+    decision_ask: Optional[float] = None
+    decision_mid: Optional[float] = None
+    decision_spread_bps: Optional[float] = None
+
+    def to_stream_dict(self) -> dict:
+        return {
+            "type": StreamEventType.ORDER_INTENT,
+            **self._base_stream_dict(),
+            "routing_prefix": self.routing_prefix,
+            "intent_ts": self.intent_ts or self.source_ts or ts_ms(),
+            "decision_bid": "" if self.decision_bid is None else self.decision_bid,
+            "decision_ask": "" if self.decision_ask is None else self.decision_ask,
+            "decision_mid": "" if self.decision_mid is None else self.decision_mid,
+            "decision_spread_bps": "" if self.decision_spread_bps is None else self.decision_spread_bps,
+        }
+
+
+@dataclass
+class OrderRejectedStreamEvent(LifecycleStreamEventBase):
+    """Terminal lifecycle event for submission-time rejection/failure."""
+
+    error: str = ""
+    reason: str = ""
+    status: str = "REJECTED"
+    rejected_ts: int = 0
+
+    def to_stream_dict(self) -> dict:
+        return {
+            "type": StreamEventType.ORDER_REJECTED,
+            **self._base_stream_dict(),
+            "error": self.error,
+            "reason": self.reason or self.error,
+            "status": self.status,
+            "rejected_ts": self.rejected_ts or self.source_ts or ts_ms(),
+        }
 
 
 # ══════════════════════════════════════════════════════════════
@@ -49,7 +155,7 @@ class OrderEventBase:
             "clientOrderId": self.client_order_id,
             "exchangeOrderId": self.exchange_order_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "orderType": self.order_type,
             "quantity": self.quantity,
@@ -63,8 +169,8 @@ class OrderEventBase:
             "origin": self.origin,
             "parentId": self.parent_id,
             "leverage": self.leverage,
-            "createdAt": self.created_at,
-            "updatedAt": self.updated_at,
+            "createdAt": ts_s_to_ms(self.created_at),
+            "updatedAt": ts_s_to_ms(self.updated_at),
         }
 
     @classmethod
@@ -212,7 +318,7 @@ class ChaseProgressEvent:
             "type": EventType.CHASE_PROGRESS,
             "chaseId": self.chase_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "quantity": self.quantity,
             "repriceCount": self.reprice_count,
@@ -246,7 +352,7 @@ class ChaseFilledEvent:
             "type": EventType.CHASE_FILLED,
             "chaseId": self.chase_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "quantity": self.quantity,
             "fillPrice": self.fill_price,
@@ -275,7 +381,7 @@ class ChaseCancelledEvent:
             "type": EventType.CHASE_CANCELLED,
             "chaseId": self.chase_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "reason": self.reason,
             "repriceCount": self.reprice_count,
@@ -339,7 +445,7 @@ class ScalperProgressEvent:
             "type": EventType.SCALPER_PROGRESS,
             "scalperId": self.scalper_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "startSide": self.start_side,
             "status": self.status,
             "totalFillCount": self.fill_count,
@@ -370,7 +476,7 @@ class ScalperFilledEvent:
             "type": EventType.SCALPER_FILLED,
             "scalperId": self.scalper_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "layerIdx": self.layer_idx,
             "fillPrice": self.fill_price,
@@ -394,7 +500,7 @@ class ScalperCancelledEvent:
             "type": EventType.SCALPER_CANCELLED,
             "scalperId": self.scalper_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "totalFillCount": self.fill_count,
             "status": "CANCELLED",
             "timestamp": ts_ms(),
@@ -423,7 +529,7 @@ class TWAPProgressEvent:
             "type": EventType.TWAP_PROGRESS,
             "twapId": self.twap_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "filledLots": self.filled_lots,
             "totalLots": self.total_lots,
@@ -451,7 +557,7 @@ class TWAPCompletedEvent:
             "type": EventType.TWAP_COMPLETED,
             "twapId": self.twap_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "filledLots": self.filled_lots,
             "totalLots": self.total_lots,
@@ -479,7 +585,7 @@ class TWAPCancelledEvent:
             "type": EventType.TWAP_CANCELLED,
             "twapId": self.twap_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "filledLots": self.filled_lots,
             "totalLots": self.total_lots,
@@ -502,7 +608,7 @@ class TWAPBasketLegInfo:
 
     def to_dict(self) -> dict:
         return {
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "filledSize": self.filled_size,
             "totalSize": self.total_size,
@@ -606,7 +712,7 @@ class TrailStopProgressEvent:
             "type": EventType.TRAIL_STOP_PROGRESS,
             "trailStopId": self.trail_stop_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "callbackPct": self.callback_pct,
             "extremePrice": self.extreme_price,
@@ -637,7 +743,7 @@ class TrailStopTriggeredEvent:
             "type": EventType.TRAIL_STOP_TRIGGERED,
             "trailStopId": self.trail_stop_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "callbackPct": self.callback_pct,
             "extremePrice": self.extreme_price,
@@ -664,7 +770,7 @@ class TrailStopCancelledEvent:
             "type": EventType.TRAIL_STOP_CANCELLED,
             "trailStopId": self.trail_stop_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "callbackPct": self.callback_pct,
             "positionId": self.position_id,
@@ -696,7 +802,7 @@ class PositionUpdatedEvent:
             "type": EventType.POSITION_UPDATED,
             "subAccountId": self.sub_account_id,
             "positionId": self.position_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "entryPrice": self.entry_price,
             "quantity": self.quantity,
@@ -726,7 +832,7 @@ class PositionClosedEvent:
             "type": EventType.POSITION_CLOSED,
             "subAccountId": self.sub_account_id,
             "positionId": self.position_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "realizedPnl": self.realized_pnl,
             "closePrice": self.close_price,

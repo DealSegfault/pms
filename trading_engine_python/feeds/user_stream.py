@@ -268,6 +268,7 @@ class UserStreamService:
                     "accumulated_filled_qty": mapped["accumulated_filled_qty"],
                     "avg_price": mapped["avg_price"],
                     "reduce_only": str(mapped.get("reduce_only", False)),
+                    "source_ts": str(raw.get("T") or message.get("E") or 0),
                 })
                 if not event_id:
                     await self._order_manager.on_order_update(mapped)
@@ -310,6 +311,7 @@ class UserStreamService:
                     "payload": json.dumps(normalized),
                     "event_time": str(message.get("E", 0)),
                     "transaction_time": str(message.get("T", 0)),
+                    "source_ts": str(message.get("E", 0) or message.get("T", 0) or 0),
                 })
                 if not event_id and self._risk_engine:
                     await self._risk_engine.on_account_update(normalized)
@@ -377,6 +379,7 @@ class UserStreamService:
                     "fill_qty": mapped["last_filled_qty"],
                     "accumulated_filled_qty": mapped["accumulated_filled_qty"],
                     "avg_price": mapped["avg_price"],
+                    "source_ts": str(data.get("T", 0) or 0),
                 })
                 if not event_id:
                     await self._order_manager.on_order_update(mapped)

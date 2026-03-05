@@ -19,6 +19,7 @@ EVENT_MAP = {
     "ORDER_STATE_PARTIAL": "order_partial",
     "ORDER_STATE_FILLED": "order_filled",
     "ORDER_STATE_CANCELLED": "order_cancelled",
+    "ORDER_STATE_REJECTED": "order_failed",
 }
 
 

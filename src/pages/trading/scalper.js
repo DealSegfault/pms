@@ -146,6 +146,9 @@ export async function submitScalper() {
 
     const scalperMode = document.getElementById('scalper-controls')?.dataset?.scalperMode || 'LONG';
     const _neutralMode = scalperMode === 'NEUTRAL';
+    const allowLossEnabled = document.getElementById('scalper-allow-loss')
+        ? (document.getElementById('scalper-allow-loss')?.checked ?? false)
+        : !_neutralMode;
     // For NEUTRAL, we start both legs so startSide is LONG by convention (server handles it)
     const startSide = _neutralMode ? 'LONG' : scalperMode; // LONG | SHORT
 
@@ -190,7 +193,7 @@ export async function submitScalper() {
                 minFillSpreadPct: parseFloat(document.getElementById('scalper-min-fill-spread')?.value) || 0,
                 fillDecayHalfLifeMs: (parseInt(document.getElementById('scalper-fill-decay-halflife')?.value) || 30) * 1000,
                 minRefillDelayMs: (parseInt(document.getElementById('scalper-min-refill-delay')?.value) || 0) * 1000,
-                allowLoss: document.getElementById('scalper-allow-loss')?.checked ?? false,
+                allowLoss: allowLossEnabled,
                 // Risk guards (from trade analysis)
                 maxLossPerCloseBps: parseInt(document.getElementById('scalper-max-loss-close')?.value) || 0,
                 maxFillsPerMinute: parseInt(document.getElementById('scalper-max-fills-pm')?.value) || 0,

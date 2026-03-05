@@ -34,7 +34,7 @@ export async function submitTwapOrder() {
     const perLot = totalSize / lots;
     if (perLot < minNotional) {
         const maxLots = Math.floor(totalSize / minNotional);
-        return showToast(`Each lot $${perLot.toFixed(2)} < $${minNotional} min. Reduce lots to ${maxLots} or increase size.`, 'error');
+        return showToast(`Requested ${lots} lots gives $${perLot.toFixed(2)}/lot. Max at this size: ${Math.max(0, maxLots)} lots (min $${minNotional}/lot).`, 'error');
     }
 
     const intervalSec = (durationMinutes * 60) / lots;
@@ -79,6 +79,14 @@ export async function submitTwapOrder() {
             scheduleTradingRefresh({ openOrders: true, annotations: true, forceAnnotations: true }, 30);
         }
     } catch (err) {
+        if (err?.errorCode === 'VALIDATION_TWAP_LOTS_INVALID' && err?.details) {
+            const d = err.details;
+            const requestedLots = Number(d.requestedLots || lots);
+            const maxLots = Number(d.maxLots || 0);
+            const minNotionalHint = Number(d.minNotional || minNotional);
+            showToast(`TWAP rejected: ${requestedLots} lots requested, max is ${Math.max(0, maxLots)} for ${d.symbol || S.selectedSymbol} (min $${minNotionalHint}/lot).`, 'error');
+            return;
+        }
         if (err.errors && Array.isArray(err.errors)) {
             showTradeError(err.errors);
         } else {

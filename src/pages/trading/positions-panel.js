@@ -583,7 +583,7 @@ export async function prefillOrderForm(params) {
         setInput('scalper-min-fill-spread', (params.minFillSpreadPct || 0).toFixed(2));
         setInput('scalper-fill-decay-halflife', Math.round((params.fillDecayHalfLifeMs || 30000) / 1000));
         setInput('scalper-min-refill-delay', Math.round((params.minRefillDelayMs || 0) / 1000));
-        setChecked('scalper-allow-loss', params.allowLoss ?? false);
+        setChecked('scalper-allow-loss', params.allowLoss ?? !params.neutralMode);
         import('./scalper.js').then(m => m.updateScalperPreview?.());
     }
 

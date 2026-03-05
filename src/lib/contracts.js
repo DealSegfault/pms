@@ -7,7 +7,7 @@
  * No runtime code — purely documentation for frontend developers.
  *
  * Convention:
- *   - Symbol: ccxt format (DOGE/USDT:USDT) — use symbol.split('/')[0] for display
+ *   - Symbol: Binance-native (DOGEUSDT) — convert only at display boundary
  *   - Side: BUY/SELL for orders, LONG/SHORT for positions
  *   - Timestamps: milliseconds everywhere
  *   - REST and WS return identical shapes (Python to_dict() passthrough)
@@ -59,6 +59,16 @@ export const WS_EVENTS = {
     ADL_TRIGGERED: 'adl_triggered',
 };
 
+export const LIFECYCLE_STREAM_EVENTS = {
+    ORDER_INTENT: 'ORDER_INTENT',
+    ORDER_NEW: 'ORDER_NEW',
+    ORDER_PARTIALLY_FILLED: 'ORDER_PARTIALLY_FILLED',
+    ORDER_FILLED: 'ORDER_FILLED',
+    ORDER_CANCELLED: 'ORDER_CANCELLED',
+    ORDER_EXPIRED: 'ORDER_EXPIRED',
+    ORDER_REJECTED: 'ORDER_REJECTED',
+};
+
 // ── Event Payload Types ─────────────────────────────────────
 
 /**
@@ -67,6 +77,44 @@ export const WS_EVENTS = {
  * @property {string} type       - One of WS_EVENTS
  * @property {Object} data       - Event-specific payload (see below)
  * @property {number} timestamp  - Server ms timestamp
+ */
+
+/**
+ * @typedef {Object} OrderIntentLifecyclePayload
+ * @property {"ORDER_INTENT"} type
+ * @property {string} client_order_id
+ * @property {string} sub_account_id
+ * @property {string} routing_prefix
+ * @property {string} symbol
+ * @property {string} side
+ * @property {string} order_type
+ * @property {string|number} quantity
+ * @property {string|number} price
+ * @property {string|boolean} reduce_only
+ * @property {string} origin
+ * @property {string|number} decision_bid
+ * @property {string|number} decision_ask
+ * @property {string|number} decision_mid
+ * @property {string|number} decision_spread_bps
+ * @property {string|number} intent_ts
+ * @property {string|number} source_ts
+ * @property {string|number} ingested_ts
+ */
+
+/**
+ * @typedef {Object} OrderRejectedLifecyclePayload
+ * @property {"ORDER_REJECTED"} type
+ * @property {string} client_order_id
+ * @property {string} sub_account_id
+ * @property {string} symbol
+ * @property {string} side
+ * @property {string} order_type
+ * @property {string} error
+ * @property {string} reason
+ * @property {string} status
+ * @property {string|number} rejected_ts
+ * @property {string|number} source_ts
+ * @property {string|number} ingested_ts
  */
 
 /**

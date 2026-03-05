@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import random
 import time
 import uuid
@@ -41,6 +42,16 @@ TWAP_REDIS_TTL = 43200  # 12h
 
 # Side normalization delegated to contracts.common
 _normalize_side = normalize_side
+
+
+class TWAPValidationError(ValueError):
+    """Structured validation error surfaced to JS/API without lossy parsing."""
+
+    def __init__(self, code: str, message: str, details: Optional[dict] = None):
+        super().__init__(message)
+        self.error_code = code
+        self.error_category = "VALIDATION"
+        self.error_details = details or {}
 
 
 # ── Dataclasses ──
@@ -95,6 +106,133 @@ class TWAPEngine:
         self._active: Dict[str, TWAPState] = {}
         self._baskets: Dict[str, TWAPBasketState] = {}
 
+    def _resolve_num_lots(self, params: dict) -> int:
+        raw = params.get("numLots", params.get("lots", 10))
+        try:
+            num_lots = int(raw)
+        except (TypeError, ValueError):
+            raise TWAPValidationError(
+                "VALIDATION_TWAP_LOTS_INVALID",
+                f"Invalid lots value: {raw!r}",
+                {"requestedLots": raw, "maxLots": 0},
+            )
+        if num_lots < 1:
+            raise TWAPValidationError(
+                "VALIDATION_TWAP_LOTS_INVALID",
+                f"Invalid lots value: {num_lots}",
+                {"requestedLots": num_lots, "maxLots": 0},
+            )
+        return num_lots
+
+    def _resolve_mid_price(self, symbol: str) -> Optional[float]:
+        price = self._md.get_mid_price(symbol) if self._md else None
+        if price is None:
+            return None
+        try:
+            price_val = float(price)
+        except (TypeError, ValueError):
+            return None
+        return price_val if price_val > 0 else None
+
+    def _resolve_total_quantity(self, params: dict, symbol: str) -> tuple[float, Optional[float]]:
+        """Return (total_qty, total_notional_usd_if_known)."""
+        if "sizeUsdt" in params and params["sizeUsdt"]:
+            size_usdt = float(params["sizeUsdt"])
+            if size_usdt <= 0:
+                raise TWAPValidationError(
+                    "VALIDATION_TWAP_INVALID_SIZE",
+                    f"sizeUsdt must be positive, got {size_usdt}",
+                )
+            price = self._resolve_mid_price(symbol)
+            if not price:
+                raise TWAPValidationError(
+                    "VALIDATION_TWAP_PRICE_UNAVAILABLE",
+                    f"Cannot get price for {symbol} to convert sizeUsdt to quantity",
+                )
+            return size_usdt / price, size_usdt
+
+        if "totalSize" in params and params["totalSize"]:
+            total_size = float(params["totalSize"])
+            if total_size <= 0:
+                raise TWAPValidationError(
+                    "VALIDATION_TWAP_INVALID_SIZE",
+                    f"totalSize must be positive, got {total_size}",
+                )
+            price = self._resolve_mid_price(symbol)
+            if not price:
+                raise TWAPValidationError(
+                    "VALIDATION_TWAP_PRICE_UNAVAILABLE",
+                    f"Cannot get price for {symbol} to convert totalSize to quantity",
+                )
+            return total_size / price, total_size
+
+        if "quantity" in params and params["quantity"]:
+            total_qty = float(params["quantity"])
+            if total_qty <= 0:
+                raise TWAPValidationError(
+                    "VALIDATION_TWAP_INVALID_SIZE",
+                    f"quantity must be positive, got {total_qty}",
+                )
+            price = self._resolve_mid_price(symbol)
+            total_notional = total_qty * price if price else None
+            return total_qty, total_notional
+
+        raise TWAPValidationError(
+            "VALIDATION_TWAP_MISSING_SIZE",
+            "Missing required field: quantity, sizeUsdt, or totalSize",
+        )
+
+    def _symbol_constraints(self, symbol: str) -> tuple[float, float]:
+        """Return (min_notional, min_qty) if symbol info is available."""
+        min_notional = 5.0
+        min_qty = 0.0
+        symbol_info = getattr(self._om, "_symbol_info", None)
+        if symbol_info:
+            try:
+                min_notional = float(symbol_info.get_min_notional(symbol))
+            except Exception:
+                pass
+            try:
+                min_qty = float(symbol_info.get_min_qty(symbol))
+            except Exception:
+                pass
+        return max(min_notional, 0.0), max(min_qty, 0.0)
+
+    def _validate_lot_constraints(
+        self,
+        symbol: str,
+        num_lots: int,
+        total_qty: float,
+        total_notional: Optional[float],
+    ) -> None:
+        min_notional, min_qty = self._symbol_constraints(symbol)
+        max_lots_candidates: List[int] = []
+
+        if total_notional is not None and total_notional > 0 and min_notional > 0:
+            max_lots_candidates.append(int(math.floor(total_notional / min_notional)))
+        if total_qty > 0 and min_qty > 0:
+            max_lots_candidates.append(int(math.floor(total_qty / min_qty)))
+
+        max_lots = min(max_lots_candidates) if max_lots_candidates else num_lots
+        max_lots = max(max_lots, 0)
+        if num_lots <= max_lots:
+            return
+
+        details = {
+            "symbol": symbol,
+            "requestedLots": int(num_lots),
+            "maxLots": int(max_lots),
+            "totalSize": float(total_notional) if total_notional is not None else None,
+            "minNotional": float(min_notional),
+            "totalQuantity": float(total_qty),
+            "minQty": float(min_qty),
+        }
+        raise TWAPValidationError(
+            "VALIDATION_TWAP_LOTS_INVALID",
+            f"Requested {num_lots} lots exceeds max {max_lots} for {symbol}",
+            details,
+        )
+
     # ── Single TWAP ──
 
     async def start_twap(self, params: dict) -> str:
@@ -109,26 +247,9 @@ class TWAPEngine:
         twap_id = f"twap_{uuid.uuid4().hex[:12]}"
         symbol = params["symbol"]  # Keep ccxt format — convert at exchange boundary only
         side = _normalize_side(params["side"])
-
-        # Resolve quantity — support coin amount, USD amount, or frontend totalSize (USD)
-        if "sizeUsdt" in params and params["sizeUsdt"]:
-            size_usdt = float(params["sizeUsdt"])
-            price = self._md.get_mid_price(symbol) if self._md else None
-            if not price or price <= 0:
-                raise ValueError(f"Cannot get price for {symbol} to convert sizeUsdt to quantity")
-            total_qty = size_usdt / price
-        elif "totalSize" in params and params["totalSize"]:
-            size_usdt = float(params["totalSize"])
-            price = self._md.get_mid_price(symbol) if self._md else None
-            if not price or price <= 0:
-                raise ValueError(f"Cannot get price for {symbol} to convert totalSize to quantity")
-            total_qty = size_usdt / price
-        elif "quantity" in params and params["quantity"]:
-            total_qty = float(params["quantity"])
-        else:
-            raise ValueError("Missing required field: quantity, sizeUsdt, or totalSize")
-
-        num_lots = int(params.get("numLots", params.get("lots", 10)))
+        num_lots = self._resolve_num_lots(params)
+        total_qty, total_notional = self._resolve_total_quantity(params, symbol)
+        self._validate_lot_constraints(symbol, num_lots, total_qty, total_notional)
         irregular = bool(params.get("irregular", False))
 
         # Compute interval: support both intervalSeconds and durationMinutes
@@ -138,6 +259,11 @@ class TWAPEngine:
             interval_seconds = (float(params["durationMinutes"]) * 60) / num_lots
         else:
             interval_seconds = 60.0
+        if interval_seconds <= 0:
+            raise TWAPValidationError(
+                "VALIDATION_TWAP_INVALID_INTERVAL",
+                f"intervalSeconds must be > 0, got {interval_seconds}",
+            )
 
         # Generate lot sizes
         if irregular:
@@ -210,10 +336,19 @@ class TWAPEngine:
         basket_id = f"twapb_{uuid.uuid4().hex[:12]}"
         sub_account_id = params["subAccountId"]
         basket_name = params.get("basketName", "Unnamed Index")
-        num_lots = int(params.get("lots", params.get("numLots", 10)))
+        num_lots = self._resolve_num_lots(params)
 
-        twap_ids = []
-        for leg in params.get("legs", []):
+        legs = params.get("legs", [])
+        if not isinstance(legs, list) or not legs:
+            raise TWAPValidationError(
+                "VALIDATION_TWAP_BASKET_LOTS_INVALID",
+                "TWAP basket requires at least one leg",
+                {"basketName": basket_name, "requestedLots": num_lots, "legs": []},
+            )
+
+        prepared_legs: List[dict] = []
+        invalid_legs: List[dict] = []
+        for leg in legs:
             leg_params = {
                 **leg,
                 "subAccountId": sub_account_id,
@@ -228,6 +363,27 @@ class TWAPEngine:
             if leg_params.get("jitter") and "jitterPct" not in leg_params:
                 leg_params["jitterPct"] = 30
 
+            try:
+                total_qty, total_notional = self._resolve_total_quantity(leg_params, leg_params.get("symbol", ""))
+                self._validate_lot_constraints(leg_params.get("symbol", ""), num_lots, total_qty, total_notional)
+                prepared_legs.append(leg_params)
+            except TWAPValidationError as exc:
+                if getattr(exc, "error_code", "") == "VALIDATION_TWAP_LOTS_INVALID":
+                    details = dict(getattr(exc, "error_details", {}) or {})
+                    details["side"] = leg_params.get("side", "")
+                    invalid_legs.append(details)
+                    continue
+                raise
+
+        if invalid_legs:
+            raise TWAPValidationError(
+                "VALIDATION_TWAP_BASKET_LOTS_INVALID",
+                f"TWAP basket {basket_name} has legs with invalid lot sizing",
+                {"basketName": basket_name, "requestedLots": num_lots, "legs": invalid_legs},
+            )
+
+        twap_ids = []
+        for leg_params in prepared_legs:
             twap_id = await self.start_twap(leg_params)
             twap_ids.append(twap_id)
 

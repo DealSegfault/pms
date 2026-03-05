@@ -300,6 +300,52 @@ def test_account_update_reconciles_with_active_pms_order_evidence():
     asyncio.run(run())
 
 
+def test_account_update_hint_only_does_not_expand_virtual_position_to_exchange_aggregate():
+    async def run():
+        book = _account_book()
+        engine = RiskEngine(
+            position_book=book,
+            market_data=None,
+            exchange_client=None,
+            redis_client=None,
+            db=None,
+        )
+        engine.set_managed_accounts({"s1"})
+        engine.set_order_manager(SimpleNamespace(get_active_orders=lambda symbol=None, sub_account_id=None: []))
+
+        await engine.on_order_fill(SimpleNamespace(
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            filled_qty=0.1,
+            avg_fill_price=100.0,
+            leverage=10,
+            reduce_only=False,
+            origin="MANUAL",
+        ))
+
+        current = book.find_symbol_position("s1", "BTCUSDT")
+        assert current is not None
+        assert current.quantity == pytest.approx(0.1)
+        assert current.entry_price == pytest.approx(100.0)
+
+        await engine.on_account_update({
+            "positions": [{
+                "symbol": "BTCUSDT",
+                "position_amount": 1.0,
+                "entry_price": 120.0,
+            }]
+        })
+
+        current = book.find_symbol_position("s1", "BTCUSDT")
+        assert current is not None
+        assert current.quantity == pytest.approx(0.1)
+        assert current.entry_price == pytest.approx(100.0)
+        assert current.notional == pytest.approx(10.0)
+
+    asyncio.run(run())
+
+
 def test_account_update_proportionally_adls_virtual_positions_when_exchange_backing_drops():
     async def run():
         book = _multi_account_book()

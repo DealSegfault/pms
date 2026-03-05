@@ -14,6 +14,8 @@ import logging
 import time
 from typing import Any, Optional, Set
 
+from .state import derive_legacy_routing_prefix, derive_routing_prefix
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,7 +52,8 @@ async def backfill_from_exchange(
     # Build prefix set for quick ownership checks
     prefix_to_sub = {}
     for sub_id in managed_accounts:
-        prefix_to_sub[sub_id[:8]] = sub_id
+        prefix_to_sub[derive_routing_prefix(sub_id)] = sub_id
+        prefix_to_sub[derive_legacy_routing_prefix(sub_id)] = sub_id
 
     # Determine which symbols to check
     if not symbols:

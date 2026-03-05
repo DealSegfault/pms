@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from .common import ts_ms, ts_s_to_ms
+from .common import normalize_symbol, ts_s_to_ms
 
 
 # ══════════════════════════════════════════════════════════════
@@ -24,7 +24,7 @@ class ChaseRedisState:
     """Persisted to pms:chase:{chaseId} and pms:active_chase:{subAccountId}."""
     chase_id: str = ""
     sub_account_id: str = ""
-    symbol: str = ""                    # ccxt format (e.g. STEEM/USDT:USDT)
+    symbol: str = ""                    # Binance-native (e.g. STEEMUSDT)
     side: str = ""                      # BUY / SELL
     quantity: float = 0.0
     leverage: int = 1
@@ -46,7 +46,7 @@ class ChaseRedisState:
         d = {
             "chaseId": self.chase_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "quantity": self.quantity,
             "leverage": self.leverage,
@@ -134,7 +134,7 @@ class ScalperRedisState:
         return {
             "scalperId": self.scalper_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "startSide": self.start_side,
             "childCount": self.child_count,
             "status": self.status,
@@ -185,7 +185,7 @@ class TWAPRedisState:
         d = {
             "twapId": self.twap_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "totalQuantity": self.total_quantity,
             "numLots": self.num_lots,
@@ -253,7 +253,7 @@ class TrailStopRedisState:
         return {
             "trailStopId": self.trail_stop_id,
             "subAccountId": self.sub_account_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "quantity": self.quantity,
             "callbackPct": self.callback_pct,
@@ -291,7 +291,7 @@ class PositionSnapshot:
     def to_dict(self) -> dict:
         return {
             "id": self.position_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "entryPrice": self.entry_price,
             "quantity": self.quantity,
@@ -302,7 +302,7 @@ class PositionSnapshot:
             "unrealizedPnl": self.unrealized_pnl,
             "pnlPercent": self.pnl_percent,
             "markPrice": self.mark_price,
-            "openedAt": self.opened_at,
+            "openedAt": ts_s_to_ms(self.opened_at or 0.0),
         }
 
 
@@ -327,7 +327,7 @@ class OpenOrderSnapshot:
         return {
             "clientOrderId": self.client_order_id,
             "exchangeOrderId": self.exchange_order_id,
-            "symbol": self.symbol,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
             "side": self.side,
             "orderType": self.order_type,
             "price": self.price,
@@ -337,7 +337,7 @@ class OpenOrderSnapshot:
             "leverage": self.leverage,
             "reduceOnly": self.reduce_only,
             "state": self.state,
-            "createdAt": self.created_at,
+            "createdAt": ts_s_to_ms(self.created_at or 0.0),
         }
 
 

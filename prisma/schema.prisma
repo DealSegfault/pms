@@ -27,6 +27,7 @@ model User {
 model SubAccount {
   id              String   @id @default(uuid())
   userId          String?  @map("user_id")
+  routingPrefix   String?  @unique @map("routing_prefix")
   name            String
   type            String   @default("USER") // USER, BOT
   initialBalance  Float    @map("initial_balance")
@@ -44,6 +45,11 @@ model SubAccount {
   trades       TradeExecution[]
   balanceLogs  BalanceLog[]
   pendingOrders PendingOrder[]
+  orderLifecycles OrderLifecycle[]
+  fillFacts       FillFact[]
+  strategySessions StrategySession[]
+  tcaRollups      SubAccountTcaRollup[]
+  strategyRollups StrategyTcaRollup[]
 
   @@index([userId, status])
   @@index([status])
@@ -164,6 +170,226 @@ model PendingOrder {
   @@index([status, type])
   @@index([subAccountId, status])
   @@map("pending_orders")
+}
+
+model OrderLifecycle {
+  id                  String   @id @default(uuid())
+  executionScope      String   @default("SUB_ACCOUNT") @map("execution_scope")
+  subAccountId        String?  @map("sub_account_id")
+  venue               String   @default("BINANCE_FUTURES")
+  venueAccountKey     String   @default("binance:futures:main") @map("venue_account_key")
+  ownershipConfidence String   @default("HARD") @map("ownership_confidence")
+  originPath          String   @default("PYTHON_CMD") @map("origin_path")
+  strategyType        String?  @map("strategy_type")
+  strategySessionId   String?  @map("strategy_session_id")
+  parentId            String?  @map("parent_id")
+  clientOrderId       String?  @map("client_order_id")
+  exchangeOrderId     String?  @map("exchange_order_id")
+  symbol              String?
+  side                String?
+  orderType           String?  @map("order_type")
+  reduceOnly          Boolean  @default(false) @map("reduce_only")
+  requestedQty        Float?   @map("requested_qty")
+  limitPrice          Float?   @map("limit_price")
+  decisionBid         Float?   @map("decision_bid")
+  decisionAsk         Float?   @map("decision_ask")
+  decisionMid         Float?   @map("decision_mid")
+  decisionSpreadBps   Float?   @map("decision_spread_bps")
+  intentTs            DateTime? @map("intent_ts")
+  ackTs               DateTime? @map("ack_ts")
+  firstFillTs         DateTime? @map("first_fill_ts")
+  doneTs              DateTime? @map("done_ts")
+  finalStatus         String?  @map("final_status")
+  filledQty           Float    @default(0) @map("filled_qty")
+  avgFillPrice        Float?   @map("avg_fill_price")
+  repriceCount        Int      @default(0) @map("reprice_count")
+  reconciliationStatus String  @default("PENDING") @map("reconciliation_status")
+  reconciliationReason String? @map("reconciliation_reason")
+  lastReconciledAt    DateTime? @map("last_reconciled_at")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  subAccount      SubAccount?      @relation(fields: [subAccountId], references: [id])
+  strategySession StrategySession? @relation(fields: [strategySessionId], references: [id])
+  events          OrderLifecycleEvent[]
+  fillFacts       FillFact[]
+
+  @@unique([venue, venueAccountKey, clientOrderId])
+  @@unique([venue, venueAccountKey, exchangeOrderId])
+  @@index([subAccountId, createdAt])
+  @@index([clientOrderId])
+  @@index([exchangeOrderId])
+  @@index([symbol, createdAt])
+  @@index([reconciliationStatus, updatedAt])
+  @@map("order_lifecycles")
+}
+
+model OrderLifecycleEvent {
+  id           String   @id @default(uuid())
+  lifecycleId  String   @map("lifecycle_id")
+  streamEventId String  @unique @map("stream_event_id")
+  eventType    String   @map("event_type")
+  sourceTs     DateTime? @map("source_ts")
+  ingestedTs   DateTime? @map("ingested_ts")
+  payloadJson  String   @map("payload_json")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  lifecycle OrderLifecycle @relation(fields: [lifecycleId], references: [id])
+
+  @@index([lifecycleId, createdAt])
+  @@index([eventType, sourceTs])
+  @@map("order_lifecycle_events")
+}
+
+model MarketQuote {
+  id        String   @id @default(uuid())
+  symbol    String
+  ts        DateTime
+  bid       Float
+  ask       Float
+  mid       Float
+  spreadBps Float?   @map("spread_bps")
+  source    String   @default("L1")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([symbol, ts])
+  @@index([symbol, ts])
+  @@map("market_quotes")
+}
+
+model FillFact {
+  id                  String   @id @default(uuid())
+  lifecycleId         String   @map("lifecycle_id")
+  subAccountId        String?  @map("sub_account_id")
+  sourceEventId       String?  @unique @map("source_event_id")
+  executionScope      String   @default("SUB_ACCOUNT") @map("execution_scope")
+  ownershipConfidence String   @default("HARD") @map("ownership_confidence")
+  symbol              String
+  side                String?
+  fillTs              DateTime @map("fill_ts")
+  fillQty             Float    @map("fill_qty")
+  fillPrice           Float    @map("fill_price")
+  fillBid             Float?   @map("fill_bid")
+  fillAsk             Float?   @map("fill_ask")
+  fillMid             Float?   @map("fill_mid")
+  fillSpreadBps       Float?   @map("fill_spread_bps")
+  sampledAt           DateTime? @map("sampled_at")
+  fee                 Float    @default(0)
+  makerTaker          String?  @map("maker_taker")
+  originType          String   @default("MANUAL") @map("origin_type")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  lifecycle OrderLifecycle @relation(fields: [lifecycleId], references: [id])
+  subAccount SubAccount?    @relation(fields: [subAccountId], references: [id])
+  markouts   FillMarkout[]
+
+  @@index([subAccountId, fillTs])
+  @@index([symbol, fillTs])
+  @@index([lifecycleId, fillTs])
+  @@map("fill_facts")
+}
+
+model FillMarkout {
+  id         String   @id @default(uuid())
+  fillFactId String   @map("fill_fact_id")
+  horizonMs  Int      @map("horizon_ms")
+  measuredTs DateTime? @map("measured_ts")
+  midPrice   Float?   @map("mid_price")
+  markPrice  Float?   @map("mark_price")
+  markoutBps Float?   @map("markout_bps")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  fillFact FillFact @relation(fields: [fillFactId], references: [id])
+
+  @@unique([fillFactId, horizonMs])
+  @@map("fill_markouts")
+}
+
+model StrategySession {
+  id           String   @id
+  subAccountId String?  @map("sub_account_id")
+  origin       String   @default("MANUAL")
+  strategyType String?  @map("strategy_type")
+  symbol       String?
+  side         String?
+  startedAt    DateTime? @map("started_at")
+  endedAt      DateTime? @map("ended_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  subAccount SubAccount?      @relation(fields: [subAccountId], references: [id])
+  lifecycles OrderLifecycle[]
+  rollups    StrategyTcaRollup[]
+
+  @@index([subAccountId, startedAt])
+  @@map("strategy_sessions")
+}
+
+model SubAccountTcaRollup {
+  id                  String   @id @default(uuid())
+  subAccountId        String   @map("sub_account_id")
+  executionScope      String   @default("SUB_ACCOUNT") @map("execution_scope")
+  ownershipConfidence String   @default("HARD") @map("ownership_confidence")
+  orderCount          Int      @default(0) @map("order_count")
+  terminalOrderCount  Int      @default(0) @map("terminal_order_count")
+  fillCount           Int      @default(0) @map("fill_count")
+  cancelCount         Int      @default(0) @map("cancel_count")
+  rejectCount         Int      @default(0) @map("reject_count")
+  totalRequestedQty   Float    @default(0) @map("total_requested_qty")
+  totalFilledQty      Float    @default(0) @map("total_filled_qty")
+  totalFillNotional   Float    @default(0) @map("total_fill_notional")
+  fillRatio           Float?   @map("fill_ratio")
+  cancelToFillRatio   Float?   @map("cancel_to_fill_ratio")
+  avgArrivalSlippageBps Float? @map("avg_arrival_slippage_bps")
+  avgAckLatencyMs     Float?   @map("avg_ack_latency_ms")
+  avgWorkingTimeMs    Float?   @map("avg_working_time_ms")
+  avgMarkout1sBps     Float?   @map("avg_markout_1s_bps")
+  avgMarkout5sBps     Float?   @map("avg_markout_5s_bps")
+  avgMarkout30sBps    Float?   @map("avg_markout_30s_bps")
+  totalRepriceCount   Int      @default(0) @map("total_reprice_count")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  subAccount SubAccount @relation(fields: [subAccountId], references: [id])
+
+  @@unique([subAccountId, executionScope, ownershipConfidence])
+  @@index([executionScope, ownershipConfidence])
+  @@map("sub_account_tca_rollups")
+}
+
+model StrategyTcaRollup {
+  id                  String   @id @default(uuid())
+  strategySessionId   String   @map("strategy_session_id")
+  subAccountId        String?  @map("sub_account_id")
+  strategyType        String?  @map("strategy_type")
+  executionScope      String   @default("SUB_ACCOUNT") @map("execution_scope")
+  ownershipConfidence String   @default("HARD") @map("ownership_confidence")
+  orderCount          Int      @default(0) @map("order_count")
+  terminalOrderCount  Int      @default(0) @map("terminal_order_count")
+  fillCount           Int      @default(0) @map("fill_count")
+  cancelCount         Int      @default(0) @map("cancel_count")
+  rejectCount         Int      @default(0) @map("reject_count")
+  totalRequestedQty   Float    @default(0) @map("total_requested_qty")
+  totalFilledQty      Float    @default(0) @map("total_filled_qty")
+  totalFillNotional   Float    @default(0) @map("total_fill_notional")
+  fillRatio           Float?   @map("fill_ratio")
+  cancelToFillRatio   Float?   @map("cancel_to_fill_ratio")
+  avgArrivalSlippageBps Float? @map("avg_arrival_slippage_bps")
+  avgAckLatencyMs     Float?   @map("avg_ack_latency_ms")
+  avgWorkingTimeMs    Float?   @map("avg_working_time_ms")
+  avgMarkout1sBps     Float?   @map("avg_markout_1s_bps")
+  avgMarkout5sBps     Float?   @map("avg_markout_5s_bps")
+  avgMarkout30sBps    Float?   @map("avg_markout_30s_bps")
+  totalRepriceCount   Int      @default(0) @map("total_reprice_count")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  strategySession StrategySession @relation(fields: [strategySessionId], references: [id])
+  subAccount      SubAccount?     @relation(fields: [subAccountId], references: [id])
+
+  @@unique([strategySessionId, executionScope, ownershipConfidence])
+  @@index([executionScope, ownershipConfidence])
+  @@map("strategy_tca_rollups")
 }
 
 model BotConfig {

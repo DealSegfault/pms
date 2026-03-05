@@ -3,6 +3,7 @@ import { renderPositionsPage, cleanup as cleanupPositions } from './pages/positi
 import { renderHistoryPage } from './pages/history.js';
 import { renderAdminPage } from './pages/admin.js';
 import { renderAccountPage } from './pages/account.js';
+import { renderTcaPage, cleanup as cleanupTca } from './pages/tca.js';
 import { renderIndexPage, cleanup as cleanupIndex } from './pages/index-trading.js';
 import {
     state,
@@ -96,6 +97,7 @@ function cleanupActivePages() {
     cleanupTrading();
     cleanupPositions();
     cleanupIndex();
+    cleanupTca();
 }
 
 function showAuthPage(reconnecting = false) {
@@ -131,6 +133,7 @@ const routes = {
     '/positions': renderPositionsPage,
     '/index': renderIndexPage,
     '/history': renderHistoryPage,
+    '/tca': renderTcaPage,
     '/admin': renderAdminPage,
     '/account': renderAccountPage,
 };

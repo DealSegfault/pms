@@ -26,8 +26,8 @@ If the task changes DTOs or event/state shapes, also use `cross-system-dto-evalu
 - `server/routes/proxy.js`
 - `server/routes/history.js`
 - `trading_engine_python/tests/test_cross_system_integrity.py`
-- `references/subaccount-invariants.md`
-- `references/tca-module-design.md`
+- `../../../refactor/subaccount-invariants.md`
+- `../../../refactor/tca-module-design.md`
 
 ## Workflow
 
@@ -84,3 +84,4 @@ If the task changes DTOs or event/state shapes, also use `cross-system-dto-evalu
 - Confirm analytics tables can separate virtual sub-account execution from raw main-account activity.
 - Run `trading_engine_python/tests/test_cross_system_integrity.py` if DTOs or event shapes changed.
 
+Canonical planning docs for this skill now live in `refactor/`.

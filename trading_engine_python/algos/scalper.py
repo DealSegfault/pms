@@ -287,6 +287,35 @@ def _is_active_pin_allowed(
 _to_exchange_side = normalize_side
 
 
+def _parse_optional_bool(value: object, default: bool) -> bool:
+    """Parse permissive bool payloads from JS and Redis snapshots."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in ("true", "1", "yes", "on"):
+        return True
+    if text in ("false", "0", "no", "off", ""):
+        return False
+    return default
+
+
+def _resolve_allow_loss(payload: dict, neutral_mode: bool) -> bool:
+    """
+    Resolve allowLoss with mode-aware defaults.
+
+    - Explicit payload value always wins.
+    - Omitted allowLoss defaults to True for regular LONG/SHORT scalper.
+    - Omitted allowLoss defaults to False for neutral mode.
+    """
+    if "allowLoss" in payload:
+        return _parse_optional_bool(payload.get("allowLoss"), default=False)
+    return False if neutral_mode else True
+
+
 # ── Scalper Engine ─────────────────────────────────────────────
 
 
@@ -324,6 +353,7 @@ class ScalperEngine:
         long_size_usd = max(0, float(params.get("longSizeUsd", params.get("quantity", 0))))
         short_size_usd = max(0, float(params.get("shortSizeUsd", long_size_usd)))
         neutral_mode = bool(params.get("neutralMode", False))
+        allow_loss = _resolve_allow_loss(params, neutral_mode)
 
         # Subscribe to market data FIRST — this starts the depth stream for
         # the symbol so L1 data becomes available. Without this, get_l1()
@@ -387,7 +417,7 @@ class ScalperEngine:
             min_fill_spread_pct=max(0, min(10, float(params.get("minFillSpreadPct", 0)))),
             fill_decay_half_life_ms=max(1000, float(params.get("fillDecayHalfLifeMs", 30000))),
             min_refill_delay_ms=max(0, float(params.get("minRefillDelayMs", 0))),
-            allow_loss=params.get("allowLoss", True) not in (False, "false"),
+            allow_loss=allow_loss,
             max_loss_per_close_bps=max(0, int(params.get("maxLossPerCloseBps", 0))),
             max_fills_per_minute=max(0, int(params.get("maxFillsPerMinute", 0))),
             pnl_feedback_mode=params.get("pnlFeedbackMode", "off"),
@@ -1331,6 +1361,8 @@ class ScalperEngine:
                 short_size_usd = float(data.get("shortSizeUsd", 0))
                 symbol = data.get("symbol", "")
                 leverage = int(data.get("leverage", 1))
+                neutral_mode = bool(data.get("neutralMode", False))
+                allow_loss = _resolve_allow_loss(data, neutral_mode)
 
                 state = ScalperState(
                     id=scalper_id,
@@ -1344,11 +1376,11 @@ class ScalperEngine:
                     short_offset_pct=short_offset,
                     long_size_usd=long_size_usd,
                     short_size_usd=short_size_usd,
-                    neutral_mode=bool(data.get("neutralMode", False)),
+                    neutral_mode=neutral_mode,
                     min_fill_spread_pct=float(data.get("minFillSpreadPct", 0)),
                     fill_decay_half_life_ms=float(data.get("fillDecayHalfLifeMs", 30000)),
                     min_refill_delay_ms=float(data.get("minRefillDelayMs", 0)),
-                    allow_loss=data.get("allowLoss", True) not in (False, "false"),
+                    allow_loss=allow_loss,
                     fill_count=int(data.get("totalFillCount", 0)),
                     reduce_only_armed=bool(data.get("reduceOnlyArmed", False)),
                     pin_long_to_entry=bool(data.get("pinLongToEntry", False)),

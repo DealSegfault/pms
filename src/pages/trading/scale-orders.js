@@ -425,7 +425,6 @@ export function updateTwapPreview() {
     const el = document.getElementById('twap-preview');
     if (!el) return;
     const lotsSlider = document.getElementById('twap-lots');
-    const lotsValEl = document.getElementById('twap-lots-val');
     let lots = parseInt(lotsSlider?.value) || 10;
     const durMin = parseInt(document.getElementById('twap-duration')?.value) || 30;
     const sizeUsd = parseFloat(document.getElementById('trade-size')?.value) || 0;
@@ -438,17 +437,8 @@ export function updateTwapPreview() {
     }
 
     const minNotional = S.symbolInfo?.minNotional || 6;
-
-    // Auto-clamp slider max so per-lot always >= minNotional
-    const maxLots = Math.max(2, Math.floor(sizeUsd / minNotional));
-    if (lotsSlider) {
-        lotsSlider.max = Math.min(50, maxLots);
-        if (lots > maxLots) {
-            lots = maxLots;
-            lotsSlider.value = lots;
-            if (lotsValEl) lotsValEl.textContent = lots;
-        }
-    }
+    const maxLots = Math.floor(sizeUsd / minNotional);
+    if (lotsSlider) lotsSlider.max = '50';
 
     const perLot = sizeUsd / lots;
     const intervalSec = (durMin * 60) / lots;
@@ -456,7 +446,7 @@ export function updateTwapPreview() {
     const endStr = end.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
     if (perLot < minNotional) {
-        el.innerHTML = `<span style="color:var(--red);">⚠️ $${perLot.toFixed(2)}/lot is below $${minNotional} min. Max: ${maxLots} lots</span>`;
+        el.innerHTML = `<span style="color:var(--red);">⚠️ Requested ${lots} lots gives $${perLot.toFixed(2)}/lot. Max at this size: ${Math.max(0, maxLots)} lots (min $${minNotional}/lot).</span>`;
         if (submitBtn && S.orderType === 'TWAP') { submitBtn.disabled = true; submitBtn.style.opacity = '0.4'; }
         return;
     }

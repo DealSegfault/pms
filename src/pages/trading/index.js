@@ -278,6 +278,19 @@ function attachEventListeners() {
         if (el) el.textContent = v > 0 ? `+${v}` : `${v}`;
         import('./scalper.js').then(m => m.updateScalperPreview());
     });
+
+    function _syncScalperAllowLoss(mode) {
+        const allowLossInput = document.getElementById('scalper-allow-loss');
+        const hint = document.getElementById('scalper-allow-loss-hint');
+        if (!allowLossInput) return;
+        allowLossInput.checked = mode !== 'NEUTRAL';
+        if (hint) {
+            hint.textContent = mode === 'NEUTRAL'
+                ? 'Neutral mode default: OFF. Enable manually if you want loss-taking closes.'
+                : 'Regular mode default: ON. Disable to block loss-taking close fills.';
+        }
+    }
+
     // ── Neutral mode toggle (drives the global LONG/NEUTRAL/SHORT buttons) ──
     function _setScalperMode(mode) {
         const btnL = document.getElementById('btn-long');
@@ -303,6 +316,7 @@ function attachEventListeners() {
         if (settings) settings.style.display = mode === 'NEUTRAL' ? 'block' : 'none';
         if (ctrl) ctrl.dataset.scalperMode = mode;
         S.set('selectedSide', mode);
+        _syncScalperAllowLoss(mode);
         import('./scalper.js').then(m => m.updateScalperPreview());
     }
     // Default state — only apply scalper mode when SCALPER is the active order type

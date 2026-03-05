@@ -20,6 +20,7 @@ import { setRedisClient } from './redis-proxy.js';
 import { flexAuthMiddleware, adminMiddleware } from './auth.js';
 import prisma from './db/prisma.js';
 import { disconnectPrisma } from './db/prisma.js';
+import { ensureSubAccountRoutingPrefixes } from './db/subaccount-routing.js';
 import { errorHandler } from './http/error-model.js';
 import { startPythonEngine, stopPythonEngine } from './python-engine.js';
 
@@ -177,6 +178,13 @@ server.on('error', (err) => {
 
 async function start() {
     try {
+        const routingPrefixMigration = await ensureSubAccountRoutingPrefixes(prisma);
+        if (routingPrefixMigration.updatedCount > 0) {
+            console.log(
+                `[Server] Backfilled ${routingPrefixMigration.updatedCount} sub-account routing prefix(es)`,
+            );
+        }
+
         // Connect Redis
         const redisReady = await initRedis();
 
