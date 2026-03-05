@@ -8,6 +8,7 @@ export const THEMES = [
     { id: 'default', label: 'Default', emoji: '🌙', color: '#6366f1', bg: ['#0a0e17', '#1a2035'], green: '#22c55e', red: '#ef4444' },
     { id: 'girly', label: 'Girly', emoji: '🩷', color: '#ec4899', bg: ['#1a0f1e', '#2d1a33'], green: '#34d399', red: '#fb7185' },
     { id: 'citadel', label: 'Citadel', emoji: '⚡', color: '#00d4ff', bg: ['#06090f', '#0e1420'], green: '#00e676', red: '#ff1744' },
+    { id: 'gruvbox', label: 'Gruvbox', emoji: '🦉', color: '#fe8019', bg: ['#1d2021', '#282828'], green: '#b8bb26', red: '#fb4934' },
 ];
 
 export function getTheme() {

@@ -24,8 +24,9 @@ export function updateScalperPreview() {
     const weights = _computeSkewWeights(count, skew);
     const longLayers = _computePreviewOffsets(longOff, count);
     const shortLayers = _computePreviewOffsets(shortOff, count);
+    const effMin = _effectiveMinNotional();
     const minNotional = _minLayerNotional(perSideUsd, count, skew, price);
-    const tooSmall = minNotional + 0.001 < MIN_NOTIONAL && price > 0 && perSideUsd > 0;
+    const tooSmall = minNotional + 0.001 < effMin && price > 0 && perSideUsd > 0;
 
     const scalperMode = document.getElementById('scalper-controls')?.dataset?.scalperMode || 'LONG';
     const maxW = Math.max(...weights);
@@ -71,8 +72,8 @@ export function updateScalperPreview() {
 
     if (tooSmall) {
         const minWeight = Math.min(...weights);
-        const minSize = (MIN_NOTIONAL / minWeight).toFixed(0);
-        const skewNote = skew !== 0 ? ' (adjusted for skew)' : ` (${count} layers × $${MIN_NOTIONAL})`;
+        const minSize = (effMin / minWeight).toFixed(0);
+        const skewNote = skew !== 0 ? ' (adjusted for skew)' : ` (${count} layers × $${effMin})`;
         html += `<span style="color:#f43f5e; font-size:10px;">⚠ Min size: $${minSize}/side${skewNote}</span>`;
     }
     if (scalperMode === 'NEUTRAL') {
@@ -95,13 +96,21 @@ function _computeSkewWeights(count, skew) {
     const s = skew / 100;
     const w = Array.from({ length: count }, (_, i) => {
         const t = i / (count - 1);
-        return Math.pow(8, s * (2 * t - 1));
+        return Math.pow(3, s * (2 * t - 1));
     });
     const total = w.reduce((a, b) => a + b, 0);
     return w.map(x => x / total);
 }
 
-const MIN_NOTIONAL = 5; // USD, Binance limit
+const MIN_NOTIONAL = 6; // USD, per-layer floor
+const MIN_NOTIONAL_MAJOR = 20; // USD, per-layer floor for majors
+const MAJORS = new Set(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE']);
+
+/** Return the per-layer minimum for the currently selected symbol. */
+function _effectiveMinNotional() {
+    const base = (S.selectedSymbol || '').split('/')[0].toUpperCase();
+    return MAJORS.has(base) ? MIN_NOTIONAL_MAJOR : MIN_NOTIONAL;
+}
 
 /** Returns the smallest layer notional in USD for the opening leg. */
 function _minLayerNotional(perSideUsd, count, skew, price) {
@@ -135,13 +144,14 @@ export async function submitScalper() {
 
     const perSideUsd = totalSizeUsd;
 
-    // Client-side guard: block if any layer would be < $5
+    // Client-side guard: block if any layer would be below min notional
+    const effMin = _effectiveMinNotional();
     const minLayerNotional = _minLayerNotional(perSideUsd, count, skew, S.currentPrice || 0);
-    if (S.currentPrice > 0 && minLayerNotional + 0.001 < MIN_NOTIONAL) {
+    if (S.currentPrice > 0 && minLayerNotional + 0.001 < effMin) {
         const weights = _computeSkewWeights(count, skew);
         const minWeight = Math.min(...weights);
-        const minNeeded = (MIN_NOTIONAL / minWeight).toFixed(0);
-        return showToast(`Min size is $${minNeeded} ($${MIN_NOTIONAL} min per layer, adjusted for skew)`, 'error');
+        const minNeeded = (effMin / minWeight).toFixed(0);
+        return showToast(`Min size is $${minNeeded} ($${effMin} min per layer, adjusted for skew)`, 'error');
     }
 
     const scalperMode = document.getElementById('scalper-controls')?.dataset?.scalperMode || 'LONG';

@@ -2,7 +2,7 @@
 import { state, api, showToast, formatPrice } from '../../core/index.js';
 import { cuteConfirm } from '../../lib/cute-confirm.js';
 import * as S from './state.js';
-import { showTradeError, restoreSubmitButton } from './order-form.js';
+import { showTradeError, restoreSubmitButton, _sizeFloor } from './order-form.js';
 import { scheduleTradingRefresh } from './refresh-scheduler.js';
 import { beginOrderLatency, markOrderSent, markOrderAck, markOrderPaint } from './perf-metrics.js';
 
@@ -328,7 +328,7 @@ export async function submitScaleOrder() {
     }
 
     const weights = generateSkewWeights(S.scaleOrderCount, S.scaleSkew);
-    const minNotional = S.symbolInfo?.minNotional || 5;
+    const minNotional = Math.max(S.symbolInfo?.minNotional || 0, _sizeFloor());
 
     const allOrders = prices.map((price, i) => ({
         price,
@@ -436,7 +436,7 @@ export function updateTwapPreview() {
         return;
     }
 
-    const minNotional = S.symbolInfo?.minNotional || 6;
+    const minNotional = Math.max(S.symbolInfo?.minNotional || 0, _sizeFloor());
     const maxLots = Math.floor(sizeUsd / minNotional);
     if (lotsSlider) lotsSlider.max = '50';
 

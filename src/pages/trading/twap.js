@@ -2,7 +2,7 @@
 import { state, api, showToast, formatPrice } from '../../core/index.js';
 import { cuteConfirm } from '../../lib/cute-confirm.js';
 import * as S from './state.js';
-import { showTradeError, setSizePercent, restoreSubmitButton } from './order-form.js';
+import { showTradeError, setSizePercent, restoreSubmitButton, _sizeFloor } from './order-form.js';
 import { scheduleTradingRefresh } from './refresh-scheduler.js';
 import { beginOrderLatency, markOrderSent, markOrderAck, markOrderPaint } from './perf-metrics.js';
 
@@ -30,7 +30,7 @@ export async function submitTwapOrder() {
     const priceLimitRaw = parseFloat(document.getElementById('twap-price-limit')?.value);
     const priceLimit = Number.isFinite(priceLimitRaw) && priceLimitRaw > 0 ? priceLimitRaw : null;
 
-    const minNotional = S.symbolInfo?.minNotional || 6;
+    const minNotional = Math.max(S.symbolInfo?.minNotional || 0, _sizeFloor());
     const perLot = totalSize / lots;
     if (perLot < minNotional) {
         const maxLots = Math.floor(totalSize / minNotional);

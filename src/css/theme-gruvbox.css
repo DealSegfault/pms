@@ -1,0 +1,921 @@
+/* ═══════════════════════════════════════════════════════════════
+   🦉 GRUVBOX THEME — Eye-Friendly Warmth
+   Retro groove · Low strain · Matte comfort · morhetz/gruvbox
+   Designed for extended sessions & sensitive eyes
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── Color palette ────────────────────────────────────────────── */
+[data-theme="gruvbox"] {
+    --bg-primary: #1d2021;
+    --bg-secondary: #282828;
+    --bg-card: rgba(50, 48, 47, 0.88);
+    --bg-card-hover: rgba(60, 56, 54, 0.92);
+    --bg-input: #1d2021;
+    --bg-glass: rgba(40, 40, 40, 0.92);
+    --surface-2: rgba(60, 56, 54, 0.65);
+
+    --text: #ebdbb2;
+    --text-primary: #fbf1c7;
+    --text-secondary: #bdae93;
+    --text-muted: #7c6f64;
+
+    --accent: #fe8019;
+    --accent-hover: #f9a825;
+    --accent-glow: rgba(254, 128, 25, 0.2);
+    --accent-gold: #fabd2f;
+    --accent-gold-glow: rgba(250, 189, 47, 0.18);
+
+    --green: #b8bb26;
+    --green-bg: rgba(184, 187, 38, 0.08);
+    --green-glow: rgba(184, 187, 38, 0.18);
+
+    --red: #fb4934;
+    --red-bg: rgba(251, 73, 52, 0.08);
+    --red-glow: rgba(251, 73, 52, 0.18);
+
+    --yellow: #fabd2f;
+    --yellow-bg: rgba(250, 189, 47, 0.08);
+
+    --border: rgba(235, 219, 178, 0.08);
+    --border-active: rgba(254, 128, 25, 0.35);
+
+    --radius: 8px;
+    --radius-sm: 5px;
+    --radius-lg: 12px;
+
+    --shadow: 0 2px 16px rgba(0, 0, 0, 0.5);
+    --shadow-lg: 0 6px 32px rgba(0, 0, 0, 0.65);
+
+    --gradient-accent: linear-gradient(135deg, #fe8019, #fabd2f);
+    --gradient-card: linear-gradient(180deg, rgba(50, 48, 47, 0.9), rgba(40, 40, 40, 0.95));
+    --gradient-nav: linear-gradient(180deg, rgba(29, 32, 33, 0.97), rgba(29, 32, 33, 0.99));
+    --theme-color: #1d2021;
+
+    --font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+}
+
+/* ── Body: warm matte background ─────────────────────────────── */
+[data-theme="gruvbox"] body {
+    background:
+        radial-gradient(ellipse at 30% 0%, rgba(254, 128, 25, 0.02) 0%, transparent 50%),
+        radial-gradient(ellipse at 70% 100%, rgba(184, 187, 38, 0.015) 0%, transparent 50%),
+        #1d2021;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   DATA TYPOGRAPHY
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .stat-value,
+[data-theme="gruvbox"] .pnl-value,
+[data-theme="gruvbox"] .price-value,
+[data-theme="gruvbox"] .size-value,
+[data-theme="gruvbox"] .ob-row span,
+[data-theme="gruvbox"] .pos-col-val,
+[data-theme="gruvbox"] .cpr-pnl {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.2px;
+}
+
+[data-theme="gruvbox"] .stat-label,
+[data-theme="gruvbox"] .pos-col-label,
+[data-theme="gruvbox"] .panel-header,
+[data-theme="gruvbox"] .bot-settings-group-title {
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-size: 0.7em;
+    font-weight: 700;
+    font-family: var(--font);
+}
+
+/* PnL coloring — no harsh glows, just tinted text */
+[data-theme="gruvbox"] .pnl-positive,
+[data-theme="gruvbox"] .profit {
+    color: #b8bb26;
+}
+
+[data-theme="gruvbox"] .pnl-negative,
+[data-theme="gruvbox"] .loss {
+    color: #fb4934;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   CARDS — Warm matte surfaces
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .card,
+[data-theme="gruvbox"] .glass-card {
+    background: var(--gradient-card);
+    border: 1px solid rgba(235, 219, 178, 0.06);
+    border-radius: var(--radius);
+    box-shadow:
+        0 0 0 1px rgba(0, 0, 0, 0.25),
+        0 2px 10px rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+}
+
+[data-theme="gruvbox"] .card:hover,
+[data-theme="gruvbox"] .glass-card:hover {
+    border-color: rgba(254, 128, 25, 0.15);
+    box-shadow:
+        0 0 0 1px rgba(254, 128, 25, 0.04),
+        0 4px 16px rgba(0, 0, 0, 0.5);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   BOTTOM NAV — Warm control bar
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] #bottom-nav {
+    background: var(--gradient-nav);
+    border-top: 1px solid rgba(235, 219, 178, 0.08);
+    box-shadow:
+        0 -1px 0 rgba(0, 0, 0, 0.4),
+        0 -4px 16px rgba(0, 0, 0, 0.3);
+}
+
+[data-theme="gruvbox"] .nav-item {
+    position: relative;
+    transition: color 0.15s ease-out;
+}
+
+[data-theme="gruvbox"] .nav-item.active {
+    color: #fe8019;
+}
+
+[data-theme="gruvbox"] .nav-item.active svg {
+    filter: drop-shadow(0 0 3px rgba(254, 128, 25, 0.35));
+}
+
+[data-theme="gruvbox"] .nav-item.active::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 24px;
+    height: 2px;
+    background: #fe8019;
+    border-radius: 1px;
+    box-shadow: 0 0 4px rgba(254, 128, 25, 0.35);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SECTION HEADERS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .section-title {
+    background: linear-gradient(90deg, #fe8019, #fabd2f);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    font-weight: 800;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    font-size: 0.85em;
+}
+
+[data-theme="gruvbox"] .card-title {
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    color: #ebdbb2;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   BUTTONS — Warm, matte, no harsh glow
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .btn-primary {
+    background: linear-gradient(180deg, #d65d0e, #af3a03);
+    box-shadow: 0 1px 6px rgba(214, 93, 14, 0.2);
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(254, 128, 25, 0.2);
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    font-size: 0.82em;
+    color: #fbf1c7;
+    transition: all 0.12s ease-out;
+}
+
+[data-theme="gruvbox"] .btn-primary:hover {
+    background: linear-gradient(180deg, #fe8019, #d65d0e);
+    box-shadow: 0 2px 10px rgba(254, 128, 25, 0.25);
+    transform: none;
+}
+
+[data-theme="gruvbox"] .btn-primary:active {
+    transform: scale(0.98);
+    box-shadow: 0 0 4px rgba(254, 128, 25, 0.15);
+}
+
+[data-theme="gruvbox"] .btn-outline {
+    border-color: rgba(254, 128, 25, 0.2);
+    color: #fe8019;
+    border-radius: var(--radius-sm);
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    transition: all 0.12s ease-out;
+}
+
+[data-theme="gruvbox"] .btn-outline:hover {
+    border-color: rgba(254, 128, 25, 0.4);
+    background: rgba(254, 128, 25, 0.05);
+    color: #fabd2f;
+}
+
+/* ── Trade side buttons ───────────────────────────────────────── */
+[data-theme="gruvbox"] .btn-long,
+[data-theme="gruvbox"] .side-toggle button.active-long,
+[data-theme="gruvbox"] .side-toggle-mini button.active-long,
+[data-theme="gruvbox"] .btn-submit-long {
+    background: linear-gradient(180deg, #98971a, #79740e);
+    box-shadow: 0 1px 6px rgba(184, 187, 38, 0.15);
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(184, 187, 38, 0.15);
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    font-size: 0.82em;
+    color: #fbf1c7;
+}
+
+[data-theme="gruvbox"] .btn-short,
+[data-theme="gruvbox"] .side-toggle button.active-short,
+[data-theme="gruvbox"] .side-toggle-mini button.active-short,
+[data-theme="gruvbox"] .btn-submit-short {
+    background: linear-gradient(180deg, #cc241d, #9d0006);
+    box-shadow: 0 1px 6px rgba(251, 73, 52, 0.15);
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(251, 73, 52, 0.15);
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    font-size: 0.82em;
+    color: #fbf1c7;
+}
+
+[data-theme="gruvbox"] .btn-submit {
+    border-radius: var(--radius-sm);
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    font-size: 0.82em;
+    transition: all 0.12s ease-out;
+}
+
+[data-theme="gruvbox"] .btn-submit-long:hover {
+    box-shadow: 0 0 12px rgba(184, 187, 38, 0.2);
+}
+
+[data-theme="gruvbox"] .btn-submit-short:hover {
+    box-shadow: 0 0 12px rgba(251, 73, 52, 0.2);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   BOT CONTROLS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .bot-toggle input:checked+.bot-toggle-slider {
+    background: linear-gradient(135deg, #d65d0e, #fe8019);
+    border-color: rgba(254, 128, 25, 0.4);
+    box-shadow: 0 0 8px rgba(254, 128, 25, 0.2);
+}
+
+[data-theme="gruvbox"] .leverage-slider {
+    background: linear-gradient(to right, #b8bb26, #fabd2f, #fb4934);
+}
+
+[data-theme="gruvbox"] .bot-settings-group {
+    border-color: rgba(235, 219, 178, 0.06);
+    border-radius: var(--radius);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TABS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .tab-bar button.active {
+    background: rgba(254, 128, 25, 0.08);
+    color: #fe8019;
+    border-radius: var(--radius-sm);
+    box-shadow: inset 0 -2px 0 #fe8019;
+    font-weight: 700;
+}
+
+[data-theme="gruvbox"] .trading-tab.active {
+    color: #fe8019 !important;
+    border-color: #fe8019 !important;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   BADGES — Warm data labels
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .badge {
+    border-radius: var(--radius-sm);
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    font-family: var(--font-mono);
+    font-size: 0.72em;
+    font-variant-numeric: tabular-nums;
+}
+
+[data-theme="gruvbox"] .badge-active {
+    background: rgba(184, 187, 38, 0.1);
+    color: #b8bb26;
+    border: 1px solid rgba(184, 187, 38, 0.18);
+}
+
+[data-theme="gruvbox"] .badge-long {
+    background: rgba(184, 187, 38, 0.08);
+    color: #b8bb26;
+    border: 1px solid rgba(184, 187, 38, 0.15);
+    border-radius: var(--radius-sm);
+}
+
+[data-theme="gruvbox"] .badge-short {
+    background: rgba(251, 73, 52, 0.08);
+    color: #fb4934;
+    border: 1px solid rgba(251, 73, 52, 0.15);
+    border-radius: var(--radius-sm);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   MODALS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .modal-overlay {
+    background: rgba(29, 32, 33, 0.85);
+    backdrop-filter: blur(3px);
+}
+
+[data-theme="gruvbox"] .modal-content {
+    background: linear-gradient(180deg, #32302f, #282828);
+    border: 1px solid rgba(254, 128, 25, 0.12);
+    border-top: 2px solid var(--accent);
+    border-radius: var(--radius);
+    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.7);
+}
+
+/* Gruvbox confirm modal overrides */
+[data-theme="gruvbox"] .cute-confirm-modal {
+    background: linear-gradient(180deg, #32302f, #282828) !important;
+    border: 1px solid rgba(254, 128, 25, 0.12) !important;
+    border-top: 2px solid var(--accent) !important;
+    border-radius: var(--radius) !important;
+}
+
+[data-theme="gruvbox"] .cute-confirm-title {
+    font-weight: 800 !important;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    font-size: 0.9em !important;
+    color: #fbf1c7 !important;
+    background: none !important;
+    -webkit-text-fill-color: unset !important;
+}
+
+[data-theme="gruvbox"] .cute-confirm-message {
+    color: var(--text-secondary) !important;
+    font-size: 0.85em;
+}
+
+[data-theme="gruvbox"] .cute-confirm-ok {
+    background: linear-gradient(180deg, #d65d0e, #af3a03) !important;
+    border-radius: var(--radius-sm) !important;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: #fbf1c7 !important;
+}
+
+[data-theme="gruvbox"] .cute-confirm-ok.cute-confirm-danger {
+    background: linear-gradient(180deg, #cc241d, #9d0006) !important;
+}
+
+[data-theme="gruvbox"] .cute-confirm-cancel {
+    border-radius: var(--radius-sm) !important;
+    border-color: rgba(254, 128, 25, 0.15) !important;
+    color: var(--text-secondary) !important;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   INPUTS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] input,
+[data-theme="gruvbox"] select {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    letter-spacing: 0.3px;
+    font-variant-numeric: tabular-nums;
+}
+
+[data-theme="gruvbox"] input:focus,
+[data-theme="gruvbox"] select:focus {
+    border-color: rgba(254, 128, 25, 0.4) !important;
+    box-shadow: 0 0 0 1px rgba(254, 128, 25, 0.08),
+        0 0 6px rgba(254, 128, 25, 0.05) !important;
+    outline: none;
+}
+
+[data-theme="gruvbox"] .search-input {
+    border-color: rgba(235, 219, 178, 0.08);
+    border-radius: var(--radius-sm);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TOAST — Warm alert bar
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .toast {
+    background: rgba(40, 40, 40, 0.96);
+    border: 1px solid rgba(235, 219, 178, 0.08);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-sm);
+    box-shadow: 0 2px 16px rgba(0, 0, 0, 0.6);
+    font-family: var(--font-mono);
+    font-size: 0.82em;
+    letter-spacing: 0.2px;
+    animation: gruvboxToastEnter 0.2s ease-out;
+}
+
+[data-theme="gruvbox"] .toast-success {
+    border-left-color: #b8bb26;
+}
+
+[data-theme="gruvbox"] .toast-error {
+    border-left-color: #fb4934;
+}
+
+[data-theme="gruvbox"] .toast-warning {
+    border-left-color: #fabd2f;
+}
+
+@keyframes gruvboxToastEnter {
+    0% {
+        transform: translateX(40px);
+        opacity: 0;
+    }
+
+    100% {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ORDER BOOK & MID PRICE
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .ob-mid {
+    color: #fabd2f;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+[data-theme="gruvbox"] .symbol-item:hover {
+    background: rgba(254, 128, 25, 0.04);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   PANEL HEADERS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .panel-header {
+    border-bottom: 1px solid rgba(235, 219, 178, 0.06);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   CHART
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .chart-panel {
+    border-color: rgba(235, 219, 178, 0.05);
+}
+
+[data-theme="gruvbox"] .chart-toolbar {
+    border-color: rgba(235, 219, 178, 0.05);
+    background: rgba(40, 40, 40, 0.6);
+}
+
+[data-theme="gruvbox"] .tf-btn {
+    font-family: var(--font-mono);
+    font-size: 0.75em;
+    letter-spacing: 0.3px;
+    font-weight: 600;
+}
+
+[data-theme="gruvbox"] .tf-btn.active {
+    color: #fe8019;
+    background: rgba(254, 128, 25, 0.08);
+    border-color: rgba(254, 128, 25, 0.18);
+    font-weight: 700;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SIZE SLIDER
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .size-slider-fill {
+    background: linear-gradient(90deg, #d65d0e, #fe8019);
+}
+
+[data-theme="gruvbox"] .slider-diamond.active {
+    background: #fe8019;
+    border-color: rgba(254, 128, 25, 0.5);
+    box-shadow: 0 0 3px rgba(254, 128, 25, 0.3);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SCROLLBAR — Warm 4px
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] ::-webkit-scrollbar {
+    width: 4px;
+}
+
+[data-theme="gruvbox"] ::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+[data-theme="gruvbox"] ::-webkit-scrollbar-thumb {
+    background: rgba(168, 153, 132, 0.25);
+    border-radius: 2px;
+}
+
+[data-theme="gruvbox"] ::-webkit-scrollbar-thumb:hover {
+    background: rgba(168, 153, 132, 0.45);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   EMPTY STATES — Warm illustration style
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .cute-svg {
+    filter: drop-shadow(0 0 10px rgba(254, 128, 25, 0.12));
+    opacity: 0.75;
+}
+
+[data-theme="gruvbox"] .cute-title {
+    background: linear-gradient(90deg, #fe8019, #fabd2f);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    text-shadow: none;
+    font-weight: 800;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    font-size: 0.85em;
+}
+
+[data-theme="gruvbox"] .cute-subtitle {
+    font-family: var(--font-mono);
+    font-size: 0.78em;
+    letter-spacing: 0.3px;
+    color: var(--text-muted);
+}
+
+[data-theme="gruvbox"] .cute-illustration {
+    animation: gruvboxFloat 5s ease-in-out infinite;
+}
+
+@keyframes gruvboxFloat {
+
+    0%,
+    100% {
+        transform: translateY(0);
+    }
+
+    50% {
+        transform: translateY(-3px);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   POSITIONS / ORDERS PANELS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .compact-pos-panel {
+    border-color: rgba(235, 219, 178, 0.05);
+}
+
+[data-theme="gruvbox"] .open-orders-panel {
+    border-color: rgba(235, 219, 178, 0.05);
+}
+
+[data-theme="gruvbox"] .btn-cancel-all {
+    border-color: rgba(251, 73, 52, 0.2);
+    color: #fb4934;
+    border-radius: var(--radius-sm);
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+    font-size: 0.75em;
+    font-family: var(--font-mono);
+    transition: all 0.12s ease-out;
+}
+
+[data-theme="gruvbox"] .btn-cancel-all:hover {
+    background: rgba(251, 73, 52, 0.06);
+    box-shadow: 0 0 6px rgba(251, 73, 52, 0.08);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   EQUITY CHART & ACCOUNT
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] #equity-chart {
+    border-radius: var(--radius);
+    border: 1px solid rgba(235, 219, 178, 0.05);
+}
+
+[data-theme="gruvbox"] .equity-upnl-panel {
+    background: rgba(50, 48, 47, 0.5);
+    border-color: rgba(235, 219, 178, 0.05);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SYMBOL BAR
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .symbol-bar {
+    border-bottom-color: rgba(235, 219, 178, 0.05);
+    background: rgba(40, 40, 40, 0.7);
+}
+
+[data-theme="gruvbox"] .symbol-bar-name {
+    color: #fe8019;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+
+[data-theme="gruvbox"] .symbol-bar-price {
+    color: #fbf1c7;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   AUTH CARD — Warm parchment
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] #auth-card {
+    background: linear-gradient(180deg, rgba(60, 56, 54, 0.95), rgba(40, 40, 40, 0.97));
+    border: 1px solid rgba(254, 128, 25, 0.1);
+    border-top: 2px solid var(--accent);
+    box-shadow:
+        0 0 16px rgba(254, 128, 25, 0.04),
+        0 8px 40px rgba(0, 0, 0, 0.6);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   APP HEADER
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] #app-header {
+    border-bottom-color: rgba(235, 219, 178, 0.05);
+    background: rgba(29, 32, 33, 0.92);
+    backdrop-filter: blur(8px);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   INDEX TRADING
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .idx-list {
+    border-color: rgba(235, 219, 178, 0.05);
+}
+
+[data-theme="gruvbox"] .idx-item.active {
+    background: rgba(254, 128, 25, 0.05);
+    border-color: rgba(254, 128, 25, 0.18);
+    border-left: 3px solid #fe8019;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   RANGE INPUT
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] input[type="range"]::-webkit-slider-thumb {
+    background: #fe8019;
+    border: 1px solid rgba(214, 93, 14, 0.5);
+    box-shadow: 0 0 3px rgba(254, 128, 25, 0.3);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SELECTION
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] ::selection {
+    background: rgba(254, 128, 25, 0.2);
+    color: #fbf1c7;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ANIMATIONS — Gentle, no harsh flashing
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Card entrance: subtle fade */
+@keyframes gruvboxCardEnter {
+    0% {
+        opacity: 0;
+        transform: translateY(4px);
+    }
+
+    100% {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+[data-theme="gruvbox"] .card,
+[data-theme="gruvbox"] .glass-card {
+    animation: gruvboxCardEnter 0.25s ease-out;
+}
+
+/* Suppress bouncy/kawaii animations */
+[data-theme="gruvbox"] .cute-bounce,
+[data-theme="gruvbox"] .cute-bounce-delay1,
+[data-theme="gruvbox"] .cute-bounce-delay2,
+[data-theme="gruvbox"] .cute-bounce-delay3 {
+    animation: gruvboxFloat 5s ease-in-out infinite;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SCANNER
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .scanner-badge {
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: 0.72em;
+    letter-spacing: 0.4px;
+    font-weight: 700;
+}
+
+[data-theme="gruvbox"] .scanner-badge.active {
+    background: rgba(254, 128, 25, 0.08);
+    border-color: rgba(254, 128, 25, 0.2);
+    color: #fe8019;
+}
+
+[data-theme="gruvbox"] .scanner-stat-value {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ENGINE CARDS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .engine-card {
+    border-color: rgba(235, 219, 178, 0.05);
+    border-radius: var(--radius);
+    transition: border-color 0.15s ease-out;
+}
+
+[data-theme="gruvbox"] .engine-card.active {
+    border-color: rgba(184, 187, 38, 0.18);
+    border-left: 3px solid #b8bb26;
+    background: rgba(184, 187, 38, 0.03);
+}
+
+[data-theme="gruvbox"] .engine-card.cooldown {
+    border-color: rgba(250, 189, 47, 0.15);
+    border-left: 3px solid #fabd2f;
+    background: rgba(250, 189, 47, 0.03);
+}
+
+[data-theme="gruvbox"] .engine-state.active {
+    color: #b8bb26;
+    background: rgba(184, 187, 38, 0.1);
+    font-family: var(--font-mono);
+    font-size: 0.72em;
+    letter-spacing: 0.3px;
+    font-weight: 700;
+}
+
+[data-theme="gruvbox"] .engine-state.cooldown {
+    color: #fabd2f;
+    background: rgba(250, 189, 47, 0.1);
+    font-family: var(--font-mono);
+    font-size: 0.72em;
+    letter-spacing: 0.3px;
+    font-weight: 700;
+}
+
+[data-theme="gruvbox"] .engine-row .dim {
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   WEIGHT CHIPS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .weight-chip {
+    font-family: var(--font-mono);
+    font-size: 0.72em;
+    border-radius: var(--radius-sm);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.3px;
+}
+
+[data-theme="gruvbox"] .weight-chip.long {
+    color: #b8bb26;
+    border-color: rgba(184, 187, 38, 0.18);
+    background: rgba(184, 187, 38, 0.05);
+}
+
+[data-theme="gruvbox"] .weight-chip.short {
+    color: #fb4934;
+    border-color: rgba(251, 73, 52, 0.18);
+    background: rgba(251, 73, 52, 0.05);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   INDEX CARDS
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .index-card {
+    border-radius: var(--radius);
+    transition: border-color 0.12s ease-out;
+}
+
+[data-theme="gruvbox"] .index-card.active {
+    border-left: 3px solid #fe8019;
+}
+
+[data-theme="gruvbox"] .index-card-header .card-title {
+    font-family: var(--font-mono);
+    letter-spacing: 0.3px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   EVENT LOG
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .event-item {
+    font-family: var(--font-mono);
+    font-size: 0.78em;
+    border-bottom-color: rgba(235, 219, 178, 0.04);
+}
+
+[data-theme="gruvbox"] .event-time {
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   THEME SWATCH (account page picker)
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .theme-swatch {
+    border-radius: var(--radius) !important;
+}
+
+[data-theme="gruvbox"] .theme-swatch:hover {
+    transform: translateY(-1px);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ACCOUNT PAGE — Stat grid
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .stat-grid {
+    gap: 8px;
+}
+
+[data-theme="gruvbox"] .stat-item {
+    background: rgba(50, 48, 47, 0.5);
+    border: 1px solid rgba(235, 219, 178, 0.05);
+    border-radius: var(--radius);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   RECONNECT BANNER
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] #reconnect-banner {
+    background: rgba(254, 128, 25, 0.05) !important;
+    border-color: rgba(254, 128, 25, 0.12) !important;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SELECTED ITEMS — Orange accent bar
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="gruvbox"] .idx-item.active,
+[data-theme="gruvbox"] .symbol-item.selected {
+    border-left: 3px solid var(--accent);
+}

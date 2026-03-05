@@ -4,7 +4,7 @@
 import { state, api, showToast, formatPrice } from '../../core/index.js';
 import { cuteConfirm } from '../../lib/cute-confirm.js';
 import * as S from './state.js';
-import { showTradeError } from './order-form.js';
+import { showTradeError, _sizeFloor } from './order-form.js';
 
 // ── Chart line management ───────────────────────
 
@@ -247,6 +247,9 @@ export async function submitChase() {
     const sizeInput = document.getElementById('trade-size');
     const sizeUsdt = parseFloat(sizeInput?.value) || 0;
     if (sizeUsdt <= 0) return showToast('Enter a trade size', 'error');
+
+    const minNotional = _sizeFloor();
+    if (sizeUsdt < minNotional) return showToast(`Min order is $${minNotional}. You entered $${sizeUsdt.toFixed(2)}`, 'error');
 
 
     const offsetPct = parseFloat(document.getElementById('chase-offset')?.value) || 0;

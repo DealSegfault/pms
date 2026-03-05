@@ -83,6 +83,16 @@ export function setLeverage(val) {
     setSizePercent(S.sizePercent);
 }
 
+// Minimum trade size floor to avoid exchange min-notional errors
+const _SIZE_FLOOR = 6;       // USD – default for alts
+const _SIZE_FLOOR_MAJOR = 20; // USD – for high-notional majors
+const _MAJOR_BASES = new Set(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE']);
+
+export function _sizeFloor() {
+    const base = (S.selectedSymbol || '').split('/')[0].toUpperCase();
+    return _MAJOR_BASES.has(base) ? _SIZE_FLOOR_MAJOR : _SIZE_FLOOR;
+}
+
 export function setSizePercent(pct) {
     const availBal = S.cachedMarginInfo?.availableMargin;
     if (availBal != null && availBal < 0) {
@@ -105,7 +115,12 @@ export function setSizePercent(pct) {
     const available = S.cachedMarginInfo?.availableMargin || 0;
     const maxNotionalRule = S.cachedMarginInfo?.rules?.maxNotionalPerTrade || Infinity;
     const maxNotional = Math.min(available * S.leverage, maxNotionalRule);
-    const notional = maxNotional * (S.sizePercent / 100);
+    let notional = maxNotional * (S.sizePercent / 100);
+
+    // Enforce minimum floor when slider is above 0%
+    if (S.sizePercent > 0 && notional < _sizeFloor()) {
+        notional = _sizeFloor();
+    }
 
     const input = document.getElementById('trade-size');
     if (input) input.value = notional.toFixed(2);
@@ -183,7 +198,7 @@ export async function submitTrade() {
     const notional = sizeUsd;
     const quantity = notional / S.currentPrice;
 
-    const minNotional = S.symbolInfo?.minNotional || 5;
+    const minNotional = Math.max(S.symbolInfo?.minNotional || 0, _sizeFloor());
     if (notional < minNotional) {
         showToast(`Min order is $${minNotional} notional. You entered $${notional.toFixed(2)}`, 'error');
         return;
@@ -249,7 +264,7 @@ export async function submitLimitOrder() {
     const notional = sizeUsd;
     const quantity = notional / limitPrice;
 
-    const minNotional = S.symbolInfo?.minNotional || 5;
+    const minNotional = Math.max(S.symbolInfo?.minNotional || 0, _sizeFloor());
     if (notional < minNotional) {
         showToast(`Min order is $${minNotional} notional. You entered $${notional.toFixed(2)}`, 'error');
         return;
