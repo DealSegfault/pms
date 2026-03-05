@@ -125,21 +125,42 @@ class PositionBook:
 
     # ── Mutations ──
 
-    def load(self, by_account: Dict[str, dict]) -> None:
+    def load(self, by_account: Dict[str, dict]) -> List[str]:
         """
         Bulk-load positions grouped by account.
         by_account: {sub_account_id: {account: dict, positions: [dict], rules: dict|None}}
+        Returns list of stale position IDs that were skipped (duplicates).
         """
+        all_stale_ids: List[str] = []
         for sub_id, data in by_account.items():
             pos_map = {}
-            seen_symbols: set[str] = set()
+            # Track seen base symbols → best position dict so far
+            seen_symbols: Dict[str, dict] = {}
+
             for p in data.get("positions", []):
                 symbol_key = self._extract_base(p["symbol"]).upper()
                 if symbol_key in seen_symbols:
-                    raise RuntimeError(
-                        f"One-way invariant violated while loading {sub_id}:{p['symbol']}"
+                    # Duplicate base symbol — keep the one with the larger notional
+                    prev = seen_symbols[symbol_key]
+                    if p["notional"] >= prev["notional"]:
+                        # Current position wins, demote the previous one
+                        stale_id = prev["id"]
+                        seen_symbols[symbol_key] = p
+                    else:
+                        # Previous position wins, skip the current one
+                        stale_id = p["id"]
+                    all_stale_ids.append(stale_id)
+                    logger.error(
+                        "One-way invariant violated while loading %s:%s — "
+                        "duplicate base '%s' detected. Skipping stale position %s "
+                        "(will auto-close in DB)",
+                        sub_id, p["symbol"], symbol_key, stale_id,
                     )
-                seen_symbols.add(symbol_key)
+                    continue
+                seen_symbols[symbol_key] = p
+
+            # Build VirtualPos map from the winning positions only
+            for p in seen_symbols.values():
                 vp = VirtualPos(
                     id=p["id"], sub_account_id=sub_id,
                     symbol=normalize_symbol(p["symbol"]) if p.get("symbol") else "", side=p["side"],
@@ -156,6 +177,7 @@ class PositionBook:
                 "positions": pos_map,
                 "rules": data.get("rules"),
             }
+        return all_stale_ids
 
     def add(self, position: VirtualPos, account: dict) -> None:
         """Add a single position. Creates account entry if needed."""

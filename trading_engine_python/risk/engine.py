@@ -623,7 +623,25 @@ class RiskEngine:
             }
             count += len(positions)
 
-        self._book.load(by_account)
+        stale_ids = self._book.load(by_account)
+
+        # Auto-close any stale duplicate positions detected during load
+        if stale_ids:
+            logger.warning(
+                "Auto-closing %d stale duplicate position(s) in DB: %s",
+                len(stale_ids), ", ".join(s[:8] for s in stale_ids),
+            )
+            for stale_id in stale_ids:
+                try:
+                    await self._db.execute(
+                        "UPDATE virtual_positions SET status = ?, closed_at = NOW() "
+                        "WHERE id = ? AND status = ?",
+                        ("CLOSED_STALE", stale_id, "OPEN"),
+                    )
+                except Exception as e:
+                    logger.error("Failed to auto-close stale position %s: %s", stale_id[:8], e)
+            count -= len(stale_ids)
+
         logger.info("Loaded %d positions across %d accounts into PositionBook", count, len(by_account))
         return count
 
