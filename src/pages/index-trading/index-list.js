@@ -2,8 +2,16 @@
 import { showToast } from '../../core/index.js';
 import { cuteConfirm } from '../../lib/cute-confirm.js';
 import { st, saveIndexes } from './state.js';
-import { initChart, loadCompositeChart, cleanupCompositeStreams } from './chart.js';
+import { initChart, loadCompositeChart, cleanupCompositeStreams, fetchKlinesForSymbol } from './chart.js';
 import { openEditor } from './editor.js';
+
+// ── Sparkline preview constants ──────────────────
+const SPARK_INTERVAL = '1h';
+const SPARK_POINTS = 24;  // last 24 candles (24h of 1h data)
+
+// Cache: indexId → { points: number[], returnPct: number }
+const _sparkCache = new Map();
+let _sparkLoadVersion = 0;
 
 const LS_LAST_INDEX_KEY = 'pms_last_selected_index';
 
@@ -60,6 +68,9 @@ export function renderIndexList() {
           <div class="idx-card-composition">
             ${longs.length > 0 ? `<span class="badge badge-long" style="font-size:9px; margin-right:3px;">L: ${longs.map(f => f.symbol.split('/')[0]).join(', ')}</span>` : ''}
             ${shorts.length > 0 ? `<span class="badge badge-short" style="font-size:9px;">S: ${shorts.map(f => f.symbol.split('/')[0]).join(', ')}</span>` : ''}
+          </div>
+          <div class="idx-card-sparkline" id="idx-spark-${idx.id}">
+            <div class="shimmer"></div>
           </div>
           <div class="idx-card-weights">
             ${idx.formula.slice(0, 6).map(f => {
@@ -157,6 +168,9 @@ export function renderIndexList() {
       renderIndexList();
     });
   });
+
+  // Lazy-load sparkline previews
+  loadIndexPreviews();
 }
 
 // ── Selection ────────────────────────────────────
@@ -267,4 +281,131 @@ async function deleteIndex(id) {
   renderIndexList();
   selectIndex(null);
   showToast('Index deleted', 'success');
+}
+
+// ── Sparkline rendering ──────────────────────────
+
+function renderCardSparkline(points, returnPct) {
+  if (!points || points.length < 2) return '';
+
+  const width = 200;
+  const height = 32;
+  const pad = 2;
+  const min = Math.min(...points);
+  const max = Math.max(...points);
+  const spread = max - min || 1;
+
+  const coords = points.map((v, i) => {
+    const x = (i / (points.length - 1)) * (width - pad * 2) + pad;
+    const y = height - pad - ((v - min) / spread) * (height - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+
+  const positive = returnPct >= 0;
+  const strokeColor = positive ? 'rgba(34,197,94,0.9)' : 'rgba(239,68,68,0.9)';
+  const gradId = `spk-g-${Math.random().toString(36).slice(2, 7)}`;
+  const gradTop = positive ? 'rgba(34,197,94,0.25)' : 'rgba(239,68,68,0.25)';
+  const gradBot = 'rgba(0,0,0,0)';
+  const retColor = positive ? 'var(--green)' : 'var(--red)';
+  const retSign = positive ? '+' : '';
+
+  return `
+    <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+      <defs>
+        <linearGradient id="${gradId}" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stop-color="${gradTop}" />
+          <stop offset="100%" stop-color="${gradBot}" />
+        </linearGradient>
+      </defs>
+      <polyline points="${pad},${height} ${coords} ${width - pad},${height}" fill="url(#${gradId})" />
+      <polyline points="${coords}" fill="none" stroke="${strokeColor}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
+    <span class="idx-card-return" style="color:${retColor};">${retSign}${returnPct.toFixed(1)}%</span>`;
+}
+
+async function loadIndexPreviews() {
+  const version = ++_sparkLoadVersion;
+
+  for (const idx of st.indexes) {
+    // Skip if already cached
+    if (_sparkCache.has(idx.id)) {
+      const cached = _sparkCache.get(idx.id);
+      const el = document.getElementById(`idx-spark-${idx.id}`);
+      if (el) el.innerHTML = renderCardSparkline(cached.points, cached.returnPct);
+      continue;
+    }
+
+    // Fetch klines for all symbols in parallel
+    try {
+      const results = await Promise.all(idx.formula.map(async f => {
+        try {
+          const data = await fetchKlinesForSymbol(f.symbol, SPARK_INTERVAL);
+          return { symbol: f.symbol, factor: f.factor, data: data || [] };
+        } catch {
+          return { symbol: f.symbol, factor: f.factor, data: [] };
+        }
+      }));
+
+      if (version !== _sparkLoadVersion) return; // stale
+
+      // Build constituents
+      const totalWeight = idx.formula.reduce((s, f) => s + Math.abs(f.factor), 0);
+      if (totalWeight === 0) continue;
+
+      const constituents = results.map(r => {
+        const map = new Map();
+        for (const c of r.data) {
+          map.set(c.time, { o: c.open, h: c.high, l: c.low, c: c.close });
+        }
+        return { map, factor: r.factor, symbol: r.symbol };
+      });
+
+      // Collect all times
+      const allTimes = new Set();
+      constituents.forEach(c => c.map.forEach((_, t) => allTimes.add(t)));
+      const sorted = [...allTimes].sort((a, b) => a - b);
+      if (sorted.length === 0) continue;
+
+      // Init prices (first available close)
+      const initPrices = {};
+      for (const c of constituents) {
+        for (const t of sorted) {
+          if (c.map.has(t)) { initPrices[c.symbol] = c.map.get(t).c; break; }
+        }
+      }
+
+      // Compute composite closes
+      const closes = [];
+      for (const t of sorted) {
+        let composite = 0;
+        let valid = true;
+        for (const c of constituents) {
+          const bar = c.map.get(t);
+          const ip = initPrices[c.symbol];
+          if (!bar || !ip) { valid = false; break; }
+          const w = Math.abs(c.factor) / totalWeight;
+          const dir = c.factor > 0 ? 1 : -1;
+          composite += w * (100 + dir * ((bar.c / ip) * 100 - 100));
+        }
+        if (valid) closes.push(composite);
+      }
+
+      // Take last N points for sparkline
+      const points = closes.slice(-SPARK_POINTS);
+      if (points.length < 2) continue;
+
+      const first = points[0];
+      const last = points[points.length - 1];
+      const returnPct = ((last - first) / first) * 100;
+
+      _sparkCache.set(idx.id, { points, returnPct });
+
+      const el = document.getElementById(`idx-spark-${idx.id}`);
+      if (el) el.innerHTML = renderCardSparkline(points, returnPct);
+    } catch (err) {
+      console.warn(`[Index] Sparkline preview failed for ${idx.name}:`, err);
+      const el = document.getElementById(`idx-spark-${idx.id}`);
+      if (el) el.innerHTML = ''; // gracefully degrade
+    }
+  }
 }

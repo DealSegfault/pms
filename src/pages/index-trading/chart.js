@@ -161,7 +161,7 @@ function subscribeCompositeStreams(context, loadVersion) {
 
 // ── Kline fetching with multi-tier cache ─────────
 
-async function fetchKlinesForSymbol(symbol, interval) {
+export async function fetchKlinesForSymbol(symbol, interval) {
     const now = Date.now();
 
     // 1. Check in-memory cache first (fastest path)
