@@ -125,11 +125,6 @@ export function setSizePercent(pct) {
     const input = document.getElementById('trade-size');
     if (input) input.value = notional.toFixed(2);
 
-    const buyLabel = document.getElementById('size-buy-label');
-    const sellLabel = document.getElementById('size-sell-label');
-    if (buyLabel) buyLabel.textContent = `Buy ${notional.toFixed(2)} USDT`;
-    if (sellLabel) sellLabel.textContent = `Sell ${notional.toFixed(2)} USDT`;
-
     updatePreview();
     if (S.orderType === 'SCALPER') {
         import('./scalper.js').then(m => m.updateScalperPreview());
@@ -228,6 +223,8 @@ export async function submitTrade() {
         requestAnimationFrame(() => markOrderPaint(latencyId));
         if (result.success) {
             showToast(`${S.selectedSide} ${S.selectedSymbol.split('/')[0]} opened`, 'success');
+            // 7d. Haptic feedback
+            try { navigator?.vibrate?.(50); } catch { }
             document.getElementById('trade-size').value = '';
             document.getElementById('order-preview').style.display = 'none';
             const slider = document.getElementById('size-slider');
@@ -457,6 +454,18 @@ export function showSymbolPicker() {
     overlay.className = 'modal-overlay';
     overlay.style.alignItems = 'flex-start';
     overlay.style.paddingTop = '40px';
+
+    // 3c. Recent symbols
+    let recentSymbols = [];
+    try { recentSymbols = JSON.parse(localStorage.getItem('pms_recent_symbols') || '[]').slice(0, 5); } catch { }
+    const recentHtml = recentSymbols.length ? `
+      <div class="sym-recent-section">
+        <div class="sym-recent-label">Recently Traded</div>
+        <div class="sym-recent-chips">
+          ${recentSymbols.map(s => `<span class="sym-recent-chip" data-symbol="${s}">${s.split('/')[0]}</span>`).join('')}
+        </div>
+      </div>` : '';
+
     overlay.innerHTML = `
     <div class="modal-content" style="max-height: 80vh; display: flex; flex-direction: column;">
       <div class="modal-header">
@@ -464,12 +473,13 @@ export function showSymbolPicker() {
         <button class="modal-close">×</button>
       </div>
       <input class="search-input" id="symbol-search" placeholder="Search symbol..." autofocus />
-      <div class="symbol-list-header" style="display:flex; justify-content:space-between; padding:6px 12px; font-size:11px; color:var(--text-muted); border-bottom:1px solid var(--border); cursor:pointer; user-select:none;">
+      ${recentHtml}
+      <div class="symbol-list-header sym-picker-header" style="display:flex; justify-content:space-between; padding:6px 12px; font-size:11px; color:var(--text-muted); border-bottom:1px solid var(--border); cursor:pointer; user-select:none;">
         <span data-sort="name" style="flex:2;">Name ↕</span>
         <span data-sort="price" style="flex:1.5; text-align:right;">Price ↕</span>
         <span data-sort="change24h" style="flex:1; text-align:right;">24h% ↕</span>
-        <span data-sort="volume24h" style="flex:1; text-align:right;">Volume ↕</span>
-        <span data-sort="fundingRate" style="flex:1; text-align:right;">Funding ↕</span>
+        <span data-sort="volume24h" class="sym-picker-col-vol" style="flex:1; text-align:right;">Volume ↕</span>
+        <span data-sort="fundingRate" class="sym-picker-col-fund" style="flex:1; text-align:right;">Funding ↕</span>
       </div>
       <div class="symbol-list" id="symbol-results" style="overflow-y:auto; flex:1; max-height:60vh;"></div>
     </div>
@@ -477,16 +487,32 @@ export function showSymbolPicker() {
 
     overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
     overlay.querySelector('.modal-close').addEventListener('click', () => overlay.remove());
+    // 3c. Recent chip click handlers
+    overlay.querySelectorAll('.sym-recent-chip').forEach(chip => {
+        chip.addEventListener('click', () => { overlay.remove(); switchSymbol(chip.dataset.symbol); });
+    });
     document.body.appendChild(overlay);
 
     let allTickers = [];
     let currentSort = { key: 'change24h', dir: -1 };
+
+    // 3b. Sort direction indicators
+    function updateSortHeaders() {
+        overlay.querySelectorAll('[data-sort]').forEach(el => {
+            const key = el.dataset.sort;
+            const arrow = key === currentSort.key ? (currentSort.dir > 0 ? ' ↑' : ' ↓') : ' ↕';
+            const label = { name: 'Name', price: 'Price', change24h: '24h%', volume24h: 'Volume', fundingRate: 'Funding' }[key] || key;
+            el.textContent = label + arrow;
+            el.classList.toggle('sym-sort-active', key === currentSort.key);
+        });
+    }
 
     overlay.querySelectorAll('[data-sort]').forEach(el => {
         el.addEventListener('click', () => {
             const key = el.dataset.sort;
             if (currentSort.key === key) currentSort.dir *= -1;
             else currentSort = { key, dir: key === 'name' ? 1 : -1 };
+            updateSortHeaders();
             const q = document.getElementById('symbol-search')?.value?.trim() || '';
             renderTickerResults(filterSymbols(allTickers, q), q);
         });
@@ -532,16 +558,15 @@ export function showSymbolPicker() {
         if (!list) return;
         sortTickers(results);
 
-        // Build a map of symbols with active positions → side
         const tradedMap = new Map();
         for (const [, pos] of S._positionMap) {
             tradedMap.set(pos.symbol, pos.side);
         }
 
-        // TradFi asset classification
         const EQUITIES = new Set(['TSLA', 'AMZN', 'COIN', 'CRCL', 'HOOD', 'INTC', 'MSTR', 'PLTR']);
         const COMMODITIES = new Set(['XAU', 'XAG', 'XPD', 'XPT']);
 
+        // 3a. Responsive columns: add classes so CSS can hide on mobile
         list.innerHTML = results.map(s => {
             const chgColor = s.change24h >= 0 ? 'var(--green)' : 'var(--red)';
             const fundColor = s.fundingRate >= 0 ? 'var(--green)' : 'var(--red)';
@@ -553,7 +578,6 @@ export function showSymbolPicker() {
                 ? `<span class="symbol-traded-dot ${side === 'LONG' ? 'dot-long' : 'dot-short'}"></span><span class="symbol-traded-badge ${side === 'LONG' ? 'badge-long' : 'badge-short'}">${side === 'LONG' ? 'L' : 'S'}</span>`
                 : '';
 
-            // TradFi type badge
             const base = s.base?.toUpperCase();
             const typeBadge = EQUITIES.has(base)
                 ? '<span class="symbol-type-badge type-equity">📈 Equity</span>'
@@ -562,12 +586,12 @@ export function showSymbolPicker() {
                     : '';
 
             return `
-        <div class="symbol-item" data-symbol="${s.symbol}" style="display:flex; justify-content:space-between; align-items:center;">
+        <div class="symbol-item sym-picker-row" data-symbol="${s.symbol}" style="display:flex; justify-content:space-between; align-items:center;">
           <span style="flex:2; font-weight:600; display:flex; align-items:center; gap:6px;">${tradedIndicator}${s.base}/USDT${typeBadge}</span>
           <span style="flex:1.5; text-align:right; font-family:var(--font-mono); font-size:12px;">${s.price ? '$' + formatPrice(s.price) : '—'}</span>
           <span style="flex:1; text-align:right; font-family:var(--font-mono); font-size:12px; color:${chgColor};">${s.change24h >= 0 ? '+' : ''}${s.change24h.toFixed(2)}%</span>
-          <span style="flex:1; text-align:right; font-family:var(--font-mono); font-size:11px; color:var(--text-muted);">${volStr}</span>
-          <span style="flex:1; text-align:right; font-family:var(--font-mono); font-size:11px; color:${fundColor};">${(s.fundingRate * 100).toFixed(4)}%</span>
+          <span class="sym-picker-col-vol" style="flex:1; text-align:right; font-family:var(--font-mono); font-size:11px; color:var(--text-muted);">${volStr}</span>
+          <span class="sym-picker-col-fund" style="flex:1; text-align:right; font-family:var(--font-mono); font-size:11px; color:${fundColor};">${(s.fundingRate * 100).toFixed(4)}%</span>
         </div>
       `;
         }).join('') || '<div style="padding:20px; text-align:center; color:var(--text-muted);">No symbols found</div>';
@@ -590,6 +614,13 @@ export function showSymbolPicker() {
 export function switchSymbol(symbol) {
     S.set('selectedSymbol', symbol);
     localStorage.setItem('pms_last_symbol', symbol);
+
+    // 3c. Track recent symbols
+    try {
+        let recent = JSON.parse(localStorage.getItem('pms_recent_symbols') || '[]');
+        recent = [symbol, ...recent.filter(s => s !== symbol)].slice(0, 8);
+        localStorage.setItem('pms_recent_symbols', JSON.stringify(recent));
+    } catch { }
     let raw = symbol.replace('/', '').replace(':USDT', '').toLowerCase();
     if (!raw.endsWith('usdt')) raw += 'usdt';
     S.set('rawSymbol', raw);

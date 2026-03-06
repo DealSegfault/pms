@@ -182,6 +182,7 @@ class StreamEventType:
     ORDER_STATE_FILLED = "ORDER_STATE_FILLED"
     ORDER_STATE_CANCELLED = "ORDER_STATE_CANCELLED"
     ORDER_STATE_REJECTED = "ORDER_STATE_REJECTED"
+    SCALPER_RUNTIME_SNAPSHOT = "SCALPER_RUNTIME_SNAPSHOT"
 
 
 # ── Redis Key Prefixes ───────────────────────────────────────
@@ -277,3 +278,11 @@ class RedisKey:
     @staticmethod
     def event_channel(event_type: str) -> str:
         return f"pms:events:{event_type}"
+
+    @staticmethod
+    def trade_stream() -> str:
+        return "pms:stream:trade_events"
+
+    @staticmethod
+    def algo_runtime_stream() -> str:
+        return "pms:stream:algo_runtime"

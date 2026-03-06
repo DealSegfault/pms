@@ -115,6 +115,21 @@ function attachEventListeners() {
         const dd = document.getElementById('lev-dropdown');
         if (dd) dd.style.display = 'none';
     });
+    // Custom leverage input
+    document.getElementById('lev-custom-go')?.addEventListener('click', e => {
+        e.stopPropagation();
+        const v = parseInt(document.getElementById('lev-custom-input')?.value);
+        if (v >= 1 && v <= 125) {
+            setLeverage(v);
+            const dd = document.getElementById('lev-dropdown');
+            if (dd) dd.style.display = 'none';
+        }
+    });
+    document.getElementById('lev-custom-input')?.addEventListener('keydown', e => {
+        if (e.key === 'Enter') document.getElementById('lev-custom-go')?.click();
+        e.stopPropagation();
+    });
+    document.getElementById('lev-custom-input')?.addEventListener('click', e => e.stopPropagation());
 
     // ── Size slider ──
     const slider = document.getElementById('size-slider');
@@ -141,7 +156,16 @@ function attachEventListeners() {
     document.getElementById('chart-settings-btn')?.addEventListener('click', e => {
         e.stopPropagation();
         const panel = document.getElementById('chart-settings-panel');
-        if (panel) panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+        const backdrop = document.getElementById('chart-settings-backdrop');
+        const isOpen = panel?.style.display !== 'none';
+        if (panel) panel.style.display = isOpen ? 'none' : 'block';
+        if (backdrop) backdrop.style.display = isOpen ? 'none' : 'block';
+    });
+    document.getElementById('chart-settings-backdrop')?.addEventListener('click', () => {
+        const panel = document.getElementById('chart-settings-panel');
+        const backdrop = document.getElementById('chart-settings-backdrop');
+        if (panel) panel.style.display = 'none';
+        if (backdrop) backdrop.style.display = 'none';
     });
 
 
@@ -277,6 +301,15 @@ function attachEventListeners() {
         const el = document.getElementById('scalper-skew-val');
         if (el) el.textContent = v > 0 ? `+${v}` : `${v}`;
         import('./scalper.js').then(m => m.updateScalperPreview());
+    });
+    // Scalper Advanced toggle
+    document.getElementById('scalper-adv-toggle')?.addEventListener('click', () => {
+        const btn = document.getElementById('scalper-adv-toggle');
+        const content = document.getElementById('scalper-adv-content');
+        if (btn && content) {
+            btn.classList.toggle('open');
+            content.classList.toggle('open');
+        }
     });
 
     function _syncScalperAllowLoss(mode) {

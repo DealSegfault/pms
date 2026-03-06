@@ -30,6 +30,7 @@ class ChaseRedisState:
     leverage: int = 1
     stalk_mode: str = "maintain"
     stalk_offset_pct: float = 0.0
+    stalk_offset_ticks: Optional[int] = None
     max_distance_pct: float = 2.0
     status: str = "ACTIVE"
     reprice_count: int = 0
@@ -37,6 +38,7 @@ class ChaseRedisState:
     current_order_price: Optional[float] = None
     size_usd: float = 0.0
     reduce_only: bool = False
+    order_role: str = "ENTRY"
     parent_scalper_id: Optional[str] = None
     layer_idx: Optional[int] = None
     paused: bool = False
@@ -59,7 +61,10 @@ class ChaseRedisState:
             "currentOrderPrice": self.current_order_price,
             "sizeUsd": self.size_usd,
             "reduceOnly": self.reduce_only,
+            "orderRole": self.order_role,
         }
+        if self.stalk_offset_ticks is not None:
+            d["stalkOffsetTicks"] = self.stalk_offset_ticks
         if self.parent_scalper_id:
             d["parentScalperId"] = self.parent_scalper_id
         if self.layer_idx is not None:
@@ -82,14 +87,22 @@ class ScalperSlotSnapshot:
     side: str = ""
     qty: float = 0.0
     offset_pct: float = 0.0
+    offset_ticks: Optional[int] = None
     active: bool = False
     paused: bool = False
+    pause_reason: Optional[str] = None
     retry_at: Optional[int] = None
     retry_count: int = 0
     fills: int = 0
+    reduce_only: bool = False
+    chase_id: Optional[str] = None
+    current_order_client_id: Optional[str] = None
+    restarting: bool = False
+    restart_pending: bool = False
+    start_pending: bool = False
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "layerIdx": self.layer_idx,
             "side": self.side,
             "qty": self.qty,
@@ -99,7 +112,20 @@ class ScalperSlotSnapshot:
             "retryAt": self.retry_at,
             "retryCount": self.retry_count,
             "fills": self.fills,
+            "reduceOnly": self.reduce_only,
+            "restarting": self.restarting,
+            "restartPending": self.restart_pending,
+            "startPending": self.start_pending,
         }
+        if self.offset_ticks is not None:
+            data["offsetTicks"] = self.offset_ticks
+        if self.pause_reason is not None:
+            data["pauseReason"] = self.pause_reason
+        if self.chase_id is not None:
+            data["chaseId"] = self.chase_id
+        if self.current_order_client_id is not None:
+            data["currentOrderClientId"] = self.current_order_client_id
+        return data
 
 
 @dataclass
@@ -156,6 +182,98 @@ class ScalperRedisState:
             "pinShortToEntry": self.pin_short_to_entry,
             "startedAt": self.started_at,
             "reduceOnlyArmed": self.reduce_only_armed,
+        }
+
+
+@dataclass
+class ScalperRuntimeSnapshot:
+    """Full runtime snapshot persisted to pms:scalper:{scalperId} and DB checkpoints."""
+
+    scalper_id: str = ""
+    sub_account_id: str = ""
+    strategy_type: str = "SCALPER"
+    symbol: str = ""
+    start_side: str = "LONG"
+    child_count: int = 1
+    status: str = "ACTIVE"
+    checkpoint_seq: int = 0
+    checkpoint_reason: str = "HEARTBEAT"
+    total_fill_count: int = 0
+    long_offset_pct: float = 0.0
+    short_offset_pct: float = 0.0
+    long_size_usd: float = 0.0
+    short_size_usd: float = 0.0
+    neutral_mode: bool = False
+    leverage: int = 1
+    skew: int = 0
+    long_max_price: Optional[float] = None
+    short_min_price: Optional[float] = None
+    min_fill_spread_pct: float = 0.0
+    fill_decay_half_life_ms: float = 30000
+    min_refill_delay_ms: float = 0.0
+    allow_loss: bool = True
+    max_loss_per_close_bps: int = 0
+    max_fills_per_minute: int = 0
+    pnl_feedback_mode: str = "off"
+    pin_long_to_entry: bool = False
+    pin_short_to_entry: bool = False
+    reduce_only_armed: bool = False
+    last_known_price: float = 0.0
+    started_at: int = 0
+    source_ts: int = 0
+    resume_status: str = "LIVE"
+    last_fill_price: Dict[str, float] = field(default_factory=dict)
+    last_fill_time: Dict[str, int] = field(default_factory=dict)
+    recent_fill_times: Dict[str, List[int]] = field(default_factory=dict)
+    fill_refill_count: Dict[str, int] = field(default_factory=dict)
+    child_chase_ids: List[str] = field(default_factory=list)
+    child_order_client_ids: List[str] = field(default_factory=list)
+    long_slots: List[ScalperSlotSnapshot] = field(default_factory=list)
+    short_slots: List[ScalperSlotSnapshot] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "scalperId": self.scalper_id,
+            "subAccountId": self.sub_account_id,
+            "strategyType": self.strategy_type,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
+            "startSide": self.start_side,
+            "childCount": self.child_count,
+            "status": self.status,
+            "checkpointSeq": self.checkpoint_seq,
+            "checkpointReason": self.checkpoint_reason,
+            "totalFillCount": self.total_fill_count,
+            "longOffsetPct": self.long_offset_pct,
+            "shortOffsetPct": self.short_offset_pct,
+            "longSizeUsd": self.long_size_usd,
+            "shortSizeUsd": self.short_size_usd,
+            "neutralMode": self.neutral_mode,
+            "leverage": self.leverage,
+            "skew": self.skew,
+            "longMaxPrice": self.long_max_price,
+            "shortMinPrice": self.short_min_price,
+            "minFillSpreadPct": self.min_fill_spread_pct,
+            "fillDecayHalfLifeMs": self.fill_decay_half_life_ms,
+            "minRefillDelayMs": self.min_refill_delay_ms,
+            "allowLoss": self.allow_loss,
+            "maxLossPerCloseBps": self.max_loss_per_close_bps,
+            "maxFillsPerMinute": self.max_fills_per_minute,
+            "pnlFeedbackMode": self.pnl_feedback_mode,
+            "pinLongToEntry": self.pin_long_to_entry,
+            "pinShortToEntry": self.pin_short_to_entry,
+            "reduceOnlyArmed": self.reduce_only_armed,
+            "lastKnownPrice": self.last_known_price,
+            "startedAt": self.started_at,
+            "sourceTs": self.source_ts,
+            "resumeStatus": self.resume_status,
+            "lastFillPrice": self.last_fill_price,
+            "lastFillTime": self.last_fill_time,
+            "recentFillTimes": self.recent_fill_times,
+            "fillRefillCount": self.fill_refill_count,
+            "childChaseIds": self.child_chase_ids,
+            "childOrderClientIds": self.child_order_client_ids,
+            "longSlots": [slot.to_dict() for slot in self.long_slots],
+            "shortSlots": [slot.to_dict() for slot in self.short_slots],
         }
 
 

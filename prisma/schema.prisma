@@ -50,6 +50,12 @@ model SubAccount {
   strategySessions StrategySession[]
   tcaRollups      SubAccountTcaRollup[]
   strategyRollups StrategyTcaRollup[]
+  algoRuntimeSessions AlgoRuntimeSession[]
+  algoRuntimeCheckpoints AlgoRuntimeCheckpoint[]
+  strategyPositionLots StrategyPositionLot[]
+  strategyLotRealizations StrategyLotRealization[]
+  strategySessionPnlSamples StrategySessionPnlSample[]
+  strategySessionParamSamples StrategySessionParamSample[]
 
   @@index([userId, status])
   @@index([status])
@@ -182,12 +188,15 @@ model OrderLifecycle {
   originPath          String   @default("PYTHON_CMD") @map("origin_path")
   strategyType        String?  @map("strategy_type")
   strategySessionId   String?  @map("strategy_session_id")
+  parentStrategySessionId String? @map("parent_strategy_session_id")
+  rootStrategySessionId String? @map("root_strategy_session_id")
   parentId            String?  @map("parent_id")
   clientOrderId       String?  @map("client_order_id")
   exchangeOrderId     String?  @map("exchange_order_id")
   symbol              String?
   side                String?
   orderType           String?  @map("order_type")
+  orderRole           String   @default("UNKNOWN") @map("order_role")
   reduceOnly          Boolean  @default(false) @map("reduce_only")
   requestedQty        Float?   @map("requested_qty")
   limitPrice          Float?   @map("limit_price")
@@ -220,6 +229,7 @@ model OrderLifecycle {
   @@index([clientOrderId])
   @@index([exchangeOrderId])
   @@index([symbol, createdAt])
+  @@index([rootStrategySessionId, createdAt])
   @@index([reconciliationStatus, updatedAt])
   @@map("order_lifecycles")
 }
@@ -239,6 +249,28 @@ model OrderLifecycleEvent {
   @@index([lifecycleId, createdAt])
   @@index([eventType, sourceTs])
   @@map("order_lifecycle_events")
+}
+
+model AlgoLineageEdge {
+  id                  String   @id @default(uuid())
+  executionScope      String   @default("SUB_ACCOUNT") @map("execution_scope")
+  subAccountId        String?  @map("sub_account_id")
+  ownershipConfidence String   @default("HARD") @map("ownership_confidence")
+  parentNodeType      String   @map("parent_node_type")
+  parentNodeId        String   @map("parent_node_id")
+  childNodeType       String   @map("child_node_type")
+  childNodeId         String   @map("child_node_id")
+  relationType        String   @map("relation_type")
+  sourceEventId       String?  @map("source_event_id")
+  sourceTs            DateTime? @map("source_ts")
+  ingestedTs          DateTime? @map("ingested_ts")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  @@unique([parentNodeType, parentNodeId, childNodeType, childNodeId, relationType])
+  @@index([subAccountId, sourceTs])
+  @@index([parentNodeType, parentNodeId])
+  @@index([childNodeType, childNodeId])
+  @@map("algo_lineage_edges")
 }
 
 model MarketQuote {
@@ -310,6 +342,9 @@ model StrategySession {
   subAccountId String?  @map("sub_account_id")
   origin       String   @default("MANUAL")
   strategyType String?  @map("strategy_type")
+  parentStrategySessionId String? @map("parent_strategy_session_id")
+  rootStrategySessionId   String? @map("root_strategy_session_id")
+  sessionRole   String   @default("STANDALONE") @map("session_role")
   symbol       String?
   side         String?
   startedAt    DateTime? @map("started_at")
@@ -320,8 +355,15 @@ model StrategySession {
   subAccount SubAccount?      @relation(fields: [subAccountId], references: [id])
   lifecycles OrderLifecycle[]
   rollups    StrategyTcaRollup[]
+  runtimeSessions AlgoRuntimeSession[]
+  runtimeCheckpoints AlgoRuntimeCheckpoint[]
+  positionLots StrategyPositionLot[]
+  lotRealizations StrategyLotRealization[]
+  pnlSamples StrategySessionPnlSample[]
+  paramSamples StrategySessionParamSample[]
 
   @@index([subAccountId, startedAt])
+  @@index([rootStrategySessionId, startedAt])
   @@map("strategy_sessions")
 }
 
@@ -330,6 +372,7 @@ model SubAccountTcaRollup {
   subAccountId        String   @map("sub_account_id")
   executionScope      String   @default("SUB_ACCOUNT") @map("execution_scope")
   ownershipConfidence String   @default("HARD") @map("ownership_confidence")
+  qualityByRoleJson   String?  @map("quality_by_role_json")
   orderCount          Int      @default(0) @map("order_count")
   terminalOrderCount  Int      @default(0) @map("terminal_order_count")
   fillCount           Int      @default(0) @map("fill_count")
@@ -346,6 +389,11 @@ model SubAccountTcaRollup {
   avgMarkout1sBps     Float?   @map("avg_markout_1s_bps")
   avgMarkout5sBps     Float?   @map("avg_markout_5s_bps")
   avgMarkout30sBps    Float?   @map("avg_markout_30s_bps")
+  realizedPnl         Float    @default(0) @map("realized_pnl")
+  unrealizedPnl       Float    @default(0) @map("unrealized_pnl")
+  netPnl              Float    @default(0) @map("net_pnl")
+  feesTotal           Float    @default(0) @map("fees_total")
+  lastSampledAt       DateTime? @map("last_sampled_at")
   totalRepriceCount   Int      @default(0) @map("total_reprice_count")
   createdAt           DateTime @default(now()) @map("created_at")
   updatedAt           DateTime @updatedAt @map("updated_at")
@@ -362,8 +410,10 @@ model StrategyTcaRollup {
   strategySessionId   String   @map("strategy_session_id")
   subAccountId        String?  @map("sub_account_id")
   strategyType        String?  @map("strategy_type")
+  rollupLevel         String   @default("SESSION") @map("rollup_level")
   executionScope      String   @default("SUB_ACCOUNT") @map("execution_scope")
   ownershipConfidence String   @default("HARD") @map("ownership_confidence")
+  qualityByRoleJson   String?  @map("quality_by_role_json")
   orderCount          Int      @default(0) @map("order_count")
   terminalOrderCount  Int      @default(0) @map("terminal_order_count")
   fillCount           Int      @default(0) @map("fill_count")
@@ -380,6 +430,19 @@ model StrategyTcaRollup {
   avgMarkout1sBps     Float?   @map("avg_markout_1s_bps")
   avgMarkout5sBps     Float?   @map("avg_markout_5s_bps")
   avgMarkout30sBps    Float?   @map("avg_markout_30s_bps")
+  realizedPnl         Float    @default(0) @map("realized_pnl")
+  unrealizedPnl       Float    @default(0) @map("unrealized_pnl")
+  netPnl              Float    @default(0) @map("net_pnl")
+  feesTotal           Float    @default(0) @map("fees_total")
+  openQty             Float    @default(0) @map("open_qty")
+  openNotional        Float    @default(0) @map("open_notional")
+  closeCount          Int      @default(0) @map("close_count")
+  winCount            Int      @default(0) @map("win_count")
+  lossCount           Int      @default(0) @map("loss_count")
+  winRate             Float?   @map("win_rate")
+  maxDrawdownPnl      Float?   @map("max_drawdown_pnl")
+  maxRunupPnl         Float?   @map("max_runup_pnl")
+  lastSampledAt       DateTime? @map("last_sampled_at")
   totalRepriceCount   Int      @default(0) @map("total_reprice_count")
   createdAt           DateTime @default(now()) @map("created_at")
   updatedAt           DateTime @updatedAt @map("updated_at")
@@ -387,9 +450,225 @@ model StrategyTcaRollup {
   strategySession StrategySession @relation(fields: [strategySessionId], references: [id])
   subAccount      SubAccount?     @relation(fields: [subAccountId], references: [id])
 
-  @@unique([strategySessionId, executionScope, ownershipConfidence])
+  @@unique([strategySessionId, executionScope, ownershipConfidence, rollupLevel])
   @@index([executionScope, ownershipConfidence])
   @@map("strategy_tca_rollups")
+}
+
+model TcaWorkerCursor {
+  workerKey          String   @id @map("worker_key")
+  cursorJson         String?  @map("cursor_json")
+  lastRunStartedAt   DateTime? @map("last_run_started_at")
+  lastRunCompletedAt DateTime? @map("last_run_completed_at")
+  lastSuccessAt      DateTime? @map("last_success_at")
+  lastRunMetaJson    String?  @map("last_run_meta_json")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  @@map("tca_worker_cursors")
+}
+
+model TcaAnomaly {
+  id                    String   @id @default(uuid())
+  anomalyKey            String   @unique @map("anomaly_key")
+  anomalyType           String   @map("anomaly_type")
+  subAccountId          String?  @map("sub_account_id")
+  rootStrategySessionId String?  @map("root_strategy_session_id")
+  strategySessionId     String?  @map("strategy_session_id")
+  lifecycleId           String?  @map("lifecycle_id")
+  fillFactId            String?  @map("fill_fact_id")
+  severity              String   @default("WARN")
+  status                String   @default("OPEN")
+  payloadJson           String?  @map("payload_json")
+  sourceTs              DateTime? @map("source_ts")
+  firstSeenAt           DateTime @default(now()) @map("first_seen_at")
+  lastSeenAt            DateTime @default(now()) @map("last_seen_at")
+  resolvedAt            DateTime? @map("resolved_at")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  @@index([subAccountId, status, anomalyType])
+  @@index([rootStrategySessionId, status, anomalyType])
+  @@index([strategySessionId, status, anomalyType])
+  @@index([lifecycleId, anomalyType])
+  @@index([fillFactId, anomalyType])
+  @@map("tca_anomalies")
+}
+
+model AlgoRuntimeSession {
+  strategySessionId String   @id @map("strategy_session_id")
+  subAccountId      String   @map("sub_account_id")
+  strategyType      String   @map("strategy_type")
+  status            String
+  resumePolicy      String   @default("RECREATE_CHILD_ORDERS") @map("resume_policy")
+  startedAt         DateTime? @map("started_at")
+  stoppedAt         DateTime? @map("stopped_at")
+  lastHeartbeatAt   DateTime? @map("last_heartbeat_at")
+  latestCheckpointId String? @map("latest_checkpoint_id")
+  initialConfigJson String?  @map("initial_config_json")
+  currentConfigJson String?  @map("current_config_json")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  subAccount      SubAccount @relation(fields: [subAccountId], references: [id])
+  strategySession StrategySession @relation(fields: [strategySessionId], references: [id])
+
+  @@index([subAccountId, updatedAt])
+  @@index([status, updatedAt])
+  @@map("algo_runtime_sessions")
+}
+
+model AlgoRuntimeCheckpoint {
+  id               String   @id @default(uuid())
+  strategySessionId String  @map("strategy_session_id")
+  subAccountId     String   @map("sub_account_id")
+  strategyType     String   @map("strategy_type")
+  checkpointSeq    Int      @map("checkpoint_seq")
+  checkpointTs     DateTime @map("checkpoint_ts")
+  checkpointReason String   @map("checkpoint_reason")
+  status           String
+  snapshotJson     String   @map("snapshot_json")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  subAccount      SubAccount @relation(fields: [subAccountId], references: [id])
+  strategySession StrategySession @relation(fields: [strategySessionId], references: [id])
+
+  @@unique([strategySessionId, checkpointSeq])
+  @@index([subAccountId, checkpointTs])
+  @@index([strategySessionId, checkpointTs])
+  @@map("algo_runtime_checkpoints")
+}
+
+model StrategyPositionLot {
+  id                    String   @id @default(uuid())
+  subAccountId          String   @map("sub_account_id")
+  rootStrategySessionId String   @map("root_strategy_session_id")
+  sourceStrategySessionId String @map("source_strategy_session_id")
+  symbol                String
+  positionSide          String   @map("position_side")
+  sourceLifecycleId     String?  @map("source_lifecycle_id")
+  sourceFillFactId      String?  @map("source_fill_fact_id")
+  openedTs              DateTime @map("opened_ts")
+  openQty               Float    @map("open_qty")
+  remainingQty          Float    @map("remaining_qty")
+  openPrice             Float    @map("open_price")
+  openFee               Float    @default(0) @map("open_fee")
+  status                String   @default("OPEN")
+  closedTs              DateTime? @map("closed_ts")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  subAccount      SubAccount @relation(fields: [subAccountId], references: [id])
+  strategySession StrategySession @relation(fields: [rootStrategySessionId], references: [id])
+  realizations    StrategyLotRealization[]
+
+  @@index([subAccountId, openedTs])
+  @@index([rootStrategySessionId, symbol, positionSide, status])
+  @@index([sourceFillFactId])
+  @@map("strategy_position_lots")
+}
+
+model StrategyLotRealization {
+  id                    String   @id @default(uuid())
+  lotId                 String   @map("lot_id")
+  subAccountId          String   @map("sub_account_id")
+  rootStrategySessionId String   @map("root_strategy_session_id")
+  sourceStrategySessionId String @map("source_strategy_session_id")
+  closeLifecycleId      String?  @map("close_lifecycle_id")
+  closeFillFactId       String?  @map("close_fill_fact_id")
+  realizedTs            DateTime @map("realized_ts")
+  allocatedQty          Float    @map("allocated_qty")
+  openPrice             Float    @map("open_price")
+  closePrice            Float    @map("close_price")
+  grossRealizedPnl      Float    @map("gross_realized_pnl")
+  openFeeAllocated      Float    @default(0) @map("open_fee_allocated")
+  closeFeeAllocated     Float    @default(0) @map("close_fee_allocated")
+  netRealizedPnl        Float    @map("net_realized_pnl")
+  createdAt             DateTime @default(now()) @map("created_at")
+
+  lot            StrategyPositionLot @relation(fields: [lotId], references: [id])
+  subAccount     SubAccount @relation(fields: [subAccountId], references: [id])
+  strategySession StrategySession @relation(fields: [rootStrategySessionId], references: [id])
+
+  @@index([subAccountId, realizedTs])
+  @@index([rootStrategySessionId, realizedTs])
+  @@index([closeFillFactId])
+  @@map("strategy_lot_realizations")
+}
+
+model StrategySessionPnlSample {
+  id                String   @id @default(uuid())
+  strategySessionId String   @map("strategy_session_id")
+  subAccountId      String   @map("sub_account_id")
+  sampledAt         DateTime @map("sampled_at")
+  markPrice         Float?   @map("mark_price")
+  realizedPnl       Float    @default(0) @map("realized_pnl")
+  unrealizedPnl     Float    @default(0) @map("unrealized_pnl")
+  netPnl            Float    @default(0) @map("net_pnl")
+  feesTotal         Float    @default(0) @map("fees_total")
+  openQty           Float    @default(0) @map("open_qty")
+  openNotional      Float    @default(0) @map("open_notional")
+  fillCount         Int      @default(0) @map("fill_count")
+  closeCount        Int      @default(0) @map("close_count")
+  winCount          Int      @default(0) @map("win_count")
+  lossCount         Int      @default(0) @map("loss_count")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  subAccount      SubAccount @relation(fields: [subAccountId], references: [id])
+  strategySession StrategySession @relation(fields: [strategySessionId], references: [id])
+
+  @@unique([strategySessionId, sampledAt])
+  @@index([subAccountId, sampledAt])
+  @@index([strategySessionId, sampledAt])
+  @@map("strategy_session_pnl_samples")
+}
+
+model StrategySessionParamSample {
+  id                   String   @id @default(uuid())
+  strategySessionId    String   @map("strategy_session_id")
+  subAccountId         String   @map("sub_account_id")
+  sampledAt            DateTime @map("sampled_at")
+  sampleReason         String   @map("sample_reason")
+  status               String?
+  startSide            String?  @map("start_side")
+  neutralMode          Boolean  @default(false) @map("neutral_mode")
+  allowLoss            Boolean  @default(true) @map("allow_loss")
+  reduceOnlyArmed      Boolean  @default(false) @map("reduce_only_armed")
+  leverage             Int? 
+  childCount           Int?     @map("child_count")
+  skew                 Int?
+  longOffsetPct        Float?   @map("long_offset_pct")
+  shortOffsetPct       Float?   @map("short_offset_pct")
+  longSizeUsd          Float?   @map("long_size_usd")
+  shortSizeUsd         Float?   @map("short_size_usd")
+  longMaxPrice         Float?   @map("long_max_price")
+  shortMinPrice        Float?   @map("short_min_price")
+  pinLongToEntry       Boolean  @default(false) @map("pin_long_to_entry")
+  pinShortToEntry      Boolean  @default(false) @map("pin_short_to_entry")
+  minFillSpreadPct     Float?   @map("min_fill_spread_pct")
+  fillDecayHalfLifeMs  Float?   @map("fill_decay_half_life_ms")
+  minRefillDelayMs     Float?   @map("min_refill_delay_ms")
+  maxLossPerCloseBps   Int?     @map("max_loss_per_close_bps")
+  maxFillsPerMinute    Int?     @map("max_fills_per_minute")
+  pnlFeedbackMode      String?  @map("pnl_feedback_mode")
+  lastKnownPrice       Float?   @map("last_known_price")
+  totalFillCount       Int      @default(0) @map("total_fill_count")
+  longActiveSlots      Int      @default(0) @map("long_active_slots")
+  shortActiveSlots     Int      @default(0) @map("short_active_slots")
+  longPausedSlots      Int      @default(0) @map("long_paused_slots")
+  shortPausedSlots     Int      @default(0) @map("short_paused_slots")
+  longRetryingSlots    Int      @default(0) @map("long_retrying_slots")
+  shortRetryingSlots   Int      @default(0) @map("short_retrying_slots")
+  pauseReasonsJson     String?  @map("pause_reasons_json")
+  createdAt            DateTime @default(now()) @map("created_at")
+
+  subAccount      SubAccount @relation(fields: [subAccountId], references: [id])
+  strategySession StrategySession @relation(fields: [strategySessionId], references: [id])
+
+  @@unique([strategySessionId, sampledAt, sampleReason])
+  @@index([subAccountId, sampledAt])
+  @@index([strategySessionId, sampledAt])
+  @@map("strategy_session_param_samples")
 }
 
 model BotConfig {

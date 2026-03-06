@@ -1,78 +1,657 @@
 import { state, api, formatUsd, formatPrice, formatPnlClass, showToast } from '../core/index.js';
 import { subscribeAppStore } from '../store/app-store.js';
 import { cuteKey, cuteSadFace, cuteSpinner } from '../lib/cute-empty.js';
+import { createTcaInstrumentation } from './tca/instrumentation.js';
+import { ensureTcaPageShell, ensureTcaStrategyShell, patchTcaRegion } from './tca/render-islands.js';
+import { openTcaStrategyModal } from './tca/strategy-modal.js';
+
+const TCA_TABS = new Set(['overview', 'lifecycles', 'strategies']);
+const DEFAULT_TAB = 'overview';
+const DEFAULT_SORT_BY = 'updatedAt';
+const DEFAULT_SORT_DIR = 'desc';
+const DEFAULT_PAGE_SIZE = 25;
+const PAGE_SIZES = [25, 50, 100];
+const DEFAULT_STRATEGY_SORT_BY = 'updatedAt';
+const DEFAULT_STRATEGY_SORT_DIR = 'desc';
+const DEFAULT_STRATEGY_PAGE_SIZE = 25;
+const DEFAULT_TIMELINE_PAGE_SIZE = 10;
+
+const WS_LIFECYCLE_EVENTS = ['order_placed', 'order_active', 'order_filled', 'order_cancelled', 'order_failed'];
+const WS_OVERVIEW_EVENTS = ['order_filled', 'order_cancelled', 'order_failed'];
+const WS_STRATEGY_EVENTS = ['scalper_progress', 'scalper_filled', 'order_filled', 'order_cancelled', 'pnl_update', 'position_updated', 'position_closed'];
 
 const DEFAULT_FILTERS = {
     symbol: '',
     strategyType: '',
-    finalStatus: '',
+    finalStatus: 'FILLED',
+    strategyStatus: '',
     lookback: '7d',
     includeNonHard: false,
     benchmarkMs: 5000,
 };
 
+const ROLE_LABELS = {
+    ENTRY: 'First entry into a new position path.',
+    ADD: 'Adds more size into an existing root position.',
+    UNWIND: 'Reduce-only close flow used to exit owned exposure.',
+    FLATTEN: 'Forced or terminal flattening of residual position.',
+    REPRICE: 'Replacement/amend flow. Not economic intent on its own.',
+    HEDGE: 'Balancing leg used by neutral or paired logic.',
+    UNKNOWN: 'Role metadata was missing at submit time, so TCA cannot classify intent precisely.',
+};
+
+const INFO_TIPS = {
+    overviewScore: 'Composite 0-100 score from fill ratio, short-horizon markouts, arrival slippage, reject rate, and reprice load.',
+    benchmarkPulse: 'Arrival slippage compares the fill versus the decision mid. Markout shows what happened after the fill at 1s, 5s, or 30s.',
+    lifecycleQuality: 'Top line shows arrival slippage and the selected benchmark markout. Positive post-fill markout is favorable; negative means adverse selection.',
+    lifecycleToxicity: 'Toxicity weights negative short-horizon markouts and absolute arrival slippage. Higher means the flow looked more toxic.',
+    lifecycleLineage: 'Lineage tracks how the order was spawned through parent algos and replacement flows.',
+    pnlCurve: '5-second economic samples. Net = realized + unrealized - fees. Exposure tracks open notional, so flat PnL with changing exposure is still meaningful.',
+    parameterEvolution: 'Raw 5-second runtime checkpoints for scalper controls. Flat lines mean the parameter stayed constant, not that sampling stopped.',
+    executionQuality: 'Arrival slippage measures entry quality at fill time. Markouts measure price movement after the fill. Negative short-horizon markouts imply more toxic flow.',
+    stateTimeline: 'Recent runtime checkpoints only. This feed is paginated to keep the studio fast. Browse older pages for older pauses/restarts.',
+    lifecycleDrawer: 'Lifecycle detail loads core execution facts first, then lineage in a separate request so the drawer stays responsive.',
+};
+
 const PAGE = {
     container: null,
     filters: { ...DEFAULT_FILTERS },
-    data: null,
+    tab: DEFAULT_TAB,
+    sortBy: DEFAULT_SORT_BY,
+    sortDir: DEFAULT_SORT_DIR,
+    page: 1,
+    pageSize: DEFAULT_PAGE_SIZE,
     loading: false,
     error: null,
+    overviewLoading: false,
+    lifecycleLoading: false,
+    data: {
+        rollups: [],
+        strategyRollups: [],
+        strategySessions: [],
+    },
+    lifecyclePage: {
+        items: [],
+        page: 1,
+        pageSize: DEFAULT_PAGE_SIZE,
+        total: 0,
+        totalPages: 0,
+        hasPrev: false,
+        hasNext: false,
+        sortBy: DEFAULT_SORT_BY,
+        sortDir: DEFAULT_SORT_DIR,
+    },
+    strategyPage: {
+        items: [],
+        page: 1,
+        pageSize: DEFAULT_STRATEGY_PAGE_SIZE,
+        total: 0,
+        totalPages: 0,
+        hasPrev: false,
+        hasNext: false,
+        sortBy: DEFAULT_STRATEGY_SORT_BY,
+        sortDir: DEFAULT_STRATEGY_SORT_DIR,
+    },
+    strategyTimelinePage: 1,
+    strategyTimelinePageSize: DEFAULT_TIMELINE_PAGE_SIZE,
     selectedLifecycleId: null,
+    selectedStrategySessionId: null,
     detail: null,
     detailLoading: false,
+    detailError: null,
+    strategyLoading: false,
+    strategyDetailLoading: false,
+    strategyTimeseriesLoading: false,
+    strategyLedgerLoading: false,
+    strategyLineageLoading: false,
+    strategyParamsExpanded: false,
+    strategyDetail: null,
+    strategyTimeseries: null,
+    strategyLedger: null,
     unsubscribe: null,
     refreshTimer: null,
+    strategyLiveTimer: null,
     inputTimer: null,
-    requestSeq: 0,
+    wsLifecycleTimer: null,
+    wsOverviewTimer: null,
+    wsDetailTimer: null,
+    wsStrategyListTimer: null,
+    wsStrategyDetailTimer: null,
+    requestSeqOverview: 0,
+    requestSeqLifecycle: 0,
     detailSeq: 0,
+    detailLineageSeq: 0,
+    requestSeqStrategy: 0,
+    requestSeqStrategyDetail: 0,
+    requestSeqStrategyTimeseries: 0,
+    requestSeqStrategyLedger: 0,
+    requestSeqStrategyLineage: 0,
     onClick: null,
     onInput: null,
     onChange: null,
+    _lifecycleHandler: null,
+    _lifecycleByOrderHandler: null,
+    wsHandlers: [],
+    controllers: {
+        overview: null,
+        lifecycles: null,
+        detail: null,
+        detailLineage: null,
+        strategies: null,
+        strategyDetail: null,
+        strategyTimeseries: null,
+        strategyLedger: null,
+        strategyLineage: null,
+    },
+    pendingStrategyRefresh: null,
+    graphTruncatedCount: 0,
+    truncatedLifecycleIds: new Set(),
+    debugPerf: false,
+    instrumentation: createTcaInstrumentation(),
 };
+
+function readPersistedDebugPerf() {
+    if (typeof window === 'undefined' || !window.localStorage) return false;
+    try {
+        return window.localStorage.getItem('tca.debugPerf') === '1';
+    } catch {
+        return false;
+    }
+}
+
+function persistDebugPerf(enabled) {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    try {
+        if (enabled) {
+            window.localStorage.setItem('tca.debugPerf', '1');
+        } else {
+            window.localStorage.removeItem('tca.debugPerf');
+        }
+    } catch {
+        // Ignore storage failures in private contexts.
+    }
+}
+
+function publishDebugApi() {
+    if (typeof window === 'undefined') return;
+    window.__TCA_DEBUG = {
+        snapshot: () => PAGE.instrumentation.snapshot(),
+        reset: () => {
+            PAGE.instrumentation.reset();
+            render('debug-reset');
+        },
+        enable: () => {
+            PAGE.debugPerf = true;
+            PAGE.instrumentation.setEnabled(true);
+            persistDebugPerf(true);
+            syncHashState();
+            render('debug-enable');
+        },
+        disable: () => {
+            PAGE.debugPerf = false;
+            PAGE.instrumentation.setEnabled(false);
+            persistDebugPerf(false);
+            syncHashState();
+            render('debug-disable');
+        },
+    };
+}
+
+async function tcaApi(path, options = {}, meta = {}) {
+    const trace = PAGE.instrumentation.beginFetch(meta.key || path, {
+        path,
+        ...meta,
+    });
+    try {
+        const payload = await api(path, options);
+        trace.finish('ok');
+        return payload;
+    } catch (err) {
+        trace.finish(err?.name === 'AbortError' ? 'abort' : 'error', {
+            message: err?.message || null,
+        });
+        throw err;
+    }
+}
 
 export function renderTcaPage(container) {
     cleanup();
 
     PAGE.container = container;
+    PAGE.instrumentation.reset();
     PAGE.filters = { ...DEFAULT_FILTERS };
+    PAGE.tab = DEFAULT_TAB;
+    PAGE.sortBy = DEFAULT_SORT_BY;
+    PAGE.sortDir = DEFAULT_SORT_DIR;
+    PAGE.page = 1;
+    PAGE.pageSize = DEFAULT_PAGE_SIZE;
     PAGE.loading = false;
     PAGE.error = null;
-    PAGE.data = null;
+    PAGE.overviewLoading = false;
+    PAGE.lifecycleLoading = false;
+    PAGE.data = {
+        rollups: [],
+        strategyRollups: [],
+        strategySessions: [],
+    };
+    PAGE.lifecyclePage = {
+        items: [],
+        page: 1,
+        pageSize: DEFAULT_PAGE_SIZE,
+        total: 0,
+        totalPages: 0,
+        hasPrev: false,
+        hasNext: false,
+        sortBy: DEFAULT_SORT_BY,
+        sortDir: DEFAULT_SORT_DIR,
+    };
+    PAGE.strategyPage = {
+        items: [],
+        page: 1,
+        pageSize: DEFAULT_STRATEGY_PAGE_SIZE,
+        total: 0,
+        totalPages: 0,
+        hasPrev: false,
+        hasNext: false,
+        sortBy: DEFAULT_STRATEGY_SORT_BY,
+        sortDir: DEFAULT_STRATEGY_SORT_DIR,
+    };
+    PAGE.strategyTimelinePage = 1;
+    PAGE.strategyTimelinePageSize = DEFAULT_TIMELINE_PAGE_SIZE;
     PAGE.selectedLifecycleId = null;
+    PAGE.selectedStrategySessionId = null;
     PAGE.detail = null;
     PAGE.detailLoading = false;
+    PAGE.detailError = null;
+    PAGE.strategyLoading = false;
+    PAGE.strategyDetailLoading = false;
+    PAGE.strategyTimeseriesLoading = false;
+    PAGE.strategyLedgerLoading = false;
+    PAGE.strategyLineageLoading = false;
+    PAGE.strategyParamsExpanded = false;
+    PAGE.strategyDetail = null;
+    PAGE.strategyTimeseries = null;
+    PAGE.strategyLedger = null;
+    PAGE.pendingStrategyRefresh = null;
+    PAGE.graphTruncatedCount = 0;
+    PAGE.truncatedLifecycleIds = new Set();
+    PAGE.debugPerf = readPersistedDebugPerf();
 
+    applyHashState(parseTcaHashState(location.hash));
+    PAGE.instrumentation.setEnabled(PAGE.debugPerf);
+    publishDebugApi();
     bindEvents();
+    syncHashState();
+
     PAGE.unsubscribe = subscribeAppStore(({ type }) => {
-        if (type === 'currentAccount' && location.hash === '#/tca') {
+        if (type === 'currentAccount' && location.hash.startsWith('#/tca')) {
             PAGE.selectedLifecycleId = null;
+            PAGE.selectedStrategySessionId = null;
             PAGE.detail = null;
-            loadPage();
+            PAGE.detailError = null;
+            PAGE.strategyDetail = null;
+            PAGE.strategyTimeseries = null;
+            PAGE.strategyLedger = null;
+            PAGE.page = 1;
+            PAGE.strategyPage.page = 1;
+            PAGE.strategyTimelinePage = 1;
+            loadInitialData();
         }
     });
+
     PAGE.refreshTimer = setInterval(() => {
-        if (PAGE.container && location.hash === '#/tca') loadPage({ silent: true });
+        if (!PAGE.container || !location.hash.startsWith('#/tca')) return;
+        PAGE.instrumentation.recordSchedule('timer.page-refresh', { delayMs: 30000, source: 'interval' });
+        refreshFromTimer();
     }, 30000);
 
-    render();
-    loadPage();
+    PAGE.strategyLiveTimer = setInterval(() => {
+        if (!PAGE.container || PAGE.tab !== 'strategies' || !PAGE.selectedStrategySessionId) return;
+        if (!isSelectedStrategyLive()) return;
+        PAGE.instrumentation.recordSchedule('timer.strategy-live', { delayMs: 5000, source: 'interval' });
+        loadStrategyPage({ silent: true });
+        loadStrategySessionBundle(PAGE.selectedStrategySessionId, {
+            silent: true,
+            parts: { detail: false, timeseries: true, ledger: false, lineage: false },
+        });
+    }, 5000);
+
+    PAGE._lifecycleHandler = (e) => {
+        const id = e?.detail?.lifecycleId;
+        if (!id || !PAGE.container) return;
+        PAGE.tab = 'lifecycles';
+        PAGE.selectedLifecycleId = id;
+        PAGE.detail = null;
+        syncHashState();
+        render('external-open-lifecycle');
+        loadLifecycleDetail(id);
+    };
+    window.addEventListener('open_lifecycle', PAGE._lifecycleHandler);
+
+    PAGE._lifecycleByOrderHandler = async (e) => {
+        const clientOrderId = e?.detail?.clientOrderId;
+        if (!clientOrderId || !PAGE.container || !state.currentAccount) return;
+
+        const existing = (PAGE.lifecyclePage?.items || []).find((lc) => lc.clientOrderId === clientOrderId);
+        if (existing) {
+            PAGE.tab = 'lifecycles';
+            PAGE.selectedLifecycleId = existing.lifecycleId;
+            PAGE.detail = null;
+            syncHashState();
+            render('lookup-open-lifecycle');
+            loadLifecycleDetail(existing.lifecycleId);
+            return;
+        }
+
+        try {
+            const results = await tcaApi(
+                `/trade/tca/lifecycles/${state.currentAccount}?clientOrderId=${encodeURIComponent(clientOrderId)}&limit=1`,
+                {},
+                { key: 'lookup.lifecycle-by-order' },
+            );
+            const lc = Array.isArray(results) && results[0];
+            if (lc?.lifecycleId) {
+                PAGE.tab = 'lifecycles';
+                PAGE.selectedLifecycleId = lc.lifecycleId;
+                PAGE.detail = null;
+                syncHashState();
+                render('lookup-open-lifecycle');
+                loadLifecycleDetail(lc.lifecycleId);
+            }
+        } catch {
+            showToast('Could not find lifecycle for this order', 'warning');
+        }
+    };
+    window.addEventListener('open_lifecycle_by_order', PAGE._lifecycleByOrderHandler);
+
+    registerWsRefreshListeners();
+    render('mount');
+    loadInitialData();
 }
 
 export function cleanup() {
     if (PAGE.refreshTimer) clearInterval(PAGE.refreshTimer);
+    if (PAGE.strategyLiveTimer) clearInterval(PAGE.strategyLiveTimer);
     if (PAGE.inputTimer) clearTimeout(PAGE.inputTimer);
+    if (PAGE.wsLifecycleTimer) clearTimeout(PAGE.wsLifecycleTimer);
+    if (PAGE.wsOverviewTimer) clearTimeout(PAGE.wsOverviewTimer);
+    if (PAGE.wsDetailTimer) clearTimeout(PAGE.wsDetailTimer);
+    if (PAGE.wsStrategyListTimer) clearTimeout(PAGE.wsStrategyListTimer);
+    if (PAGE.wsStrategyDetailTimer) clearTimeout(PAGE.wsStrategyDetailTimer);
     if (PAGE.unsubscribe) PAGE.unsubscribe();
+
+    if (PAGE.controllers.overview) PAGE.controllers.overview.abort();
+    if (PAGE.controllers.lifecycles) PAGE.controllers.lifecycles.abort();
+    if (PAGE.controllers.detail) PAGE.controllers.detail.abort();
+    if (PAGE.controllers.detailLineage) PAGE.controllers.detailLineage.abort();
+    if (PAGE.controllers.strategies) PAGE.controllers.strategies.abort();
+    if (PAGE.controllers.strategyDetail) PAGE.controllers.strategyDetail.abort();
+    if (PAGE.controllers.strategyTimeseries) PAGE.controllers.strategyTimeseries.abort();
+    if (PAGE.controllers.strategyLedger) PAGE.controllers.strategyLedger.abort();
+    if (PAGE.controllers.strategyLineage) PAGE.controllers.strategyLineage.abort();
+
     if (PAGE.container && PAGE.onClick) PAGE.container.removeEventListener('click', PAGE.onClick);
     if (PAGE.container && PAGE.onInput) PAGE.container.removeEventListener('input', PAGE.onInput);
     if (PAGE.container && PAGE.onChange) PAGE.container.removeEventListener('change', PAGE.onChange);
+    if (PAGE._lifecycleHandler) window.removeEventListener('open_lifecycle', PAGE._lifecycleHandler);
+    if (PAGE._lifecycleByOrderHandler) window.removeEventListener('open_lifecycle_by_order', PAGE._lifecycleByOrderHandler);
+
+    for (const { eventName, handler } of PAGE.wsHandlers) {
+        window.removeEventListener(eventName, handler);
+    }
+    PAGE.wsHandlers = [];
 
     PAGE.container = null;
     PAGE.unsubscribe = null;
     PAGE.refreshTimer = null;
+    PAGE.strategyLiveTimer = null;
     PAGE.inputTimer = null;
+    PAGE.wsLifecycleTimer = null;
+    PAGE.wsOverviewTimer = null;
+    PAGE.wsDetailTimer = null;
+    PAGE.wsStrategyListTimer = null;
+    PAGE.wsStrategyDetailTimer = null;
+    PAGE.strategyParamsExpanded = false;
     PAGE.onClick = null;
     PAGE.onInput = null;
     PAGE.onChange = null;
+    PAGE._lifecycleHandler = null;
+    PAGE._lifecycleByOrderHandler = null;
+    PAGE.controllers.overview = null;
+    PAGE.controllers.lifecycles = null;
+    PAGE.controllers.detail = null;
+    PAGE.controllers.detailLineage = null;
+    PAGE.controllers.strategies = null;
+    PAGE.controllers.strategyDetail = null;
+    PAGE.controllers.strategyTimeseries = null;
+    PAGE.controllers.strategyLedger = null;
+    PAGE.controllers.strategyLineage = null;
+    PAGE.debugPerf = false;
+}
+
+function parseTcaHashState(hash) {
+    const stateFromHash = {
+        tab: DEFAULT_TAB,
+        page: 1,
+        pageSize: DEFAULT_PAGE_SIZE,
+        sortBy: DEFAULT_SORT_BY,
+        sortDir: DEFAULT_SORT_DIR,
+        strategyPage: 1,
+        strategyPageSize: DEFAULT_STRATEGY_PAGE_SIZE,
+        strategySortBy: DEFAULT_STRATEGY_SORT_BY,
+        strategySortDir: DEFAULT_STRATEGY_SORT_DIR,
+        selectedStrategySessionId: null,
+        filters: { ...DEFAULT_FILTERS },
+        debugPerf: readPersistedDebugPerf(),
+    };
+    if (!hash || !hash.startsWith('#/tca')) return stateFromHash;
+    const qIndex = hash.indexOf('?');
+    if (qIndex < 0) return stateFromHash;
+
+    const params = new URLSearchParams(hash.slice(qIndex + 1));
+    const tab = String(params.get('tab') || DEFAULT_TAB).toLowerCase();
+    if (TCA_TABS.has(tab)) stateFromHash.tab = tab;
+
+    stateFromHash.page = Math.max(1, Number.parseInt(params.get('page'), 10) || 1);
+    const pageSize = Number.parseInt(params.get('pageSize'), 10);
+    stateFromHash.pageSize = PAGE_SIZES.includes(pageSize) ? pageSize : DEFAULT_PAGE_SIZE;
+
+    const sortBy = String(params.get('sortBy') || DEFAULT_SORT_BY);
+    stateFromHash.sortBy = sortBy || DEFAULT_SORT_BY;
+    stateFromHash.sortDir = String(params.get('sortDir') || DEFAULT_SORT_DIR).toLowerCase() === 'asc' ? 'asc' : 'desc';
+
+    stateFromHash.filters.symbol = String(params.get('symbol') || '');
+    stateFromHash.filters.strategyType = String(params.get('strategyType') || '');
+    stateFromHash.filters.finalStatus = String(params.get('finalStatus') || DEFAULT_FILTERS.finalStatus);
+    stateFromHash.filters.strategyStatus = String(params.get('sessionStatus') || '');
+    stateFromHash.filters.lookback = String(params.get('lookback') || DEFAULT_FILTERS.lookback);
+    stateFromHash.filters.includeNonHard = params.get('includeNonHard') === '1';
+    stateFromHash.selectedStrategySessionId = String(params.get('sessionId') || '') || null;
+
+    stateFromHash.strategyPage = Math.max(1, Number.parseInt(params.get('strategyPage'), 10) || 1);
+    const strategyPageSize = Number.parseInt(params.get('strategyPageSize'), 10);
+    stateFromHash.strategyPageSize = PAGE_SIZES.includes(strategyPageSize) ? strategyPageSize : DEFAULT_STRATEGY_PAGE_SIZE;
+    stateFromHash.strategySortBy = String(params.get('strategySortBy') || DEFAULT_STRATEGY_SORT_BY) || DEFAULT_STRATEGY_SORT_BY;
+    stateFromHash.strategySortDir = String(params.get('strategySortDir') || DEFAULT_STRATEGY_SORT_DIR).toLowerCase() === 'asc' ? 'asc' : 'desc';
+
+    const benchmark = Number.parseInt(params.get('benchmarkMs'), 10);
+    if ([1000, 5000, 30000].includes(benchmark)) stateFromHash.filters.benchmarkMs = benchmark;
+    if (params.has('debugPerf')) stateFromHash.debugPerf = params.get('debugPerf') === '1';
+
+    return stateFromHash;
+}
+
+function applyHashState(nextState) {
+    PAGE.tab = nextState.tab;
+    PAGE.page = nextState.page;
+    PAGE.pageSize = nextState.pageSize;
+    PAGE.sortBy = nextState.sortBy;
+    PAGE.sortDir = nextState.sortDir;
+    PAGE.strategyPage.page = nextState.strategyPage;
+    PAGE.strategyPage.pageSize = nextState.strategyPageSize;
+    PAGE.strategyPage.sortBy = nextState.strategySortBy;
+    PAGE.strategyPage.sortDir = nextState.strategySortDir;
+    PAGE.selectedStrategySessionId = nextState.selectedStrategySessionId;
+    PAGE.filters = { ...DEFAULT_FILTERS, ...nextState.filters };
+    PAGE.debugPerf = !!nextState.debugPerf;
+    PAGE.instrumentation.setEnabled(PAGE.debugPerf);
+    persistDebugPerf(PAGE.debugPerf);
+}
+
+function syncHashState() {
+    const params = new URLSearchParams();
+    params.set('tab', PAGE.tab);
+    params.set('page', String(PAGE.page));
+    params.set('pageSize', String(PAGE.pageSize));
+    params.set('sortBy', PAGE.sortBy);
+    params.set('sortDir', PAGE.sortDir);
+    params.set('strategyPage', String(PAGE.strategyPage.page));
+    params.set('strategyPageSize', String(PAGE.strategyPage.pageSize));
+    params.set('strategySortBy', PAGE.strategyPage.sortBy);
+    params.set('strategySortDir', PAGE.strategyPage.sortDir);
+    if (PAGE.filters.symbol) params.set('symbol', PAGE.filters.symbol);
+    if (PAGE.filters.strategyType) params.set('strategyType', PAGE.filters.strategyType);
+    if (PAGE.filters.finalStatus) params.set('finalStatus', PAGE.filters.finalStatus);
+    if (PAGE.filters.strategyStatus) params.set('sessionStatus', PAGE.filters.strategyStatus);
+    if (PAGE.filters.lookback !== DEFAULT_FILTERS.lookback) params.set('lookback', PAGE.filters.lookback);
+    if (PAGE.filters.includeNonHard) params.set('includeNonHard', '1');
+    if (PAGE.filters.benchmarkMs !== DEFAULT_FILTERS.benchmarkMs) params.set('benchmarkMs', String(PAGE.filters.benchmarkMs));
+    if (PAGE.selectedStrategySessionId) params.set('sessionId', PAGE.selectedStrategySessionId);
+    if (PAGE.debugPerf) params.set('debugPerf', '1');
+    const nextHash = `#/tca?${params.toString()}`;
+    if (location.hash !== nextHash) {
+        history.replaceState(null, '', nextHash);
+    }
+}
+
+function renderInfoHelp(tip) {
+    if (!tip) return '';
+    return `<span class="tca-kpi-help">ⓘ<span class="tca-tip">${escapeHtml(tip)}</span></span>`;
+}
+
+function isSelectedStrategyLive() {
+    const selected = PAGE.strategyPage.items.find((row) => row.strategySessionId === PAGE.selectedStrategySessionId);
+    const runtimeStatus = PAGE.strategyDetail?.runtime?.status || selected?.runtimeStatus || '';
+    return String(runtimeStatus).toUpperCase() === 'ACTIVE';
+}
+
+function roleDescription(role) {
+    return ROLE_LABELS[String(role || 'UNKNOWN').toUpperCase()] || ROLE_LABELS.UNKNOWN;
+}
+
+function mergeStrategyLineage(strategySessionId, lineageGraph, lineGraphState = {}) {
+    if (PAGE.selectedStrategySessionId !== strategySessionId) return;
+    PAGE.strategyDetail = {
+        ...(PAGE.strategyDetail || {}),
+        lineageGraph: lineageGraph || null,
+        lineageGraphLoading: !!lineGraphState.loading,
+        lineageGraphError: lineGraphState.error || null,
+    };
+}
+
+function hasRoleMetrics(roleMetrics) {
+    return !!roleMetrics && Object.keys(roleMetrics).length > 0;
+}
+
+function aggregateRoleMetricMaps(metricMaps = []) {
+    const buckets = new Map();
+    for (const metricMap of metricMaps) {
+        if (!metricMap || typeof metricMap !== 'object') continue;
+        for (const [roleKey, metrics] of Object.entries(metricMap)) {
+            const role = String(roleKey || 'UNKNOWN').toUpperCase();
+            if (!metrics || typeof metrics !== 'object') continue;
+            const bucket = buckets.get(role) || {
+                lifecycleCount: 0,
+                fillCount: 0,
+                arrivalTotal: 0,
+                arrivalWeight: 0,
+                mark1Total: 0,
+                mark1Weight: 0,
+                mark5Total: 0,
+                mark5Weight: 0,
+                mark30Total: 0,
+                mark30Weight: 0,
+            };
+            const lifecycleCount = Number.isFinite(metrics.lifecycleCount) ? Number(metrics.lifecycleCount) : 0;
+            const fillCount = Number.isFinite(metrics.fillCount) ? Number(metrics.fillCount) : 0;
+            const arrivalWeight = lifecycleCount > 0 ? lifecycleCount : (Number.isFinite(metrics.avgArrivalSlippageBps) ? 1 : 0);
+            const markWeight = fillCount > 0 ? fillCount : (lifecycleCount > 0 ? lifecycleCount : 0);
+
+            bucket.lifecycleCount += lifecycleCount;
+            bucket.fillCount += fillCount;
+            if (Number.isFinite(metrics.avgArrivalSlippageBps) && arrivalWeight > 0) {
+                bucket.arrivalTotal += Number(metrics.avgArrivalSlippageBps) * arrivalWeight;
+                bucket.arrivalWeight += arrivalWeight;
+            }
+            if (Number.isFinite(metrics.avgMarkout1sBps) && markWeight > 0) {
+                bucket.mark1Total += Number(metrics.avgMarkout1sBps) * markWeight;
+                bucket.mark1Weight += markWeight;
+            }
+            if (Number.isFinite(metrics.avgMarkout5sBps) && markWeight > 0) {
+                bucket.mark5Total += Number(metrics.avgMarkout5sBps) * markWeight;
+                bucket.mark5Weight += markWeight;
+            }
+            if (Number.isFinite(metrics.avgMarkout30sBps) && markWeight > 0) {
+                bucket.mark30Total += Number(metrics.avgMarkout30sBps) * markWeight;
+                bucket.mark30Weight += markWeight;
+            }
+            buckets.set(role, bucket);
+        }
+    }
+
+    const out = {};
+    for (const [role, bucket] of buckets.entries()) {
+        const avgArrivalSlippageBps = bucket.arrivalWeight > 0 ? bucket.arrivalTotal / bucket.arrivalWeight : null;
+        const avgMarkout1sBps = bucket.mark1Weight > 0 ? bucket.mark1Total / bucket.mark1Weight : null;
+        const avgMarkout5sBps = bucket.mark5Weight > 0 ? bucket.mark5Total / bucket.mark5Weight : null;
+        const avgMarkout30sBps = bucket.mark30Weight > 0 ? bucket.mark30Total / bucket.mark30Weight : null;
+        out[role] = {
+            lifecycleCount: bucket.lifecycleCount,
+            fillCount: bucket.fillCount,
+            avgArrivalSlippageBps,
+            avgMarkout1sBps,
+            avgMarkout5sBps,
+            avgMarkout30sBps,
+            toxicityScore: computeToxicityScore(avgArrivalSlippageBps, avgMarkout1sBps, avgMarkout5sBps),
+        };
+    }
+    return out;
+}
+
+function extractRoleMetricsFromLifecycleRows(lifecycles = []) {
+    return aggregateRoleMetricMaps((lifecycles || []).map((row) => ({
+        [String(row.orderRole || 'UNKNOWN').toUpperCase()]: {
+            lifecycleCount: 1,
+            fillCount: Number(row.fillCount || 0),
+            avgArrivalSlippageBps: Number.isFinite(row.arrivalSlippageBps) ? row.arrivalSlippageBps : null,
+            avgMarkout1sBps: Number.isFinite(row.avgMarkout1sBps) ? row.avgMarkout1sBps : null,
+            avgMarkout5sBps: Number.isFinite(row.avgMarkout5sBps) ? row.avgMarkout5sBps : null,
+            avgMarkout30sBps: Number.isFinite(row.avgMarkout30sBps) ? row.avgMarkout30sBps : null,
+        },
+    })));
+}
+
+function resolveLineageRoleMetrics(primaryRollup, strategyRollups = [], lifecycles = []) {
+    const primaryMetrics = extractRoleMetrics(primaryRollup);
+    if (hasRoleMetrics(primaryMetrics)) return primaryMetrics;
+    const strategyMetrics = aggregateRoleMetricMaps((strategyRollups || []).map((row) => extractRoleMetrics(row)));
+    if (hasRoleMetrics(strategyMetrics)) return strategyMetrics;
+    return extractRoleMetricsFromLifecycleRows(lifecycles);
+}
+
+function ensureLineagePreviewSelection() {
+    if (PAGE.tab !== 'lineage') return false;
+    const items = Array.isArray(PAGE.lifecyclePage?.items) ? PAGE.lifecyclePage.items : [];
+    if (!items.length) return false;
+    const stillVisible = PAGE.selectedLifecycleId
+        ? items.some((row) => row.lifecycleId === PAGE.selectedLifecycleId)
+        : false;
+    if (stillVisible) return false;
+    PAGE.selectedLifecycleId = items[0].lifecycleId;
+    PAGE.detail = null;
+    PAGE.detailError = null;
+    loadLifecycleDetail(PAGE.selectedLifecycleId, { silent: true });
+    return true;
 }
 
 function bindEvents() {
@@ -83,14 +662,43 @@ function bindEvents() {
         if (actionEl) {
             const { action } = actionEl.dataset;
             if (action === 'refresh') {
-                loadPage();
+                loadOverview();
+                return;
+            }
+            if (action === 'refresh-lifecycles') {
+                loadLifecyclePage();
+                return;
+            }
+            if (action === 'refresh-strategies') {
+                loadStrategyPage();
+                if (PAGE.selectedStrategySessionId) loadStrategySessionBundle(PAGE.selectedStrategySessionId);
+                return;
+            }
+            if (action === 'reset-debug-metrics') {
+                PAGE.instrumentation.reset();
+                render('debug-reset');
                 return;
             }
             if (action === 'set-benchmark') {
                 const next = Number.parseInt(actionEl.dataset.benchmarkMs || '', 10);
                 if (Number.isFinite(next)) {
                     PAGE.filters.benchmarkMs = next;
-                    render();
+                    syncHashState();
+                    render('benchmark-change');
+                }
+                return;
+            }
+            if (action === 'set-tab') {
+                const tab = String(actionEl.dataset.tab || '').toLowerCase();
+                if (!TCA_TABS.has(tab)) return;
+                PAGE.tab = tab;
+                syncHashState();
+                render('tab-change');
+                if (tab === 'overview') loadOverview({ silent: true });
+                if (tab === 'lifecycles') loadLifecyclePage({ silent: true });
+                if (tab === 'strategies') {
+                    loadStrategyPage({ silent: true });
+                    if (PAGE.selectedStrategySessionId) loadStrategySessionBundle(PAGE.selectedStrategySessionId, { silent: true });
                 }
                 return;
             }
@@ -98,7 +706,7 @@ function bindEvents() {
                 PAGE.selectedLifecycleId = null;
                 PAGE.detail = null;
                 PAGE.detailLoading = false;
-                render();
+                render('drawer-close');
                 return;
             }
             if (action === 'open-lifecycle') {
@@ -106,9 +714,142 @@ function bindEvents() {
                 if (lifecycleId) {
                     PAGE.selectedLifecycleId = lifecycleId;
                     PAGE.detail = null;
+                    PAGE.detailError = null;
+                    render('open-lifecycle');
                     loadLifecycleDetail(lifecycleId);
-                    render();
                 }
+                return;
+            }
+            if (action === 'inspect-lineage') {
+                const lifecycleId = actionEl.dataset.lifecycleId;
+                if (lifecycleId) {
+                    PAGE.tab = 'lifecycles';
+                    PAGE.selectedLifecycleId = lifecycleId;
+                    PAGE.detail = null;
+                    PAGE.detailError = null;
+                    syncHashState();
+                    render('inspect-lineage');
+                    loadLifecycleDetail(lifecycleId);
+                }
+                return;
+            }
+            if (action === 'set-page') {
+                const page = Math.max(1, Number.parseInt(actionEl.dataset.page || '', 10) || 1);
+                if (page === PAGE.page) return;
+                PAGE.page = page;
+                syncHashState();
+                render('lifecycle-page-change');
+                loadLifecyclePage({ silent: true });
+                return;
+            }
+            if (action === 'sort-lifecycles') {
+                const sortBy = String(actionEl.dataset.sortBy || DEFAULT_SORT_BY);
+                if (sortBy === PAGE.sortBy) {
+                    PAGE.sortDir = PAGE.sortDir === 'asc' ? 'desc' : 'asc';
+                } else {
+                    PAGE.sortBy = sortBy;
+                    PAGE.sortDir = 'desc';
+                }
+                PAGE.page = 1;
+                syncHashState();
+                render('lifecycle-sort-change');
+                loadLifecyclePage({ silent: true });
+                return;
+            }
+            if (action === 'jump-page') {
+                const input = PAGE.container.querySelector('[data-jump-page]');
+                const value = Number.parseInt(input?.value || '', 10);
+                const maxPage = Math.max(1, PAGE.lifecyclePage.totalPages || 1);
+                if (!Number.isFinite(value)) return;
+                const nextPage = Math.min(maxPage, Math.max(1, value));
+                if (nextPage === PAGE.page) return;
+                PAGE.page = nextPage;
+                syncHashState();
+                render('lifecycle-jump-page');
+                loadLifecyclePage({ silent: true });
+                return;
+            }
+            if (action === 'open-strategy-session') {
+                const strategySessionId = actionEl.dataset.sessionId;
+                if (!strategySessionId) return;
+                PAGE.selectedStrategySessionId = strategySessionId;
+                PAGE.strategyTimelinePage = 1;
+                PAGE.strategyParamsExpanded = false;
+                PAGE.strategyDetail = null;
+                PAGE.strategyTimeseries = null;
+                PAGE.strategyLedger = null;
+                PAGE.tab = 'strategies';
+                syncHashState();
+                render('strategy-open');
+                loadStrategySessionBundle(strategySessionId);
+                return;
+            }
+            if (action === 'open-strategy-modal') {
+                const strategySessionId = actionEl.dataset.sessionId;
+                const subAccountId = actionEl.dataset.subAccountId || state.currentAccount;
+                if (!strategySessionId || !subAccountId) return;
+                void openTcaStrategyModal({
+                    subAccountId,
+                    strategySessionId,
+                });
+                return;
+            }
+            if (action === 'toggle-parameter-evolution') {
+                PAGE.strategyParamsExpanded = !PAGE.strategyParamsExpanded;
+                render('toggle-params');
+                if (PAGE.strategyParamsExpanded && PAGE.selectedStrategySessionId) {
+                    loadStrategySessionBundle(PAGE.selectedStrategySessionId, {
+                        silent: true,
+                        parts: { detail: false, timeseries: true, ledger: false, lineage: false },
+                    });
+                }
+                return;
+            }
+            if (action === 'set-timeline-page') {
+                const page = Math.max(1, Number.parseInt(actionEl.dataset.page || '', 10) || 1);
+                if (page === PAGE.strategyTimelinePage || !PAGE.selectedStrategySessionId) return;
+                PAGE.strategyTimelinePage = page;
+                render('timeline-page-change');
+                loadStrategySessionBundle(PAGE.selectedStrategySessionId, {
+                    silent: true,
+                    parts: { detail: false, timeseries: true, ledger: false, lineage: false },
+                });
+                return;
+            }
+            if (action === 'set-strategy-page') {
+                const page = Math.max(1, Number.parseInt(actionEl.dataset.page || '', 10) || 1);
+                if (page === PAGE.strategyPage.page) return;
+                PAGE.strategyPage.page = page;
+                syncHashState();
+                render('strategy-page-change');
+                loadStrategyPage({ silent: true });
+                return;
+            }
+            if (action === 'sort-strategies') {
+                const sortBy = String(actionEl.dataset.sortBy || DEFAULT_STRATEGY_SORT_BY);
+                if (sortBy === PAGE.strategyPage.sortBy) {
+                    PAGE.strategyPage.sortDir = PAGE.strategyPage.sortDir === 'asc' ? 'desc' : 'asc';
+                } else {
+                    PAGE.strategyPage.sortBy = sortBy;
+                    PAGE.strategyPage.sortDir = 'desc';
+                }
+                PAGE.strategyPage.page = 1;
+                syncHashState();
+                render('strategy-sort-change');
+                loadStrategyPage({ silent: true });
+                return;
+            }
+            if (action === 'jump-strategy-page') {
+                const input = PAGE.container.querySelector('[data-jump-strategy-page]');
+                const value = Number.parseInt(input?.value || '', 10);
+                const maxPage = Math.max(1, PAGE.strategyPage.totalPages || 1);
+                if (!Number.isFinite(value)) return;
+                const nextPage = Math.min(maxPage, Math.max(1, value));
+                if (nextPage === PAGE.strategyPage.page) return;
+                PAGE.strategyPage.page = nextPage;
+                syncHashState();
+                render('strategy-jump-page');
+                loadStrategyPage({ silent: true });
                 return;
             }
         }
@@ -117,7 +858,7 @@ function bindEvents() {
             PAGE.selectedLifecycleId = null;
             PAGE.detail = null;
             PAGE.detailLoading = false;
-            render();
+            render('drawer-overlay-close');
         }
     };
 
@@ -125,19 +866,58 @@ function bindEvents() {
         const target = event.target.closest('[data-filter]');
         if (!target || target.dataset.filter !== 'symbol') return;
         PAGE.filters.symbol = target.value.trim().toUpperCase();
+        PAGE.page = 1;
+        PAGE.strategyPage.page = 1;
+        PAGE.strategyTimelinePage = 1;
         debounceReload();
     };
 
     PAGE.onChange = (event) => {
-        const target = event.target.closest('[data-filter]');
+        const target = event.target;
         if (!target) return;
 
-        const { filter } = target.dataset;
-        if (filter === 'strategyType') PAGE.filters.strategyType = target.value;
-        if (filter === 'finalStatus') PAGE.filters.finalStatus = target.value;
-        if (filter === 'lookback') PAGE.filters.lookback = target.value;
-        if (filter === 'includeNonHard') PAGE.filters.includeNonHard = !!target.checked;
-        loadPage();
+        if (target.dataset?.action === 'set-page-size') {
+            const nextSize = Number.parseInt(target.value, 10);
+            if (!PAGE_SIZES.includes(nextSize)) return;
+            PAGE.pageSize = nextSize;
+            PAGE.page = 1;
+            syncHashState();
+            render('lifecycle-page-size');
+            loadLifecyclePage({ silent: true });
+            return;
+        }
+        if (target.dataset?.action === 'set-strategy-page-size') {
+            const nextSize = Number.parseInt(target.value, 10);
+            if (!PAGE_SIZES.includes(nextSize)) return;
+            PAGE.strategyPage.pageSize = nextSize;
+            PAGE.strategyPage.page = 1;
+            syncHashState();
+            render('strategy-page-size');
+            loadStrategyPage({ silent: true });
+            return;
+        }
+
+        const filterTarget = target.closest('[data-filter]');
+        if (!filterTarget) return;
+
+        const { filter } = filterTarget.dataset;
+        if (filter === 'strategyType') PAGE.filters.strategyType = filterTarget.value;
+        if (filter === 'finalStatus') PAGE.filters.finalStatus = filterTarget.value;
+        if (filter === 'strategyStatus') PAGE.filters.strategyStatus = filterTarget.value;
+        if (filter === 'lookback') PAGE.filters.lookback = filterTarget.value;
+        if (filter === 'includeNonHard') PAGE.filters.includeNonHard = !!filterTarget.checked;
+        PAGE.page = 1;
+        PAGE.strategyPage.page = 1;
+        PAGE.strategyTimelinePage = 1;
+        syncHashState();
+        loadOverview();
+        if (PAGE.tab === 'lifecycles') {
+            loadLifecyclePage({ silent: true });
+        }
+        if (PAGE.tab === 'strategies' || PAGE.selectedStrategySessionId) {
+            loadStrategyPage({ silent: true });
+            if (PAGE.selectedStrategySessionId) loadStrategySessionBundle(PAGE.selectedStrategySessionId, { silent: true });
+        }
     };
 
     PAGE.container.addEventListener('click', PAGE.onClick);
@@ -147,30 +927,67 @@ function bindEvents() {
 
 function debounceReload() {
     if (PAGE.inputTimer) clearTimeout(PAGE.inputTimer);
-    PAGE.inputTimer = setTimeout(() => loadPage(), 400);
+    PAGE.instrumentation.recordSchedule('filters.symbol-input', { delayMs: 400, source: 'input' });
+    PAGE.inputTimer = setTimeout(() => {
+        syncHashState();
+        loadOverview();
+        if (PAGE.tab === 'lifecycles') {
+            loadLifecyclePage({ silent: true });
+        }
+        if (PAGE.tab === 'strategies' || PAGE.selectedStrategySessionId) {
+            loadStrategyPage({ silent: true });
+            if (PAGE.selectedStrategySessionId) loadStrategySessionBundle(PAGE.selectedStrategySessionId, { silent: true });
+        }
+    }, 400);
 }
 
-async function loadPage({ silent = false } = {}) {
+function nextRequestController(key) {
+    if (PAGE.controllers[key]) {
+        PAGE.controllers[key].abort();
+    }
+    const controller = new AbortController();
+    PAGE.controllers[key] = controller;
+    return controller;
+}
+
+async function loadInitialData() {
     if (!PAGE.container) return;
-    const subAccountId = state.currentAccount;
-    const requestSeq = ++PAGE.requestSeq;
-
     PAGE.error = null;
-    PAGE.loading = !silent || !PAGE.data;
-    render();
+    PAGE.loading = true;
+    render('initial-loading');
 
-    if (!subAccountId) {
+    if (!state.currentAccount) {
         PAGE.loading = false;
-        PAGE.data = null;
-        render();
+        render('initial-no-account');
         return;
     }
 
-    const commonParams = buildCommonParams();
-    const lifecycleParams = new URLSearchParams(commonParams);
-    lifecycleParams.set('limit', '200');
-    if (PAGE.filters.finalStatus) lifecycleParams.set('finalStatus', PAGE.filters.finalStatus);
+    await loadOverview({ silent: true });
+    if (PAGE.tab === 'lifecycles' || PAGE.selectedLifecycleId) {
+        await loadLifecyclePage({ silent: true });
+    }
+    if (PAGE.tab === 'strategies' || PAGE.selectedStrategySessionId) {
+        await loadStrategyPage({ silent: true });
+        const strategyId = PAGE.selectedStrategySessionId || PAGE.strategyPage.items[0]?.strategySessionId || null;
+        if (strategyId) {
+            PAGE.selectedStrategySessionId = strategyId;
+            await loadStrategySessionBundle(strategyId, { silent: true });
+        }
+    }
+    PAGE.loading = false;
+    render('initial-complete');
+}
 
+async function loadOverview({ silent = false } = {}) {
+    if (!PAGE.container || !state.currentAccount) return;
+    const subAccountId = state.currentAccount;
+    const requestSeq = ++PAGE.requestSeqOverview;
+    const controller = nextRequestController('overview');
+
+    PAGE.overviewLoading = true;
+    if (!silent) render('overview-loading');
+
+    const commonParams = buildCommonParams();
     const strategyRollupParams = new URLSearchParams(commonParams);
     if (PAGE.filters.strategyType) strategyRollupParams.set('strategyType', PAGE.filters.strategyType);
 
@@ -182,55 +999,512 @@ async function loadPage({ silent = false } = {}) {
     if (lookbackStart) sessionParams.set('from', lookbackStart.toISOString());
 
     try {
-        const [rollups, strategyRollups, lifecycles, markouts, strategySessions] = await Promise.all([
-            api(`/trade/tca/rollups/${subAccountId}?${commonParams.toString()}`),
-            api(`/trade/tca/strategy-rollups/${subAccountId}?${strategyRollupParams.toString()}`),
-            api(`/trade/tca/lifecycles/${subAccountId}?${lifecycleParams.toString()}`),
-            api(`/trade/tca/markouts/${subAccountId}?${new URLSearchParams([...commonParams, ['limit', '500']]).toString()}`),
-            api(`/trade/tca/strategy-sessions/${subAccountId}?${sessionParams.toString()}`),
+        const [rollups, strategyRollups, strategySessions] = await Promise.all([
+            tcaApi(`/trade/tca/rollups/${subAccountId}?${commonParams.toString()}`, { signal: controller.signal }, { key: 'overview.rollups' }),
+            tcaApi(`/trade/tca/strategy-rollups/${subAccountId}?${strategyRollupParams.toString()}`, { signal: controller.signal }, { key: 'overview.strategy-rollups' }),
+            tcaApi(`/trade/tca/strategy-sessions/${subAccountId}?${sessionParams.toString()}`, { signal: controller.signal }, { key: 'overview.strategy-sessions' }),
         ]);
-
-        if (requestSeq !== PAGE.requestSeq) return;
-
+        if (requestSeq !== PAGE.requestSeqOverview) return;
         PAGE.data = {
             rollups: Array.isArray(rollups) ? rollups : [],
             strategyRollups: Array.isArray(strategyRollups) ? strategyRollups : [],
-            lifecycles: Array.isArray(lifecycles) ? lifecycles : [],
-            markouts: Array.isArray(markouts) ? markouts : [],
             strategySessions: Array.isArray(strategySessions) ? strategySessions : [],
         };
-        PAGE.loading = false;
         PAGE.error = null;
-        render();
-
-        if (PAGE.selectedLifecycleId) loadLifecycleDetail(PAGE.selectedLifecycleId, { silent: true });
     } catch (err) {
-        if (requestSeq !== PAGE.requestSeq) return;
-        PAGE.loading = false;
+        if (requestSeq !== PAGE.requestSeqOverview) return;
+        if (err?.name === 'AbortError') return;
         PAGE.error = err;
-        render();
+    } finally {
+        if (requestSeq !== PAGE.requestSeqOverview) return;
+        PAGE.overviewLoading = false;
+        render('overview-complete');
+    }
+}
+
+async function loadLifecyclePage({ silent = false } = {}) {
+    if (!PAGE.container || !state.currentAccount) return;
+    const subAccountId = state.currentAccount;
+    const requestSeq = ++PAGE.requestSeqLifecycle;
+    const controller = nextRequestController('lifecycles');
+
+    PAGE.lifecycleLoading = true;
+    if (!silent) render('lifecycles-loading');
+
+    const params = buildCommonParams();
+    params.set('page', String(PAGE.page));
+    params.set('pageSize', String(PAGE.pageSize));
+    params.set('sortBy', PAGE.sortBy);
+    params.set('sortDir', PAGE.sortDir);
+    if (PAGE.filters.finalStatus) params.set('finalStatus', PAGE.filters.finalStatus);
+
+    try {
+        const payload = await tcaApi(
+            `/trade/tca/lifecycles-page/${subAccountId}?${params.toString()}`,
+            { signal: controller.signal },
+            { key: 'lifecycles.page' },
+        );
+        if (requestSeq !== PAGE.requestSeqLifecycle) return;
+        PAGE.lifecyclePage = {
+            items: Array.isArray(payload?.items) ? payload.items : [],
+            page: Number(payload?.page || PAGE.page),
+            pageSize: Number(payload?.pageSize || PAGE.pageSize),
+            total: Number(payload?.total || 0),
+            totalPages: Number(payload?.totalPages || 0),
+            hasPrev: !!payload?.hasPrev,
+            hasNext: !!payload?.hasNext,
+            sortBy: String(payload?.sortBy || PAGE.sortBy),
+            sortDir: String(payload?.sortDir || PAGE.sortDir),
+        };
+        PAGE.page = PAGE.lifecyclePage.page || 1;
+        PAGE.pageSize = PAGE.lifecyclePage.pageSize || PAGE.pageSize;
+        PAGE.sortBy = PAGE.lifecyclePage.sortBy || PAGE.sortBy;
+        PAGE.sortDir = PAGE.lifecyclePage.sortDir || PAGE.sortDir;
+        ensureLineagePreviewSelection();
+        PAGE.error = null;
+    } catch (err) {
+        if (requestSeq !== PAGE.requestSeqLifecycle) return;
+        if (err?.name === 'AbortError') return;
+        PAGE.error = err;
+    } finally {
+        if (requestSeq !== PAGE.requestSeqLifecycle) return;
+        PAGE.lifecycleLoading = false;
+        render('lifecycles-complete');
     }
 }
 
 async function loadLifecycleDetail(lifecycleId, { silent = false } = {}) {
     if (!PAGE.container || !state.currentAccount || !lifecycleId) return;
     const detailSeq = ++PAGE.detailSeq;
+    const controller = nextRequestController('detail');
 
     PAGE.detailLoading = !silent || !PAGE.detail;
-    render();
+    PAGE.detailError = null;
+    render('lifecycle-detail-loading');
 
     try {
-        const detail = await api(`/trade/tca/lifecycle/${state.currentAccount}/${lifecycleId}`);
+        const detail = await tcaApi(
+            `/trade/tca/lifecycle/${state.currentAccount}/${lifecycleId}?includeLineage=0`,
+            { signal: controller.signal },
+            { key: 'lifecycle.detail' },
+        );
         if (detailSeq !== PAGE.detailSeq || PAGE.selectedLifecycleId !== lifecycleId) return;
-        PAGE.detail = detail;
+        PAGE.detail = {
+            ...detail,
+            lineageGraph: detail?.lineageGraph || null,
+            lineageGraphLoading: true,
+            lineageGraphError: null,
+        };
+        PAGE.detailError = null;
         PAGE.detailLoading = false;
-        render();
+        render('lifecycle-detail-loaded');
+        loadLifecycleLineage(lifecycleId);
     } catch (err) {
         if (detailSeq !== PAGE.detailSeq || PAGE.selectedLifecycleId !== lifecycleId) return;
+        if (err?.name === 'AbortError') return;
         PAGE.detailLoading = false;
         PAGE.detail = null;
-        showToast(err.message || 'Failed to load TCA detail', 'error');
-        render();
+        PAGE.detailError = err.message || 'Failed to load TCA detail';
+        if (!silent) showToast(err.message || 'Failed to load TCA detail', 'error');
+        render('lifecycle-detail-error');
+    }
+}
+
+async function loadLifecycleLineage(lifecycleId) {
+    if (!PAGE.container || !state.currentAccount || !lifecycleId) return;
+    const requestSeq = ++PAGE.detailLineageSeq;
+    const controller = nextRequestController('detailLineage');
+
+    if (PAGE.selectedLifecycleId === lifecycleId && PAGE.detail) {
+        PAGE.detail = {
+            ...PAGE.detail,
+            lineageGraphLoading: true,
+            lineageGraphError: null,
+        };
+        render('lifecycle-lineage-loading');
+    }
+
+    try {
+        const graph = await tcaApi(
+            `/trade/tca/lineage/${state.currentAccount}/ORDER_LIFECYCLE/${lifecycleId}`,
+            { signal: controller.signal },
+            { key: 'lifecycle.lineage' },
+        );
+        if (requestSeq !== PAGE.detailLineageSeq || PAGE.selectedLifecycleId !== lifecycleId || !PAGE.detail) return;
+        PAGE.detail = {
+            ...PAGE.detail,
+            lineageGraph: graph,
+            lineageGraphLoading: false,
+            lineageGraphError: null,
+        };
+        if (graph?.truncated && !PAGE.truncatedLifecycleIds.has(lifecycleId)) {
+            PAGE.truncatedLifecycleIds.add(lifecycleId);
+            PAGE.graphTruncatedCount += 1;
+        }
+        render('lifecycle-lineage-loaded');
+    } catch (err) {
+        if (requestSeq !== PAGE.detailLineageSeq || PAGE.selectedLifecycleId !== lifecycleId || !PAGE.detail) return;
+        if (err?.name === 'AbortError') return;
+        PAGE.detail = {
+            ...PAGE.detail,
+            lineageGraphLoading: false,
+            lineageGraphError: err.message || 'Failed to load lineage graph',
+        };
+        render('lifecycle-lineage-error');
+    }
+}
+
+async function loadStrategyPage({ silent = false } = {}) {
+    if (!PAGE.container || !state.currentAccount) return;
+    const subAccountId = state.currentAccount;
+    const requestSeq = ++PAGE.requestSeqStrategy;
+    const controller = nextRequestController('strategies');
+    PAGE.strategyLoading = true;
+    if (!silent) render('strategies-loading');
+
+    const params = new URLSearchParams();
+    params.set('page', String(PAGE.strategyPage.page));
+    params.set('pageSize', String(PAGE.strategyPage.pageSize));
+    params.set('sortBy', PAGE.strategyPage.sortBy);
+    params.set('sortDir', PAGE.strategyPage.sortDir);
+    params.set('strategyType', PAGE.filters.strategyType || 'SCALPER');
+    params.set('sessionRole', 'ROOT');
+    if (PAGE.filters.strategyStatus) params.set('status', PAGE.filters.strategyStatus);
+    if (PAGE.filters.symbol) params.set('symbol', PAGE.filters.symbol);
+    const lookbackStart = getLookbackStart(PAGE.filters.lookback);
+    if (lookbackStart) params.set('from', lookbackStart.toISOString());
+
+    const previousSelected = PAGE.selectedStrategySessionId;
+    try {
+        const payload = await tcaApi(
+            `/trade/tca/strategy-sessions-page/${subAccountId}?${params.toString()}`,
+            { signal: controller.signal },
+            { key: 'strategies.page' },
+        );
+        if (requestSeq !== PAGE.requestSeqStrategy) return;
+        PAGE.strategyPage = {
+            items: Array.isArray(payload?.items) ? payload.items : [],
+            page: Number(payload?.page || PAGE.strategyPage.page),
+            pageSize: Number(payload?.pageSize || PAGE.strategyPage.pageSize),
+            total: Number(payload?.total || 0),
+            totalPages: Number(payload?.totalPages || 0),
+            hasPrev: !!payload?.hasPrev,
+            hasNext: !!payload?.hasNext,
+            sortBy: String(payload?.sortBy || PAGE.strategyPage.sortBy),
+            sortDir: String(payload?.sortDir || PAGE.strategyPage.sortDir),
+        };
+        if (PAGE.selectedStrategySessionId) {
+            const stillVisible = PAGE.strategyPage.items.some((row) => row.strategySessionId === PAGE.selectedStrategySessionId);
+            if (!stillVisible && PAGE.strategyPage.items[0]?.strategySessionId) {
+                PAGE.selectedStrategySessionId = PAGE.strategyPage.items[0].strategySessionId;
+                PAGE.strategyTimelinePage = 1;
+            }
+        } else if (PAGE.strategyPage.items[0]?.strategySessionId) {
+            PAGE.selectedStrategySessionId = PAGE.strategyPage.items[0].strategySessionId;
+            PAGE.strategyTimelinePage = 1;
+        }
+        syncHashState();
+        PAGE.error = null;
+        if (PAGE.selectedStrategySessionId && PAGE.selectedStrategySessionId !== previousSelected && PAGE.tab === 'strategies') {
+            PAGE.strategyTimelinePage = 1;
+            PAGE.strategyDetail = null;
+            PAGE.strategyTimeseries = null;
+            PAGE.strategyLedger = null;
+            loadStrategySessionBundle(PAGE.selectedStrategySessionId, { silent: true });
+        }
+    } catch (err) {
+        if (requestSeq !== PAGE.requestSeqStrategy) return;
+        if (err?.name === 'AbortError') return;
+        PAGE.error = err;
+    } finally {
+        if (requestSeq !== PAGE.requestSeqStrategy) return;
+        PAGE.strategyLoading = false;
+        render('strategies-complete');
+    }
+}
+
+function buildStrategyTimeseriesParams() {
+    const range = new URLSearchParams();
+    range.set('series', PAGE.strategyParamsExpanded ? 'pnl,params,quality,exposure' : 'pnl,quality,exposure');
+    const lookbackStart = getLookbackStart(PAGE.filters.lookback);
+    if (lookbackStart) range.set('from', lookbackStart.toISOString());
+    range.set('to', new Date().toISOString());
+    range.set('eventsPage', String(PAGE.strategyTimelinePage));
+    range.set('eventsPageSize', String(PAGE.strategyTimelinePageSize));
+    range.set('maxPoints', '300');
+    return range;
+}
+
+async function loadStrategyDetail(strategySessionId, { silent = false } = {}) {
+    if (!PAGE.container || !state.currentAccount || !strategySessionId) return;
+    const detailSeq = ++PAGE.requestSeqStrategyDetail;
+    const controller = nextRequestController('strategyDetail');
+    PAGE.strategyDetailLoading = !silent || !PAGE.strategyDetail;
+    if (!silent) render('strategy-detail-loading');
+
+    try {
+        const detail = await tcaApi(
+            `/trade/tca/strategy-session/${state.currentAccount}/${strategySessionId}?includeLineage=0`,
+            { signal: controller.signal },
+            { key: 'strategy.detail' },
+        );
+        if (detailSeq !== PAGE.requestSeqStrategyDetail || PAGE.selectedStrategySessionId !== strategySessionId) return;
+        const previousGraph = PAGE.strategyDetail?.lineageGraph || null;
+        const previousError = PAGE.strategyDetail?.lineageGraphError || null;
+        PAGE.strategyDetail = {
+            ...detail,
+            lineageGraph: previousGraph,
+            lineageGraphLoading: PAGE.strategyLineageLoading,
+            lineageGraphError: previousError,
+        };
+        PAGE.strategyDetailLoading = false;
+        PAGE.error = null;
+        render('strategy-detail-loaded');
+    } catch (err) {
+        if (err?.name === 'AbortError') return;
+        if (detailSeq !== PAGE.requestSeqStrategyDetail || PAGE.selectedStrategySessionId !== strategySessionId) return;
+        PAGE.strategyDetailLoading = false;
+        PAGE.strategyDetail = null;
+        if (!silent) showToast(err.message || 'Failed to load strategy detail', 'error');
+        render('strategy-detail-error');
+    }
+}
+
+async function loadStrategyTimeseries(strategySessionId, { silent = false } = {}) {
+    if (!PAGE.container || !state.currentAccount || !strategySessionId) return;
+    const timeseriesSeq = ++PAGE.requestSeqStrategyTimeseries;
+    const controller = nextRequestController('strategyTimeseries');
+    PAGE.strategyTimeseriesLoading = !silent || !PAGE.strategyTimeseries;
+    if (!silent) render('strategy-timeseries-loading');
+
+    try {
+        const timeseries = await tcaApi(
+            `/trade/tca/strategy-session-timeseries/${state.currentAccount}/${strategySessionId}?${buildStrategyTimeseriesParams().toString()}`,
+            { signal: controller.signal },
+            { key: 'strategy.timeseries' },
+        );
+        if (timeseriesSeq !== PAGE.requestSeqStrategyTimeseries || PAGE.selectedStrategySessionId !== strategySessionId) return;
+        PAGE.strategyTimeseries = timeseries;
+        PAGE.strategyTimeseriesLoading = false;
+        PAGE.error = null;
+        render('strategy-timeseries-loaded');
+    } catch (err) {
+        if (err?.name === 'AbortError') return;
+        if (timeseriesSeq !== PAGE.requestSeqStrategyTimeseries || PAGE.selectedStrategySessionId !== strategySessionId) return;
+        PAGE.strategyTimeseriesLoading = false;
+        PAGE.strategyTimeseries = null;
+        if (!silent) showToast(err.message || 'Failed to load strategy timeseries', 'error');
+        render('strategy-timeseries-error');
+    }
+}
+
+async function loadStrategyLedger(strategySessionId, { silent = false } = {}) {
+    if (!PAGE.container || !state.currentAccount || !strategySessionId) return;
+    const ledgerSeq = ++PAGE.requestSeqStrategyLedger;
+    const controller = nextRequestController('strategyLedger');
+    PAGE.strategyLedgerLoading = !silent || !PAGE.strategyLedger;
+    if (!silent) render('strategy-ledger-loading');
+
+    try {
+        const ledger = await tcaApi(
+            `/trade/tca/strategy-session-lot-ledger/${state.currentAccount}/${strategySessionId}`,
+            { signal: controller.signal },
+            { key: 'strategy.ledger' },
+        );
+        if (ledgerSeq !== PAGE.requestSeqStrategyLedger || PAGE.selectedStrategySessionId !== strategySessionId) return;
+        PAGE.strategyLedger = ledger;
+        PAGE.strategyLedgerLoading = false;
+        PAGE.error = null;
+        render('strategy-ledger-loaded');
+    } catch (err) {
+        if (err?.name === 'AbortError') return;
+        if (ledgerSeq !== PAGE.requestSeqStrategyLedger || PAGE.selectedStrategySessionId !== strategySessionId) return;
+        PAGE.strategyLedgerLoading = false;
+        PAGE.strategyLedger = null;
+        if (!silent) showToast(err.message || 'Failed to load strategy lot ledger', 'error');
+        render('strategy-ledger-error');
+    }
+}
+
+async function loadStrategyLineage(strategySessionId, { silent = false } = {}) {
+    if (!PAGE.container || !state.currentAccount || !strategySessionId) return;
+    const requestSeq = ++PAGE.requestSeqStrategyLineage;
+    const controller = nextRequestController('strategyLineage');
+    PAGE.strategyLineageLoading = true;
+    mergeStrategyLineage(strategySessionId, PAGE.strategyDetail?.lineageGraph || null, { loading: true, error: null });
+    if (!silent) render('strategy-lineage-loading');
+
+    try {
+        const graph = await tcaApi(
+            `/trade/tca/lineage/${state.currentAccount}/STRATEGY_SESSION/${strategySessionId}`,
+            { signal: controller.signal },
+            { key: 'strategy.lineage' },
+        );
+        if (requestSeq !== PAGE.requestSeqStrategyLineage || PAGE.selectedStrategySessionId !== strategySessionId) return;
+        PAGE.strategyLineageLoading = false;
+        mergeStrategyLineage(strategySessionId, graph, { loading: false, error: null });
+        render('strategy-lineage-loaded');
+    } catch (err) {
+        if (err?.name === 'AbortError') return;
+        if (requestSeq !== PAGE.requestSeqStrategyLineage || PAGE.selectedStrategySessionId !== strategySessionId) return;
+        PAGE.strategyLineageLoading = false;
+        mergeStrategyLineage(strategySessionId, PAGE.strategyDetail?.lineageGraph || null, {
+            loading: false,
+            error: err.message || 'Failed to load lineage graph',
+        });
+        render('strategy-lineage-error');
+    }
+}
+
+async function loadStrategySessionBundle(
+    strategySessionId,
+    { silent = false, parts = { detail: true, timeseries: true, ledger: true, lineage: true } } = {},
+) {
+    if (!PAGE.container || !state.currentAccount || !strategySessionId) return;
+    const tasks = [];
+    if (parts.detail) tasks.push(loadStrategyDetail(strategySessionId, { silent }));
+    if (parts.timeseries) tasks.push(loadStrategyTimeseries(strategySessionId, { silent }));
+    if (parts.ledger) tasks.push(loadStrategyLedger(strategySessionId, { silent }));
+    if (parts.lineage) tasks.push(loadStrategyLineage(strategySessionId, { silent: true }));
+    if (!tasks.length) return;
+    await Promise.allSettled(tasks);
+}
+
+function registerWsRefreshListeners() {
+    for (const eventName of WS_LIFECYCLE_EVENTS) {
+        const handler = (event) => handleLifecycleWsEvent(event);
+        PAGE.wsHandlers.push({ eventName, handler });
+        window.addEventListener(eventName, handler);
+    }
+    for (const eventName of WS_OVERVIEW_EVENTS) {
+        const handler = (event) => handleOverviewWsEvent(event);
+        PAGE.wsHandlers.push({ eventName, handler });
+        window.addEventListener(eventName, handler);
+    }
+    for (const eventName of WS_STRATEGY_EVENTS) {
+        const handler = (event) => handleStrategyWsEvent(event);
+        PAGE.wsHandlers.push({ eventName, handler });
+        window.addEventListener(eventName, handler);
+    }
+}
+
+function isCurrentSubAccountEvent(detail) {
+    const eventSub = detail?.subAccountId || detail?.sub_account_id || null;
+    if (!eventSub) return true;
+    return eventSub === state.currentAccount;
+}
+
+function eventClientOrderId(detail) {
+    return detail?.clientOrderId || detail?.client_order_id || null;
+}
+
+function scheduleLifecycleRefresh() {
+    if (PAGE.wsLifecycleTimer) clearTimeout(PAGE.wsLifecycleTimer);
+    PAGE.instrumentation.recordSchedule('ws.lifecycle-refresh', { delayMs: 300, source: 'websocket' });
+    PAGE.wsLifecycleTimer = setTimeout(() => {
+        PAGE.wsLifecycleTimer = null;
+        if (!PAGE.container || !state.currentAccount) return;
+        if (PAGE.tab === 'lifecycles' || PAGE.selectedLifecycleId) {
+            loadLifecyclePage({ silent: true });
+        }
+    }, 300);
+}
+
+function scheduleOverviewRefresh() {
+    if (PAGE.wsOverviewTimer) clearTimeout(PAGE.wsOverviewTimer);
+    PAGE.instrumentation.recordSchedule('ws.overview-refresh', { delayMs: 800, source: 'websocket' });
+    PAGE.wsOverviewTimer = setTimeout(() => {
+        PAGE.wsOverviewTimer = null;
+        if (!PAGE.container || !state.currentAccount) return;
+        loadOverview({ silent: true });
+    }, 800);
+}
+
+function scheduleDetailRefresh() {
+    if (PAGE.wsDetailTimer) clearTimeout(PAGE.wsDetailTimer);
+    PAGE.instrumentation.recordSchedule('ws.detail-refresh', { delayMs: 300, source: 'websocket' });
+    PAGE.wsDetailTimer = setTimeout(() => {
+        PAGE.wsDetailTimer = null;
+        if (!PAGE.selectedLifecycleId) return;
+        loadLifecycleDetail(PAGE.selectedLifecycleId, { silent: true });
+    }, 300);
+}
+
+function scheduleStrategyListRefresh() {
+    if (PAGE.wsStrategyListTimer) clearTimeout(PAGE.wsStrategyListTimer);
+    PAGE.instrumentation.recordSchedule('ws.strategy-list-refresh', { delayMs: 800, source: 'websocket' });
+    PAGE.wsStrategyListTimer = setTimeout(() => {
+        PAGE.wsStrategyListTimer = null;
+        if (!PAGE.container || !state.currentAccount) return;
+        if (PAGE.tab === 'strategies') loadStrategyPage({ silent: true });
+    }, 800);
+}
+
+function scheduleStrategyDetailRefresh(parts = { detail: true, timeseries: true, ledger: true, lineage: false }) {
+    PAGE.pendingStrategyRefresh = {
+        detail: Boolean(PAGE.pendingStrategyRefresh?.detail || parts.detail),
+        timeseries: Boolean(PAGE.pendingStrategyRefresh?.timeseries || parts.timeseries),
+        ledger: Boolean(PAGE.pendingStrategyRefresh?.ledger || parts.ledger),
+        lineage: Boolean(PAGE.pendingStrategyRefresh?.lineage || parts.lineage),
+    };
+    if (PAGE.wsStrategyDetailTimer) clearTimeout(PAGE.wsStrategyDetailTimer);
+    PAGE.instrumentation.recordSchedule('ws.strategy-detail-refresh', { delayMs: 300, source: 'websocket' });
+    PAGE.wsStrategyDetailTimer = setTimeout(() => {
+        PAGE.wsStrategyDetailTimer = null;
+        if (!PAGE.selectedStrategySessionId) return;
+        const nextParts = PAGE.pendingStrategyRefresh || { detail: true, timeseries: true, ledger: true, lineage: false };
+        PAGE.pendingStrategyRefresh = null;
+        loadStrategySessionBundle(PAGE.selectedStrategySessionId, { silent: true, parts: nextParts });
+    }, 300);
+}
+
+function handleLifecycleWsEvent(event) {
+    const detail = event?.detail || {};
+    if (!isCurrentSubAccountEvent(detail)) return;
+    scheduleLifecycleRefresh();
+    if (PAGE.selectedLifecycleId && PAGE.detail?.clientOrderId) {
+        const coid = eventClientOrderId(detail);
+        if (coid && coid === PAGE.detail.clientOrderId) {
+            scheduleDetailRefresh();
+        }
+    }
+}
+
+function handleOverviewWsEvent(event) {
+    const detail = event?.detail || {};
+    if (!isCurrentSubAccountEvent(detail)) return;
+    scheduleOverviewRefresh();
+}
+
+function handleStrategyWsEvent(event) {
+    const detail = event?.detail || {};
+    if (!isCurrentSubAccountEvent(detail)) return;
+    scheduleStrategyListRefresh();
+    if (!PAGE.selectedStrategySessionId) return;
+    const eventType = String(event?.type || '').toLowerCase();
+    if (eventType === 'scalper_progress' || eventType === 'pnl_update') {
+        scheduleStrategyDetailRefresh({ detail: false, timeseries: true, ledger: false, lineage: false });
+        return;
+    }
+    scheduleStrategyDetailRefresh({ detail: true, timeseries: true, ledger: true, lineage: false });
+}
+
+function refreshFromTimer() {
+    loadOverview({ silent: true });
+    if (PAGE.tab === 'lifecycles' || PAGE.selectedLifecycleId) {
+        loadLifecyclePage({ silent: true });
+    }
+    if (PAGE.selectedLifecycleId) {
+        loadLifecycleDetail(PAGE.selectedLifecycleId, { silent: true });
+    }
+    if (PAGE.tab === 'strategies' || PAGE.selectedStrategySessionId) {
+        loadStrategyPage({ silent: true });
+        if (PAGE.selectedStrategySessionId) {
+            loadStrategySessionBundle(PAGE.selectedStrategySessionId, {
+                silent: true,
+                parts: { detail: true, timeseries: true, ledger: true, lineage: false },
+            });
+        }
     }
 }
 
@@ -253,146 +1527,637 @@ function getLookbackStart(lookback) {
     return null;
 }
 
-function render() {
+function renderTerminalState(name, html, reason) {
+    const changed = PAGE.container.innerHTML !== html;
+    PAGE.container.innerHTML = html;
+    PAGE.instrumentation.recordRender(name, {
+        changed,
+        durationMs: 0,
+        reason,
+        domNodes: 0,
+    });
+}
+
+function renderDebugPanel() {
+    const snapshot = PAGE.instrumentation.snapshot();
+    const renderRows = Object.entries(snapshot.renders || {})
+        .sort((left, right) => (right[1]?.count || 0) - (left[1]?.count || 0))
+        .slice(0, 6);
+    const fetchRows = Object.entries(snapshot.fetches || {})
+        .sort((left, right) => (right[1]?.started || 0) - (left[1]?.started || 0))
+        .slice(0, 6);
+    const scheduleRows = Object.entries(snapshot.schedules || {})
+        .sort((left, right) => (right[1]?.count || 0) - (left[1]?.count || 0))
+        .slice(0, 6);
+    const events = (snapshot.events || []).slice(0, 6);
+
+    const renderList = renderRows.length
+        ? renderRows.map(([name, bucket]) => `
+            <div class="tca-fill-row tca-fill-row-compact">
+                <div>
+                    <div class="tca-leader-title">${escapeHtml(name)}</div>
+                    <div class="tca-leader-subtitle">${bucket.changed} changed / ${bucket.skipped} skipped</div>
+                </div>
+                <div class="tca-muted-line">${bucket.count}x · avg ${(bucket.totalDurationMs / Math.max(bucket.count, 1)).toFixed(2)}ms</div>
+            </div>
+        `).join('')
+        : '<div class="tca-muted-line">No render samples yet.</div>';
+
+    const fetchList = fetchRows.length
+        ? fetchRows.map(([name, bucket]) => `
+            <div class="tca-fill-row tca-fill-row-compact">
+                <div>
+                    <div class="tca-leader-title">${escapeHtml(name)}</div>
+                    <div class="tca-leader-subtitle">ok ${bucket.ok} · abort ${bucket.abort} · err ${bucket.error}</div>
+                </div>
+                <div class="tca-muted-line">${bucket.started}x · avg ${(bucket.totalDurationMs / Math.max(bucket.ok + bucket.error + bucket.abort, 1)).toFixed(2)}ms</div>
+            </div>
+        `).join('')
+        : '<div class="tca-muted-line">No TCA fetches recorded yet.</div>';
+
+    const scheduleList = scheduleRows.length
+        ? scheduleRows.map(([name, bucket]) => `
+            <div class="tca-fill-row tca-fill-row-compact">
+                <div>
+                    <div class="tca-leader-title">${escapeHtml(name)}</div>
+                    <div class="tca-leader-subtitle">${escapeHtml(bucket.lastSource || 'unknown')}</div>
+                </div>
+                <div class="tca-muted-line">${bucket.count}x · ${bucket.lastDelayMs}ms</div>
+            </div>
+        `).join('')
+        : '<div class="tca-muted-line">No refresh schedules recorded yet.</div>';
+
+    const eventList = events.length
+        ? events.map((event) => `
+            <div class="tca-fill-row tca-fill-row-compact">
+                <div>
+                    <div class="tca-leader-title">${escapeHtml(event.type || 'event')} · ${escapeHtml(event.name || 'unknown')}</div>
+                    <div class="tca-leader-subtitle">${escapeHtml(event.ts || '')}</div>
+                </div>
+                <div class="tca-muted-line">${event.durationMs != null ? `${Number(event.durationMs).toFixed(2)}ms` : escapeHtml(event.source || '')}</div>
+            </div>
+        `).join('')
+        : '<div class="tca-muted-line">Recent events appear here once debug mode is enabled.</div>';
+
+    return `
+        <section class="glass-card tca-panel">
+            <div class="tca-panel-head">
+                <div>
+                    <div class="card-title">Debug Instrumentation</div>
+                    <div class="tca-panel-caption">Hash flag <code>debugPerf=1</code> enables recent-event history and keeps this panel visible.</div>
+                </div>
+                <div class="tca-panel-actions">
+                    <button class="btn btn-outline btn-sm" type="button" data-action="reset-debug-metrics">Reset Metrics</button>
+                </div>
+            </div>
+            <div class="tca-grid">
+                <div class="glass-card tca-panel">
+                    <div class="card-title">Renders</div>
+                    <div class="tca-fill-list">${renderList}</div>
+                </div>
+                <div class="glass-card tca-panel">
+                    <div class="card-title">Fetch Churn</div>
+                    <div class="tca-fill-list">${fetchList}</div>
+                </div>
+            </div>
+            <div class="tca-grid">
+                <div class="glass-card tca-panel">
+                    <div class="card-title">Schedules</div>
+                    <div class="tca-fill-list">${scheduleList}</div>
+                </div>
+                <div class="glass-card tca-panel">
+                    <div class="card-title">Recent Events</div>
+                    <div class="tca-fill-list">${eventList}</div>
+                </div>
+            </div>
+        </section>
+    `;
+}
+
+function render(reason = 'state') {
     if (!PAGE.container) return;
 
     const symbolInput = PAGE.container.querySelector('[data-filter="symbol"]');
     const hadSymbolFocus = symbolInput && document.activeElement === symbolInput;
     const cursorPos = hadSymbolFocus ? symbolInput.selectionStart : null;
 
+    const tableWrap = PAGE.container.querySelector('.tca-table-wrap');
+    const savedScroll = tableWrap ? tableWrap.scrollTop : 0;
+
     if (!state.currentAccount) {
-        PAGE.container.innerHTML = cuteKey({
+        renderTerminalState('terminal-empty', cuteKey({
             title: 'No Account Selected ✨',
             subtitle: 'Pick a sub-account to review execution quality.',
-        });
+        }), reason);
         return;
     }
 
-    if (PAGE.loading && !PAGE.data) {
-        PAGE.container.innerHTML = cuteSpinner();
+    if (PAGE.loading && !PAGE.data.rollups.length && !PAGE.lifecyclePage.items.length && !PAGE.strategyPage.items.length) {
+        renderTerminalState('terminal-loading', cuteSpinner(), reason);
         return;
     }
 
-    if (PAGE.error && !PAGE.data) {
-        PAGE.container.innerHTML = cuteSadFace({
+    if (PAGE.error && !PAGE.data.rollups.length && !PAGE.lifecyclePage.items.length && !PAGE.strategyPage.items.length) {
+        renderTerminalState('terminal-error', cuteSadFace({
             title: 'TCA Unavailable',
             subtitle: PAGE.error.message || 'Failed to load execution quality data.',
-        });
+        }), reason);
         return;
     }
 
-    const view = buildViewModel(PAGE.data);
-    PAGE.container.innerHTML = `
-        <div class="tca-page">
-            <section class="glass-card tca-hero">
-                <div class="tca-hero-copy">
-                    <div class="tca-eyebrow">Execution Quality</div>
-                    <div class="section-header" style="margin-bottom:8px;">
-                        <h2 class="section-title">Trade Cost Analysis</h2>
-                    </div>
-                    <p class="tca-hero-text">
-                        Review fill quality, latency, and markouts for the current sub-account.
-                        Default scope is <strong>SUB_ACCOUNT</strong> with <strong>HARD</strong> ownership only.
-                    </p>
+    const view = buildViewModel(PAGE.data, PAGE.lifecyclePage);
+    const shell = ensureTcaPageShell(PAGE.container);
+    if (shell.created) {
+        PAGE.instrumentation.recordRender('page-shell', {
+            changed: true,
+            durationMs: shell.durationMs,
+            reason,
+            domNodes: 0,
+        });
+    }
+
+    const heroChanged = patchTcaRegion(shell.hero, `
+        <section class="glass-card tca-hero">
+            <div class="tca-hero-copy">
+                <div class="tca-eyebrow">Execution Quality</div>
+                <div class="section-header" style="margin-bottom:8px;">
+                    <h2 class="section-title">Trade Cost Analysis</h2>
                 </div>
-                <div class="tca-filter-rail">
-                    ${renderFilterBar(view)}
-                </div>
-            </section>
+                <p class="tca-hero-text">
+                    Review fill quality, lineage, and toxicity by sub-account.
+                    Scope defaults to <strong>SUB_ACCOUNT</strong> and <strong>HARD</strong> ownership.
+                </p>
+            </div>
+            <div class="tca-filter-rail">
+                ${renderFilterBar(view)}
+            </div>
+        </section>
+    `, { name: 'hero', reason, instrumentation: PAGE.instrumentation });
+    patchTcaRegion(shell.tabs, renderTabBar(), { name: 'tabs', reason, instrumentation: PAGE.instrumentation });
 
-            ${renderSummary(view)}
+    if (PAGE.tab === 'strategies') {
+        const strategyShell = ensureTcaStrategyShell(shell.active);
+        if (strategyShell.created) {
+            PAGE.instrumentation.recordRender('strategy-shell', {
+                changed: true,
+                durationMs: strategyShell.durationMs,
+                reason,
+                domNodes: 0,
+            });
+        }
+        patchTcaRegion(strategyShell.rail, renderStrategyRail(), {
+            name: 'strategy-rail',
+            reason,
+            instrumentation: PAGE.instrumentation,
+        });
+        patchTcaRegion(strategyShell.studio, renderStrategyStudio(), {
+            name: 'strategy-studio',
+            reason,
+            instrumentation: PAGE.instrumentation,
+        });
+    } else {
+        patchTcaRegion(shell.active, renderActiveTab(view), {
+            name: 'active-tab',
+            reason,
+            instrumentation: PAGE.instrumentation,
+        });
+    }
 
-            <section class="tca-grid">
-                <div class="glass-card tca-panel">
-                    <div class="tca-panel-head">
-                        <div>
-                            <div class="card-title">Benchmark Pulse</div>
-                            <div class="tca-panel-caption">Recent filtered slice across ${view.summary.orderCount} lifecycle(s).</div>
-                        </div>
-                        <div class="tca-segmented">
-                            ${renderBenchmarkButtons()}
-                        </div>
-                    </div>
-                    <div class="tca-chart-card">
-                        <div class="tca-spark-wrap">
-                            ${renderSparkline(view.sparklinePoints)}
-                        </div>
-                        <div class="tca-bar-list">
-                            ${renderBenchmarkBars(view)}
-                        </div>
-                    </div>
-                </div>
+    patchTcaRegion(shell.error, PAGE.error ? `<div class="tca-inline-error">${escapeHtml(PAGE.error.message || 'Refresh failed')}</div>` : '', {
+        name: 'inline-error',
+        reason,
+        instrumentation: PAGE.instrumentation,
+    });
+    patchTcaRegion(shell.drawer, renderDrawer(view), {
+        name: 'drawer',
+        reason,
+        instrumentation: PAGE.instrumentation,
+    });
+    patchTcaRegion(shell.debug, PAGE.debugPerf ? renderDebugPanel() : '', {
+        name: 'debug-panel',
+        reason,
+        instrumentation: PAGE.instrumentation,
+    });
 
-                <div class="glass-card tca-panel">
-                    <div class="tca-panel-head">
-                        <div>
-                            <div class="card-title">Strategy Footprint</div>
-                            <div class="tca-panel-caption">Sessions ranked by filled notional inside the current filter window.</div>
-                        </div>
-                    </div>
-                    ${renderStrategyLeaders(view)}
-                </div>
-            </section>
+    if (typeof window !== 'undefined') {
+        window.__TCA_DEBUG_STATE = PAGE.instrumentation.snapshot();
+    }
 
-            <section class="glass-card tca-panel">
-                <div class="tca-panel-head">
-                    <div>
-                        <div class="card-title">Review Queue</div>
-                        <div class="tca-panel-caption">
-                            Click a lifecycle to inspect fills, stream events, markouts, and strategy lineage.
-                        </div>
-                    </div>
-                    <button class="btn btn-outline btn-sm" type="button" data-action="refresh">Refresh</button>
-                </div>
-                ${renderLifecycleTable(view)}
-            </section>
-
-            ${PAGE.error ? `<div class="tca-inline-error">${escapeHtml(PAGE.error.message || 'Refresh failed')}</div>` : ''}
-            ${renderDrawer(view)}
-        </div>
-    `;
-
-    if (hadSymbolFocus) {
+    if (heroChanged && hadSymbolFocus) {
         const restored = PAGE.container.querySelector('[data-filter="symbol"]');
         if (restored) {
             restored.focus();
-            if (cursorPos !== null) {
-                restored.setSelectionRange(cursorPos, cursorPos);
-            }
+            if (cursorPos !== null) restored.setSelectionRange(cursorPos, cursorPos);
         }
     }
+
+    const restoredTableWrap = PAGE.container.querySelector('.tca-table-wrap');
+    if (restoredTableWrap && savedScroll > 0) restoredTableWrap.scrollTop = savedScroll;
 }
 
-function buildViewModel(data) {
-    const rollups = data?.rollups || [];
-    const strategyRollups = data?.strategyRollups || [];
-    const lifecycles = (data?.lifecycles || []).slice();
-    const strategySessions = data?.strategySessions || [];
-    const markoutLookup = buildLifecycleMarkoutLookup(data?.markouts || []);
+function renderTabBar() {
+    const tabs = [
+        ['overview', 'Overview'],
+        ['lifecycles', 'Lifecycles'],
+        ['strategies', 'Strategies'],
+    ];
+    return `
+        <section class="glass-card tca-panel tca-tabs-panel">
+            <div class="tca-tabs">
+                ${tabs.map(([tab, label]) => `
+                    <button
+                        type="button"
+                        class="tca-tab-btn ${PAGE.tab === tab ? 'active' : ''}"
+                        data-action="set-tab"
+                        data-tab="${tab}"
+                    >${label}</button>
+                `).join('')}
+            </div>
+        </section>
+    `;
+}
+
+function renderActiveTab(view) {
+    if (PAGE.tab === 'lifecycles') return renderLifecyclesTab(view);
+    if (PAGE.tab === 'strategies') return renderStrategiesTab();
+    return renderOverviewTab(view);
+}
+
+function renderOverviewTab(view) {
+    return `
+        <section class="tca-grid">
+            <div class="glass-card tca-panel">
+                <div class="tca-panel-head">
+                    <div>
+                        <div class="card-title">Role Metrics ${renderInfoHelp(INFO_TIPS.executionQuality)}</div>
+                        <div class="tca-panel-caption">Arrival and markout quality by role for the current lifecycle slice.</div>
+                    </div>
+                    ${PAGE.overviewLoading ? '<span class="tca-refreshing">Refreshing…</span>' : ''}
+                </div>
+                ${renderExecutionQualityGuide(view.anomalySummary)}
+                ${renderRoleMetricCards(view.roleMetrics)}
+            </div>
+
+            <div class="glass-card tca-panel">
+                <div class="tca-panel-head">
+                    <div>
+                        <div class="card-title">Strategy Footprint</div>
+                        <div class="tca-panel-caption">Top strategy sessions by filled notional.</div>
+                    </div>
+                    ${PAGE.overviewLoading ? '<span class="tca-refreshing">Refreshing…</span>' : ''}
+                </div>
+                ${renderStrategyLeaders(view)}
+            </div>
+        </section>
+    `;
+}
+
+function renderLifecyclesTab(view) {
+    return `
+        <section class="glass-card tca-panel">
+            <div class="tca-panel-head">
+                <div>
+                    <div class="card-title">Review Queue ${renderInfoHelp(INFO_TIPS.lifecycleDrawer)}</div>
+                    <div class="tca-panel-caption">Paginated lifecycle feed with role, toxicity, and lineage status. Defaults to filled executions so repriced and cancelled cleanup legs do not dominate the queue.</div>
+                </div>
+                <div class="tca-panel-actions">
+                    ${PAGE.lifecycleLoading ? '<span class="tca-refreshing">Refreshing…</span>' : ''}
+                    <button class="btn btn-outline btn-sm" type="button" data-action="refresh-lifecycles">Refresh</button>
+                </div>
+            </div>
+            ${renderLifecycleTable(view)}
+            ${renderPaginationBar(PAGE.lifecyclePage)}
+        </section>
+    `;
+}
+
+function renderLineageTab(view) {
+    const roleCards = renderRoleMetricCards(view.roleMetrics);
+    const anomalies = view.anomalySummary;
+    return `
+        <section class="tca-grid">
+            <div class="glass-card tca-panel">
+                <div class="tca-panel-head">
+                    <div>
+                        <div class="card-title">Role Metrics ${renderInfoHelp(INFO_TIPS.executionQuality)}</div>
+                        <div class="tca-panel-caption">Arrival and markout quality by order role.</div>
+                    </div>
+                    ${PAGE.overviewLoading ? '<span class="tca-refreshing">Refreshing…</span>' : ''}
+                </div>
+                ${renderExecutionQualityGuide({ unknownRoleCount: anomalies.unknownRoleCount })}
+                ${roleCards}
+            </div>
+
+            <div class="glass-card tca-panel">
+                <div class="tca-panel-head">
+                    <div>
+                        <div class="card-title">Anomaly Health</div>
+                        <div class="tca-panel-caption">Unknown role/lineage and graph truncation signals.</div>
+                    </div>
+                </div>
+                <div class="tca-lineage-health">
+                    <div class="stat-item"><div class="stat-label">Unknown Roles</div><div class="stat-value">${anomalies.unknownRoleCount}</div></div>
+                    <div class="stat-item"><div class="stat-label">Unknown / Partial Lineage</div><div class="stat-value">${anomalies.unknownLineageCount}</div></div>
+                    <div class="stat-item"><div class="stat-label">Graph Truncated</div><div class="stat-value">${anomalies.graphTruncatedCount}</div></div>
+                </div>
+                <div class="tca-muted-line">Counts are based on current page + opened detail graphs in this session.</div>
+            </div>
+        </section>
+        <section class="glass-card tca-panel">
+            <div class="tca-panel-head">
+                <div>
+                    <div class="card-title">Lineage Preview</div>
+                    <div class="tca-panel-caption">Open a lifecycle to inspect recursive graph and anomalies.</div>
+                </div>
+            </div>
+            ${PAGE.detail
+        ? renderLineageGraph(PAGE.detail)
+        : PAGE.detailError
+            ? `<div class="tca-inline-error">${escapeHtml(PAGE.detailError)}</div>`
+        : (PAGE.lifecyclePage.items?.length
+            ? '<div class="tca-chart-empty">Loading preview from the newest visible lifecycle…</div>'
+            : '<div class="tca-chart-empty">No lifecycle rows are available in the current filter window.</div>')}
+        </section>
+    `;
+}
+
+function renderStrategiesTab() {
+    return `
+        <section class="tca-strategy-layout">
+            ${renderStrategyRail()}
+            <div class="tca-strategy-studio">
+                ${renderStrategyStudio()}
+            </div>
+        </section>
+    `;
+}
+
+function renderStrategyRail() {
+    return `
+        <div class="glass-card tca-panel tca-strategy-rail">
+            <div class="tca-panel-head">
+                <div>
+                    <div class="card-title">Root Sessions ${renderInfoHelp('Root scalper sessions only in this view. Each card rolls child chase activity into one economic root session.')}</div>
+                    <div class="tca-panel-caption">Scalper-first command center with root-session PnL, toxicity, and runtime state.</div>
+                </div>
+                <div class="tca-panel-actions">
+                    ${PAGE.strategyLoading ? '<span class="tca-refreshing">Refreshing…</span>' : ''}
+                    <button class="btn btn-outline btn-sm" type="button" data-action="refresh-strategies">Refresh</button>
+                </div>
+            </div>
+            <div class="tca-strategy-sortbar">
+                <button type="button" class="btn btn-outline btn-sm" data-action="sort-strategies" data-sort-by="updatedAt">Updated</button>
+                <button type="button" class="btn btn-outline btn-sm" data-action="sort-strategies" data-sort-by="netPnl">Net PnL</button>
+                <button type="button" class="btn btn-outline btn-sm" data-action="sort-strategies" data-sort-by="toxicityScore">Toxicity</button>
+                <button type="button" class="btn btn-outline btn-sm" data-action="sort-strategies" data-sort-by="fillCount">Fills</button>
+            </div>
+            ${renderStrategySessionList(PAGE.strategyPage.items)}
+            ${renderStrategyPaginationBar(PAGE.strategyPage)}
+        </div>
+    `;
+}
+
+function renderStrategyStudio() {
+    const selected = PAGE.strategyPage.items.find((row) => row.strategySessionId === PAGE.selectedStrategySessionId)
+        || PAGE.strategyPage.items[0]
+        || null;
+    const detail = PAGE.strategyDetail;
+    const timeseries = PAGE.strategyTimeseries;
+    const ledger = PAGE.strategyLedger;
+    const roleMetrics = roleMetricsFromStrategyDetail(detail);
+    const livePnl = latestStrategyPnlSnapshot(detail, timeseries, selected);
+    const runtimeStatus = detail?.runtime?.status || selected?.runtimeStatus || 'UNKNOWN';
+
+    return `
+        ${selected ? `
+            <section class="tca-summary-grid tca-strategy-summary-grid">
+                <div class="glass-card tca-kpi-card tca-kpi-score">
+                    <div class="price-label">Net PnL ${renderInfoHelp(INFO_TIPS.pnlCurve)}</div>
+                    <div class="price-big ${formatPnlClass(livePnl.netPnl || 0)}">${formatUsd(livePnl.netPnl || 0, 2)}</div>
+                    <div class="tca-muted-line">${escapeHtml(selected.symbol || 'Unknown')} · ${escapeHtml(runtimeStatus)}</div>
+                </div>
+                <div class="glass-card tca-kpi-card">
+                    <div class="price-label">Realized ${renderInfoHelp('Closed FIFO lot allocations net of fees. This only moves when owned lots are closed.')}</div>
+                    <div class="price-big ${formatPnlClass(livePnl.realizedPnl || 0)}">${formatUsd(livePnl.realizedPnl || 0, 2)}</div>
+                    <div class="tca-muted-line">${renderSampleStatusLine(livePnl.sampledAt, 'Last PnL sample')}</div>
+                </div>
+                <div class="glass-card tca-kpi-card">
+                    <div class="price-label">Unrealized ${renderInfoHelp('Mark-to-market value of still-open root-session lots at the latest sampled mark price.')}</div>
+                    <div class="price-big ${formatPnlClass(livePnl.unrealizedPnl || 0)}">${formatUsd(livePnl.unrealizedPnl || 0, 2)}</div>
+                    <div class="tca-muted-line">Open exposure ${formatUsd(livePnl.openNotional || 0, 2)}</div>
+                </div>
+                <div class="glass-card tca-kpi-card">
+                    <div class="price-label">Execution Quality ${renderInfoHelp(INFO_TIPS.executionQuality)}</div>
+                    <div class="price-big ${formatPnlClass(-(detail?.rollup?.toxicityScore ?? selected.toxicityScore ?? 0))}">${Number(detail?.rollup?.toxicityScore ?? selected.toxicityScore ?? 0).toFixed(2)}</div>
+                    <div class="tca-muted-line">${livePnl.fillCount || selected.fillCount || 0} fills · ${livePnl.closeCount || selected.closeCount || 0} closes</div>
+                </div>
+            </section>
+            <section class="tca-grid tca-strategy-grid">
+                <div class="glass-card tca-panel">
+                    <div class="tca-panel-head">
+                        <div>
+                            <div class="card-title">PnL Curve ${renderInfoHelp(INFO_TIPS.pnlCurve)}</div>
+                            <div class="tca-panel-caption">Net, realized, unrealized, and open exposure. ${renderSampleStatusLine(livePnl.sampledAt, '5s live sample')}</div>
+                        </div>
+                        ${PAGE.strategyTimeseriesLoading ? '<span class="tca-refreshing">Refreshing…</span>' : ''}
+                    </div>
+                    ${renderMultiSeriesChart(
+        timeseries?.series?.pnl || [],
+        [
+            ['netPnl', 'Net', '#16a34a'],
+            ['realizedPnl', 'Realized', '#0ea5e9'],
+            ['unrealizedPnl', 'Unrealized', '#f59e0b'],
+            ['openNotional', 'Exposure', '#f97316'],
+        ],
+    )}
+                </div>
+                <div class="glass-card tca-panel">
+                    <div class="tca-panel-head">
+                        <div>
+                            <div class="card-title">Parameter Evolution ${renderInfoHelp(INFO_TIPS.parameterEvolution)}</div>
+                            <div class="tca-panel-caption">Offsets, slot pressure, and refill guards over time. Loaded on demand so the default studio stays focused on economics.</div>
+                        </div>
+                        <div class="tca-panel-actions">
+                            <button class="btn btn-outline btn-sm" type="button" data-action="toggle-parameter-evolution">${PAGE.strategyParamsExpanded ? 'Hide' : 'Load'} Params</button>
+                        </div>
+                    </div>
+                    ${PAGE.strategyParamsExpanded
+        ? renderMultiSeriesChart(
+            timeseries?.series?.params || [],
+            [
+                ['longOffsetPct', 'Long Offset', '#8b5cf6'],
+                ['shortOffsetPct', 'Short Offset', '#ec4899'],
+                ['longActiveSlots', 'Long Active', '#14b8a6'],
+                ['shortPausedSlots', 'Short Paused', '#ef4444'],
+            ],
+        )
+        : '<div class="tca-chart-empty">Parameter evolution is hidden until requested. Open it when you need slot pressure or offset drift without paying for it on every default load.</div>'}
+                </div>
+            </section>
+            <section class="tca-grid tca-strategy-grid">
+                <div class="glass-card tca-panel">
+                    <div class="tca-panel-head">
+                        <div>
+                            <div class="card-title">Execution Quality ${renderInfoHelp(INFO_TIPS.executionQuality)}</div>
+                            <div class="tca-panel-caption">Role-sliced arrival and markout quality. These metrics move when fills and markouts land, not on every heartbeat.</div>
+                        </div>
+                    </div>
+                    ${renderExecutionQualityGuide(detail?.anomalyCounts || {})}
+                    ${renderRoleMetricCards(roleMetrics)}
+                </div>
+                <div class="glass-card tca-panel">
+                    <div class="tca-panel-head">
+                        <div>
+                            <div class="card-title">State Timeline ${renderInfoHelp(INFO_TIPS.stateTimeline)}</div>
+                            <div class="tca-panel-caption">Runtime checkpoints and anomalies. Newest items are shown first.</div>
+                        </div>
+                    </div>
+                    ${renderStrategyTimeline(timeseries?.events || {}, detail?.anomalyCounts || {})}
+                </div>
+            </section>
+            <section class="tca-grid tca-strategy-grid">
+                <div class="glass-card tca-panel">
+                    <div class="tca-panel-head">
+                        <div>
+                            <div class="card-title">Lot Ledger</div>
+                            <div class="tca-panel-caption">Open lots, close allocations, and session PnL anomalies.</div>
+                        </div>
+                        ${PAGE.strategyLedgerLoading ? '<span class="tca-refreshing">Refreshing…</span>' : ''}
+                    </div>
+                    ${renderStrategyLotLedger(ledger)}
+                </div>
+                <div class="glass-card tca-panel">
+                    <div class="tca-panel-head">
+                        <div>
+                            <div class="card-title">Lineage ${renderInfoHelp('Recursive graph from root scalper session through child sessions and submitted lifecycles. Loaded lazily so charts stay fast.')}</div>
+                            <div class="tca-panel-caption">Recursive root-session graph with anomaly counters.</div>
+                        </div>
+                    </div>
+                    ${detail ? renderLineageGraph(detail) : '<div class="tca-chart-empty">No lineage graph available for this strategy session.</div>'}
+                </div>
+            </section>
+        ` : '<section class="glass-card tca-panel"><div class="tca-chart-empty">No strategy session matches the current filter.</div></section>'}
+    `;
+}
+
+function renderPaginationBar(meta) {
+    const totalPages = Math.max(1, Number(meta?.totalPages || 1));
+    const currentPage = Math.min(totalPages, Math.max(1, Number(meta?.page || 1)));
+    const pages = buildPaginationWindow(currentPage, totalPages);
+    return `
+        <div class="tca-pagination-wrap">
+            <div class="tca-pagination-meta">
+                <span>${Number(meta?.total || 0)} rows</span>
+                <span>Page ${currentPage} / ${totalPages}</span>
+            </div>
+            <div class="tca-pagination">
+                <button type="button" class="btn btn-outline btn-sm" data-action="set-page" data-page="${Math.max(1, currentPage - 1)}" ${currentPage <= 1 ? 'disabled' : ''}>Prev</button>
+                ${pages.map((page) => `
+                    <button
+                        type="button"
+                        class="btn btn-sm ${page === currentPage ? 'btn-primary' : 'btn-outline'}"
+                        data-action="set-page"
+                        data-page="${page}"
+                    >${page}</button>
+                `).join('')}
+                <button type="button" class="btn btn-outline btn-sm" data-action="set-page" data-page="${Math.min(totalPages, currentPage + 1)}" ${currentPage >= totalPages ? 'disabled' : ''}>Next</button>
+            </div>
+            <div class="tca-pagination-tools">
+                <label class="tca-filter-field" style="min-width:96px;">
+                    <span>Rows</span>
+                    <select data-action="set-page-size">
+                        ${PAGE_SIZES.map((size) => `<option value="${size}" ${PAGE.pageSize === size ? 'selected' : ''}>${size}</option>`).join('')}
+                    </select>
+                </label>
+                <label class="tca-filter-field" style="min-width:120px;">
+                    <span>Jump</span>
+                    <div style="display:flex; gap:6px;">
+                        <input class="search-input" data-jump-page type="number" min="1" max="${totalPages}" placeholder="${currentPage}" />
+                        <button type="button" class="btn btn-outline btn-sm" data-action="jump-page">Go</button>
+                    </div>
+                </label>
+            </div>
+        </div>
+    `;
+}
+
+function renderStrategyPaginationBar(meta) {
+    const totalPages = Math.max(1, Number(meta?.totalPages || 1));
+    const currentPage = Math.min(totalPages, Math.max(1, Number(meta?.page || 1)));
+    const pages = buildPaginationWindow(currentPage, totalPages);
+    return `
+        <div class="tca-pagination-wrap">
+            <div class="tca-pagination-meta">
+                <span>${Number(meta?.total || 0)} sessions</span>
+                <span>Page ${currentPage} / ${totalPages}</span>
+            </div>
+            <div class="tca-pagination">
+                <button type="button" class="btn btn-outline btn-sm" data-action="set-strategy-page" data-page="${Math.max(1, currentPage - 1)}" ${currentPage <= 1 ? 'disabled' : ''}>Prev</button>
+                ${pages.map((page) => `
+                    <button
+                        type="button"
+                        class="btn btn-sm ${page === currentPage ? 'btn-primary' : 'btn-outline'}"
+                        data-action="set-strategy-page"
+                        data-page="${page}"
+                    >${page}</button>
+                `).join('')}
+                <button type="button" class="btn btn-outline btn-sm" data-action="set-strategy-page" data-page="${Math.min(totalPages, currentPage + 1)}" ${currentPage >= totalPages ? 'disabled' : ''}>Next</button>
+            </div>
+            <div class="tca-pagination-tools">
+                <label class="tca-filter-field" style="min-width:96px;">
+                    <span>Rows</span>
+                    <select data-action="set-strategy-page-size">
+                        ${PAGE_SIZES.map((size) => `<option value="${size}" ${PAGE.strategyPage.pageSize === size ? 'selected' : ''}>${size}</option>`).join('')}
+                    </select>
+                </label>
+                <label class="tca-filter-field" style="min-width:120px;">
+                    <span>Jump</span>
+                    <div style="display:flex; gap:6px;">
+                        <input class="search-input" data-jump-strategy-page type="number" min="1" max="${totalPages}" placeholder="${currentPage}" />
+                        <button type="button" class="btn btn-outline btn-sm" data-action="jump-strategy-page">Go</button>
+                    </div>
+                </label>
+            </div>
+        </div>
+    `;
+}
+
+function buildPaginationWindow(currentPage, totalPages, radius = 2) {
+    const pages = [];
+    const start = Math.max(1, currentPage - radius);
+    const end = Math.min(totalPages, currentPage + radius);
+    for (let page = start; page <= end; page += 1) pages.push(page);
+    if (!pages.includes(1)) pages.unshift(1);
+    if (!pages.includes(totalPages)) pages.push(totalPages);
+    return Array.from(new Set(pages)).sort((a, b) => a - b);
+}
+
+function buildViewModel(overviewData, lifecyclePage) {
+    const rollups = overviewData?.rollups || [];
+    const strategyRollups = overviewData?.strategyRollups || [];
+    const strategySessions = overviewData?.strategySessions || [];
+    const lifecycles = (lifecyclePage?.items || []).map((row) => {
+        const selectedMarkout = selectedMarkoutFromLifecycle(row, PAGE.filters.benchmarkMs);
+        const severityScore = buildSeverityScore(row, selectedMarkout);
+        return { ...row, selectedMarkout, severityScore };
+    });
+
     const availableStrategyTypes = Array.from(new Set(
         [
             ...lifecycles.map((row) => row.strategyType),
             ...strategyRollups.map((row) => row.strategyType),
             ...strategySessions.map((row) => row.strategyType),
+            ...(PAGE.strategyPage.items || []).map((row) => row.strategyType),
         ].filter(Boolean),
     )).sort();
 
-    const enrichedLifecycles = lifecycles.map((row) => {
-        const markouts = markoutLookup.get(row.lifecycleId) || {};
-        const selectedMarkout = markouts[PAGE.filters.benchmarkMs] ?? null;
-        const severityScore = buildSeverityScore(row, selectedMarkout);
-        return { ...row, markouts, selectedMarkout, severityScore };
-    }).sort((left, right) => {
-        if (right.severityScore !== left.severityScore) return right.severityScore - left.severityScore;
-        return new Date(right.updatedAt || right.doneTs || right.intentTs || 0).getTime()
-            - new Date(left.updatedAt || left.doneTs || left.intentTs || 0).getTime();
-    });
-
-    const summary = buildSliceSummary(enrichedLifecycles, strategySessions);
+    const primaryRollup = rollups[0] || null;
+    const summary = buildSliceSummary(lifecycles, strategySessions, primaryRollup);
     const baseline = buildRollupBaseline(rollups);
     const sessionById = new Map(strategySessions.map((row) => [row.strategySessionId, row]));
     const strategyLeaders = strategyRollups
         .map((row) => ({ ...row, session: sessionById.get(row.strategySessionId) || null }))
+        .filter(shouldDisplayStrategyLeader)
         .sort((left, right) => (right.totalFillNotional || 0) - (left.totalFillNotional || 0))
         .slice(0, 5);
 
@@ -401,41 +2166,392 @@ function buildViewModel(data) {
         benchmarkMs: PAGE.filters.benchmarkMs,
         benchmarkLabel: labelForHorizon(PAGE.filters.benchmarkMs),
         baseline,
-        lifecycles: enrichedLifecycles,
-        sparklinePoints: enrichedLifecycles
+        lifecycles,
+        sparklinePoints: strategyLeaders
             .slice(0, 24)
             .reverse()
-            .map((row) => row.selectedMarkout)
+            .map((row) => selectedMarkoutFromRollup(row))
             .filter((value) => Number.isFinite(value)),
         strategyLeaders,
         strategySessions,
         summary,
+        roleMetrics: resolveLineageRoleMetrics(primaryRollup, strategyRollups, lifecycles),
+        anomalySummary: buildAnomalySummary(lifecycles),
     };
 }
 
-function buildLifecycleMarkoutLookup(markouts) {
-    const grouped = new Map();
-    for (const row of markouts || []) {
-        if (!row.lifecycleId || !Number.isFinite(row.markoutBps)) continue;
-        const lifecycleEntry = grouped.get(row.lifecycleId) || {};
-        const bucket = lifecycleEntry[row.horizonMs] || [];
-        bucket.push(row.markoutBps);
-        lifecycleEntry[row.horizonMs] = bucket;
-        grouped.set(row.lifecycleId, lifecycleEntry);
-    }
-
-    const averages = new Map();
-    for (const [lifecycleId, horizonMap] of grouped.entries()) {
-        const next = {};
-        for (const [horizonMs, values] of Object.entries(horizonMap)) {
-            next[horizonMs] = average(values);
-        }
-        averages.set(lifecycleId, next);
-    }
-    return averages;
+function isLiquidationStrategyValue(value) {
+    const normalized = String(value || '').trim().toUpperCase();
+    if (!normalized) return false;
+    return normalized.includes('LIQUIDATION') || normalized === 'FULL_LIQUIDATION';
 }
 
-function buildSliceSummary(lifecycles, strategySessions) {
+function shouldDisplayStrategyLeader(row) {
+    if (!row) return false;
+    if (isLiquidationStrategyValue(row.strategyType)) return false;
+    if (isLiquidationStrategyValue(row.session?.strategyType)) return false;
+    if (isLiquidationStrategyValue(row.session?.origin)) return false;
+    return true;
+}
+
+function extractRoleMetrics(rollup) {
+    const out = {};
+    if (!rollup) return out;
+    const qualityByRole = rollup.qualityByRole || {};
+    const arrival = rollup.avgArrivalSlippageBpsByRole || {};
+    const mk1 = rollup.avgMarkout1sBpsByRole || {};
+    const mk5 = rollup.avgMarkout5sBpsByRole || {};
+    const mk30 = rollup.avgMarkout30sBpsByRole || {};
+    const roles = new Set([...Object.keys(arrival), ...Object.keys(mk1), ...Object.keys(mk5), ...Object.keys(mk30), ...Object.keys(qualityByRole)]);
+    for (const role of roles) {
+        const avgArrivalSlippageBps = arrival[role] ?? null;
+        const avgMarkout1sBps = mk1[role] ?? null;
+        const avgMarkout5sBps = mk5[role] ?? null;
+        const avgMarkout30sBps = mk30[role] ?? null;
+        out[role] = {
+            lifecycleCount: qualityByRole[role]?.lifecycleCount ?? null,
+            fillCount: qualityByRole[role]?.fillCount ?? null,
+            avgArrivalSlippageBps,
+            avgMarkout1sBps,
+            avgMarkout5sBps,
+            avgMarkout30sBps,
+            toxicityScore: computeToxicityScore(avgArrivalSlippageBps, avgMarkout1sBps, avgMarkout5sBps),
+        };
+    }
+    return out;
+}
+
+function buildAnomalySummary(lifecycles) {
+    const unknownRoleCount = lifecycles.filter((row) => String(row.orderRole || '').toUpperCase() === 'UNKNOWN').length;
+    const unknownLineageCount = lifecycles.filter((row) => String(row.lineageStatus || '').toUpperCase() !== 'COMPLETE').length;
+    return {
+        unknownRoleCount,
+        unknownLineageCount,
+        graphTruncatedCount: PAGE.graphTruncatedCount,
+    };
+}
+
+function renderRoleMetricCards(roleMetrics) {
+    const rows = Object.entries(roleMetrics || {});
+    if (!rows.length) {
+        return '<div class="tca-chart-empty">No role-sliced metrics available in this window yet. Quality needs fills plus sampled markouts, so live sessions can still have runtime PnL while this panel stays empty.</div>';
+    }
+    return `
+        <div class="tca-fill-list">
+            ${rows.map(([role, metrics]) => `
+                <div class="tca-fill-row">
+                    <div>
+                        <div class="tca-leader-title">${escapeHtml(role)}</div>
+                        <div class="tca-muted-line">${escapeHtml(roleDescription(role))}</div>
+                        <div class="tca-leader-subtitle">
+                            Arrival ${formatBps(metrics.avgArrivalSlippageBps)} ·
+                            1s ${formatBps(metrics.avgMarkout1sBps)} ·
+                            5s ${formatBps(metrics.avgMarkout5sBps)} ·
+                            30s ${formatBps(metrics.avgMarkout30sBps)}
+                        </div>
+                        <div class="tca-muted-line">${metrics.lifecycleCount ?? 0} lifecycle(s) · ${metrics.fillCount ?? 0} fill sample(s)</div>
+                    </div>
+                    <div class="tca-fill-mkbadge ${formatPnlClass(-(metrics.toxicityScore || 0))}">
+                        Toxicity ${Number.isFinite(metrics.toxicityScore) ? metrics.toxicityScore.toFixed(2) : '—'}
+                    </div>
+                </div>
+            `).join('')}
+        </div>
+    `;
+}
+
+function roleMetricsFromStrategyDetail(detail) {
+    const rollup = detail?.rollup || {};
+    const qualityByRole = detail?.qualityByRole || rollup.qualityByRole || {};
+    const out = {};
+    const arrival = rollup.avgArrivalSlippageBpsByRole || {};
+    const mk1 = rollup.avgMarkout1sBpsByRole || {};
+    const mk5 = rollup.avgMarkout5sBpsByRole || {};
+    const mk30 = rollup.avgMarkout30sBpsByRole || {};
+    const roles = new Set([...Object.keys(arrival), ...Object.keys(mk1), ...Object.keys(mk5), ...Object.keys(mk30), ...Object.keys(qualityByRole)]);
+    for (const role of roles) {
+        out[role] = {
+            lifecycleCount: qualityByRole[role]?.lifecycleCount ?? null,
+            fillCount: qualityByRole[role]?.fillCount ?? null,
+            avgArrivalSlippageBps: arrival[role] ?? null,
+            avgMarkout1sBps: mk1[role] ?? null,
+            avgMarkout5sBps: mk5[role] ?? null,
+            avgMarkout30sBps: mk30[role] ?? null,
+            toxicityScore: computeToxicityScore(arrival[role], mk1[role], mk5[role]),
+        };
+    }
+    return out;
+}
+
+function latestStrategyPnlSnapshot(detail, timeseries, selected) {
+    const latestPoint = (timeseries?.series?.pnl || []).slice(-1)[0] || null;
+    const latestSample = detail?.latestPnlSample || null;
+    return {
+        sampledAt: latestPoint?.ts || latestSample?.sampledAt || selected?.updatedAt || null,
+        realizedPnl: latestPoint?.realizedPnl ?? latestSample?.realizedPnl ?? detail?.rollup?.realizedPnl ?? selected?.realizedPnl ?? 0,
+        unrealizedPnl: latestPoint?.unrealizedPnl ?? latestSample?.unrealizedPnl ?? detail?.rollup?.unrealizedPnl ?? selected?.unrealizedPnl ?? 0,
+        netPnl: latestPoint?.netPnl ?? latestSample?.netPnl ?? detail?.rollup?.netPnl ?? selected?.netPnl ?? 0,
+        openNotional: latestPoint?.openNotional ?? latestSample?.openNotional ?? detail?.rollup?.openNotional ?? selected?.openNotional ?? 0,
+        fillCount: latestPoint?.fillCount ?? latestSample?.fillCount ?? detail?.rollup?.fillCount ?? selected?.fillCount ?? 0,
+        closeCount: latestPoint?.closeCount ?? latestSample?.closeCount ?? detail?.rollup?.closeCount ?? selected?.closeCount ?? 0,
+    };
+}
+
+function latestStrategyParamSnapshot(detail, timeseries) {
+    const latestPoint = (timeseries?.series?.params || []).slice(-1)[0] || null;
+    return {
+        sampledAt: latestPoint?.ts || detail?.latestParamSample?.sampledAt || null,
+        longOffsetPct: latestPoint?.longOffsetPct ?? detail?.latestParamSample?.longOffsetPct ?? null,
+        shortOffsetPct: latestPoint?.shortOffsetPct ?? detail?.latestParamSample?.shortOffsetPct ?? null,
+    };
+}
+
+function renderSampleStatusLine(ts, label = 'Last sample') {
+    if (!ts) return `${label}: waiting for data`;
+    return `${label}: ${formatRelativeTime(ts)} (${formatAbsoluteTime(ts)})`;
+}
+
+function renderExecutionQualityGuide(anomalyCounts = {}) {
+    const unknownRoleCount = Number(anomalyCounts?.unknownRoleCount || 0);
+    return `
+        <div class="tca-info-note">
+            <strong>How to read it:</strong> Arrival slippage measures fill versus decision mid. Positive post-fill markout means price moved in your favor after the fill; negative means adverse selection. Toxicity rises when short-horizon markouts are negative or arrival slippage is wide.
+        </div>
+        ${unknownRoleCount > 0 ? `<div class="tca-anomaly-banner">UNKNOWN role count: ${unknownRoleCount}. These orders were persisted without explicit intent metadata, so their execution quality is visible but attribution is less precise.</div>` : ''}
+    `;
+}
+
+function renderStrategySessionList(items) {
+    if (!items.length) {
+        return '<div class="tca-chart-empty">No root strategy sessions match the current filters.</div>';
+    }
+    return `
+        <div class="tca-strategy-list">
+            ${items.map((row) => {
+        const isActive = row.strategySessionId === PAGE.selectedStrategySessionId;
+        const anomalyClass = row.hasAnomaly ? 'is-anomaly' : 'is-clean';
+        return `
+                    <button
+                        type="button"
+                        class="tca-strategy-card ${isActive ? 'active' : ''}"
+                        data-action="open-strategy-session"
+                        data-session-id="${row.strategySessionId}"
+                    >
+                        <div class="tca-strategy-card-head">
+                            <div>
+                                <div class="tca-leader-title">${escapeHtml(row.symbol || 'Unknown')} · ${escapeHtml(row.strategyType || 'SCALPER')}</div>
+                                <div class="tca-leader-subtitle">${escapeHtml(shortId(row.strategySessionId))} · ${escapeHtml(row.runtimeStatus || 'UNKNOWN')}</div>
+                            </div>
+                            <span class="tca-lineage-pill ${anomalyClass}">${row.hasAnomaly ? `${row.anomalyCount} anomaly` : 'clean'}</span>
+                        </div>
+                        <div class="tca-strategy-card-metrics">
+                            <span class="${formatPnlClass(row.netPnl || 0)}">${formatUsd(row.netPnl || 0, 2)}</span>
+                            <span>${row.fillCount || 0} fills</span>
+                            <span>${formatUsd(row.openNotional || 0, 0)}</span>
+                        </div>
+                        <div class="tca-strategy-card-spark">${renderMiniSparkline(row.sparkline || [])}</div>
+                    </button>
+                `;
+    }).join('')}
+        </div>
+    `;
+}
+
+function renderMiniSparkline(points) {
+    const values = (points || []).map((row) => Number(row?.value)).filter(Number.isFinite);
+    if (!values.length) return '<div class="tca-muted-line">No samples</div>';
+    const width = 160;
+    const height = 42;
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const spread = max - min || 1;
+    const coords = values.map((value, index) => {
+        const x = (index / Math.max(values.length - 1, 1)) * (width - 6) + 3;
+        const y = height - (((value - min) / spread) * (height - 8) + 4);
+        return `${x},${y}`;
+    }).join(' ');
+    return `<svg viewBox="0 0 ${width} ${height}" class="tca-mini-spark ${values[values.length - 1] >= 0 ? 'positive' : 'negative'}" preserveAspectRatio="none"><polyline points="${coords}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></polyline></svg>`;
+}
+
+function renderMultiSeriesChart(points, seriesDefs) {
+    const rows = Array.isArray(points) ? points : [];
+    if (!rows.length) return '<div class="tca-chart-empty">No samples in the selected lookback.</div>';
+    const width = 820;
+    const height = 220;
+    const values = [];
+    for (const row of rows) {
+        for (const [key] of seriesDefs) {
+            const value = Number(row?.[key]);
+            if (Number.isFinite(value)) values.push(value);
+        }
+    }
+    if (!values.length) return '<div class="tca-chart-empty">No numeric values available for this series.</div>';
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const spread = max - min || 1;
+    const lastTs = rows[rows.length - 1]?.ts || null;
+    const lines = seriesDefs.map(([key, label, color]) => {
+        const coords = rows.map((row, index) => {
+            const value = Number(row?.[key]);
+            if (!Number.isFinite(value)) return null;
+            const x = (index / Math.max(rows.length - 1, 1)) * (width - 16) + 8;
+            const y = height - (((value - min) / spread) * (height - 28) + 14);
+            return `${x},${y}`;
+        }).filter(Boolean).join(' ');
+        return { key, label, color, coords };
+    }).filter((line) => line.coords);
+    return `
+        <div class="tca-series-chart">
+            <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+                ${lines.map((line) => `<polyline points="${line.coords}" fill="none" stroke="${line.color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></polyline>`).join('')}
+            </svg>
+            <div class="tca-series-legend">
+                ${lines.map((line) => `<span><i style="background:${line.color}"></i>${escapeHtml(line.label)}</span>`).join('')}
+            </div>
+            <div class="tca-series-meta">
+                <span>${rows.length} sample(s)</span>
+                <span>${renderSampleStatusLine(lastTs, 'Last point')}</span>
+            </div>
+        </div>
+    `;
+}
+
+function renderStrategyTimeline(events, anomalyCounts) {
+    const page = Math.max(1, Number(events?.page || PAGE.strategyTimelinePage || 1));
+    const totalPages = Math.max(1, Number(events?.totalPages || 1));
+    const items = Array.isArray(events?.items) ? events.items : (Array.isArray(events) ? events : []);
+    const rows = items.map((row) => ({
+        ts: row.ts,
+        label: row.type,
+        detail: row.status || 'runtime',
+        seq: row.checkpointSeq,
+    }));
+    if (anomalyCounts?.unknownLineageCount > 0) {
+        rows.push({ ts: null, label: 'LINEAGE_ANOMALY', detail: `${anomalyCounts.unknownLineageCount} event(s)` });
+    }
+    if (anomalyCounts?.sessionPnlAnomalyCount > 0) {
+        rows.push({ ts: null, label: 'PNL_ANOMALY', detail: `${anomalyCounts.sessionPnlAnomalyCount} event(s)` });
+    }
+    if (!rows.length) return '<div class="tca-chart-empty">No runtime checkpoints or anomalies recorded in this window.</div>';
+    return `
+        <div class="tca-timeline-wrap">
+            <div class="tca-timeline-summary">
+                <span>${Number(events?.total || items.length || 0)} checkpoint(s) in range</span>
+                <span>${anomalyCounts?.unknownLineageCount || 0} lineage anomaly count</span>
+                <span>${anomalyCounts?.sessionPnlAnomalyCount || 0} PnL anomaly count</span>
+            </div>
+            <div class="tca-fill-list">
+                ${rows.map((row) => `
+                <div class="tca-fill-row tca-fill-row-compact">
+                    <div>
+                        <div class="tca-leader-title">${escapeHtml(row.label)}</div>
+                        <div class="tca-leader-subtitle">${escapeHtml(row.detail)}</div>
+                    </div>
+                    <div class="tca-muted-line">${row.ts ? formatAbsoluteTime(row.ts) : 'Aggregated'}${row.seq != null ? ` · #${row.seq}` : ''}</div>
+                </div>
+            `).join('')}
+        </div>
+            ${totalPages > 1 ? `
+                <div class="tca-pagination-inline">
+                    <button type="button" class="btn btn-outline btn-sm" data-action="set-timeline-page" data-page="${Math.max(1, page - 1)}" ${page <= 1 ? 'disabled' : ''}>Prev</button>
+                    <span>Page ${page} / ${totalPages}</span>
+                    <button type="button" class="btn btn-outline btn-sm" data-action="set-timeline-page" data-page="${Math.min(totalPages, page + 1)}" ${page >= totalPages ? 'disabled' : ''}>Next</button>
+                </div>
+            ` : ''}
+        </div>
+    `;
+}
+
+function renderStrategyLotLedger(ledger) {
+    if (!ledger) return '<div class="tca-chart-empty">Select a strategy session to load its lot ledger.</div>';
+    const openLots = ledger.openLots || [];
+    const realizations = ledger.realizations || [];
+    const anomalies = ledger.anomalies || [];
+    return `
+        <div class="tca-ledger-block">
+            <div class="tca-ledger-title">Open Lots</div>
+            ${openLots.length ? `
+                <div class="tca-ledger-table">
+                    <div class="tca-ledger-row head"><span>Side</span><span>Open</span><span>Remain</span><span>Price</span></div>
+                    ${openLots.map((row) => `<div class="tca-ledger-row"><span>${escapeHtml(row.positionSide)}</span><span>${formatQty(row.openQty)}</span><span>${formatQty(row.remainingQty)}</span><span>${formatPrice(row.openPrice)}</span></div>`).join('')}
+                </div>
+            ` : '<div class="tca-muted-line">No open lots.</div>'}
+        </div>
+        <div class="tca-ledger-block">
+            <div class="tca-ledger-title">Recent Realizations</div>
+            ${realizations.length ? `
+                <div class="tca-ledger-table">
+                    <div class="tca-ledger-row head"><span>Qty</span><span>Open</span><span>Close</span><span>Net PnL</span></div>
+                    ${realizations.slice(0, 8).map((row) => `<div class="tca-ledger-row"><span>${formatQty(row.allocatedQty)}</span><span>${formatPrice(row.openPrice)}</span><span>${formatPrice(row.closePrice)}</span><span class="${formatPnlClass(row.netRealizedPnl || 0)}">${formatUsd(row.netRealizedPnl || 0, 2)}</span></div>`).join('')}
+                </div>
+            ` : '<div class="tca-muted-line">No close allocations yet.</div>'}
+        </div>
+        <div class="tca-ledger-block">
+            <div class="tca-ledger-title">Anomalies</div>
+            ${anomalies.length ? anomalies.map((row) => `<div class="tca-anomaly-banner">${escapeHtml(row.payload?.reason || 'UNKNOWN')} · ${row.sourceTs ? formatAbsoluteTime(row.sourceTs) : 'No timestamp'}</div>`).join('') : '<div class="tca-muted-line">No session PnL anomalies.</div>'}
+        </div>
+    `;
+}
+
+function buildSliceSummary(lifecycles, strategySessions, fallbackRollup) {
+    if (!lifecycles.length) {
+        if (!fallbackRollup) {
+            return {
+                orderCount: 0,
+                terminalOrderCount: 0,
+                fillCount: 0,
+                rejectCount: 0,
+                cancelCount: 0,
+                totalRequestedQty: 0,
+                totalFilledQty: 0,
+                totalFillNotional: 0,
+                totalRepriceCount: 0,
+                avgArrivalSlippageBps: null,
+                avgAckLatencyMs: null,
+                avgWorkingTimeMs: null,
+                avgMarkout1sBps: null,
+                avgMarkout5sBps: null,
+                avgMarkout30sBps: null,
+                selectedMarkoutBps: null,
+                fillRatio: null,
+                rejectRate: null,
+                sessionCount: strategySessions.length,
+                qualityScore: 0,
+                updatedAt: null,
+            };
+        }
+        const selectedMarkoutBps = selectedMarkoutFromRollup(fallbackRollup);
+        const rejectRate = Number(fallbackRollup.orderCount || 0) > 0
+            ? Number(fallbackRollup.rejectCount || 0) / Number(fallbackRollup.orderCount || 1)
+            : null;
+        const fillRatio = fallbackRollup.fillRatio ?? null;
+        const summary = {
+            orderCount: Number(fallbackRollup.orderCount || 0),
+            terminalOrderCount: Number(fallbackRollup.terminalOrderCount || 0),
+            fillCount: Number(fallbackRollup.fillCount || 0),
+            rejectCount: Number(fallbackRollup.rejectCount || 0),
+            cancelCount: Number(fallbackRollup.cancelCount || 0),
+            totalRequestedQty: Number(fallbackRollup.totalRequestedQty || 0),
+            totalFilledQty: Number(fallbackRollup.totalFilledQty || 0),
+            totalFillNotional: Number(fallbackRollup.totalFillNotional || 0),
+            totalRepriceCount: Number(fallbackRollup.totalRepriceCount || 0),
+            avgArrivalSlippageBps: fallbackRollup.avgArrivalSlippageBps ?? null,
+            avgAckLatencyMs: fallbackRollup.avgAckLatencyMs ?? null,
+            avgWorkingTimeMs: fallbackRollup.avgWorkingTimeMs ?? null,
+            avgMarkout1sBps: fallbackRollup.avgMarkout1sBps ?? null,
+            avgMarkout5sBps: fallbackRollup.avgMarkout5sBps ?? null,
+            avgMarkout30sBps: fallbackRollup.avgMarkout30sBps ?? null,
+            selectedMarkoutBps,
+            fillRatio,
+            rejectRate,
+            sessionCount: strategySessions.length,
+            qualityScore: 0,
+            updatedAt: fallbackRollup.updatedAt || null,
+        };
+        summary.qualityScore = buildQualityScore(summary);
+        return summary;
+    }
+
     const summary = {
         orderCount: lifecycles.length,
         terminalOrderCount: 0,
@@ -460,8 +2576,6 @@ function buildSliceSummary(lifecycles, strategySessions) {
         updatedAt: null,
     };
 
-    if (!lifecycles.length) return summary;
-
     const arrivals = [];
     const acks = [];
     const workings = [];
@@ -475,7 +2589,7 @@ function buildSliceSummary(lifecycles, strategySessions) {
         if (row.finalStatus && ['FILLED', 'REJECTED', 'CANCELLED', 'EXPIRED'].includes(row.finalStatus)) {
             summary.terminalOrderCount += 1;
         }
-        if (row.fillCount > 0 || (row.filledQty || 0) > 0) summary.fillCount += 1;
+        if ((row.fillCount || 0) > 0 || (row.filledQty || 0) > 0) summary.fillCount += 1;
         if (row.finalStatus === 'REJECTED') summary.rejectCount += 1;
         if (row.finalStatus === 'CANCELLED' || row.finalStatus === 'EXPIRED') summary.cancelCount += 1;
         summary.totalRequestedQty += Number(row.requestedQty || 0);
@@ -485,9 +2599,9 @@ function buildSliceSummary(lifecycles, strategySessions) {
         if (Number.isFinite(row.arrivalSlippageBps)) arrivals.push(row.arrivalSlippageBps);
         if (Number.isFinite(row.ackLatencyMs)) acks.push(row.ackLatencyMs);
         if (Number.isFinite(row.workingTimeMs)) workings.push(row.workingTimeMs);
-        if (Number.isFinite(row.markouts[1000])) markout1s.push(row.markouts[1000]);
-        if (Number.isFinite(row.markouts[5000])) markout5s.push(row.markouts[5000]);
-        if (Number.isFinite(row.markouts[30000])) markout30s.push(row.markouts[30000]);
+        if (Number.isFinite(row.avgMarkout1sBps)) markout1s.push(row.avgMarkout1sBps);
+        if (Number.isFinite(row.avgMarkout5sBps)) markout5s.push(row.avgMarkout5sBps);
+        if (Number.isFinite(row.avgMarkout30sBps)) markout30s.push(row.avgMarkout30sBps);
         if (Number.isFinite(row.selectedMarkout)) selected.push(row.selectedMarkout);
         const updateTime = new Date(row.updatedAt || row.doneTs || row.firstFillTs || row.intentTs || 0).getTime();
         if (updateTime > 0) updateTimes.push(updateTime);
@@ -516,7 +2630,6 @@ function buildRollupBaseline(rollups) {
             updatedAt: null,
         };
     }
-
     return {
         rollupCount: rollups.length,
         orderCount: rollups.reduce((sum, row) => sum + Number(row.orderCount || 0), 0),
@@ -551,6 +2664,29 @@ function buildSeverityScore(row, selectedMarkout) {
 }
 
 function renderFilterBar(view) {
+    const statusField = PAGE.tab === 'strategies'
+        ? `
+            <label class="tca-filter-field">
+                <span>Session</span>
+                <select data-filter="strategyStatus">
+                    <option value="">All</option>
+                    ${['ACTIVE', 'PAUSED_RESTARTABLE', 'COMPLETED', 'CANCELLED', 'FAILED'].map((status) => `
+                        <option value="${status}" ${PAGE.filters.strategyStatus === status ? 'selected' : ''}>${status}</option>
+                    `).join('')}
+                </select>
+            </label>
+        `
+        : `
+            <label class="tca-filter-field">
+                <span>Status</span>
+                <select data-filter="finalStatus">
+                    <option value="">All</option>
+                    ${['FILLED', 'REJECTED', 'CANCELLED', 'EXPIRED'].map((status) => `
+                        <option value="${status}" ${PAGE.filters.finalStatus === status ? 'selected' : ''}>${status}</option>
+                    `).join('')}
+                </select>
+            </label>
+        `;
     return `
         <div class="tca-filter-grid">
             <label class="tca-filter-field">
@@ -566,15 +2702,7 @@ function renderFilterBar(view) {
                     `).join('')}
                 </select>
             </label>
-            <label class="tca-filter-field">
-                <span>Status</span>
-                <select data-filter="finalStatus">
-                    <option value="">All</option>
-                    ${['FILLED', 'REJECTED', 'CANCELLED', 'EXPIRED'].map((status) => `
-                        <option value="${status}" ${PAGE.filters.finalStatus === status ? 'selected' : ''}>${status}</option>
-                    `).join('')}
-                </select>
-            </label>
+            ${statusField}
             <label class="tca-filter-field">
                 <span>Window</span>
                 <select data-filter="lookback">
@@ -586,7 +2714,8 @@ function renderFilterBar(view) {
             </label>
             <label class="tca-toggle">
                 <input type="checkbox" data-filter="includeNonHard" ${PAGE.filters.includeNonHard ? 'checked' : ''} />
-                <span>Include non-hard rows</span>
+                <span>Show uncertain matches</span>
+                <span class="tca-kpi-help" style="margin-left:2px;">ⓘ<span class="tca-tip">Include rows that are not hard ownership matches.</span></span>
             </label>
         </div>
     `;
@@ -598,7 +2727,7 @@ function renderSummary(view) {
     return `
         <section class="tca-summary-grid">
             <div class="glass-card tca-kpi-card tca-kpi-score">
-                <div class="price-label">Execution Score</div>
+                <div class="price-label">Execution Score ${renderInfoHelp(INFO_TIPS.overviewScore)}</div>
                 <div class="tca-score-row">
                     <div class="price-big">${summary.qualityScore.toFixed(0)}</div>
                     <div class="tca-score-pill ${qualityClass}">${qualityBand(summary.qualityScore)}</div>
@@ -606,14 +2735,14 @@ function renderSummary(view) {
                 <div class="tca-muted-line">Filtered slice. Benchmark: ${view.benchmarkLabel}.</div>
             </div>
             <div class="glass-card tca-kpi-card">
-                <div class="price-label">Avg Arrival</div>
+                <div class="price-label">Avg Arrival ${renderInfoHelp('Average fill versus decision mid across the filtered slice. Lower absolute slippage is cleaner.')}</div>
                 <div class="price-big ${formatPnlClass(-(summary.avgArrivalSlippageBps || 0))}">${formatBps(summary.avgArrivalSlippageBps)}</div>
-                <div class="tca-muted-line">Lower is better for urgent buys.</div>
+                <div class="tca-muted-line">Lower is better for urgent execution.</div>
             </div>
             <div class="glass-card tca-kpi-card">
-                <div class="price-label">Avg ${view.benchmarkLabel}</div>
+                <div class="price-label">Avg ${view.benchmarkLabel} ${renderInfoHelp('Average post-fill move at the selected horizon. Positive means the market moved in your favor after the fill.')}</div>
                 <div class="price-big ${formatPnlClass(summary.selectedMarkoutBps || 0)}">${formatBps(summary.selectedMarkoutBps)}</div>
-                <div class="tca-muted-line">Markout of fills in current filter slice.</div>
+                <div class="tca-muted-line">Markout quality for the selected benchmark horizon.</div>
             </div>
             <div class="glass-card tca-kpi-card">
                 <div class="price-label">Fill Ratio</div>
@@ -665,28 +2794,24 @@ function renderBenchmarkBars(view) {
     const bars = [
         {
             label: 'Arrival slippage',
-            value: summary.avgArrivalSlippageBps,
             width: pctWidth(Math.abs(summary.avgArrivalSlippageBps || 0), 25),
             className: 'tca-bar-negative',
             text: formatBps(summary.avgArrivalSlippageBps),
         },
         {
             label: `${view.benchmarkLabel} markout`,
-            value: summary.selectedMarkoutBps,
             width: pctWidth(Math.abs(summary.selectedMarkoutBps || 0), 25),
             className: (summary.selectedMarkoutBps || 0) >= 0 ? 'tca-bar-positive' : 'tca-bar-negative',
             text: formatBps(summary.selectedMarkoutBps),
         },
         {
             label: 'Fill ratio',
-            value: summary.fillRatio,
             width: pctWidth((summary.fillRatio || 0) * 100, 100),
             className: 'tca-bar-neutral',
             text: formatRatio(summary.fillRatio),
         },
         {
             label: 'Reject rate',
-            value: summary.rejectRate,
             width: pctWidth((summary.rejectRate || 0) * 100, 100),
             className: 'tca-bar-negative',
             text: formatRatio(summary.rejectRate),
@@ -745,7 +2870,7 @@ function renderSparkline(points) {
 
 function renderStrategyLeaders(view) {
     if (!view.strategyLeaders.length) {
-        return `<div class="tca-chart-empty">No strategy sessions match the current filters.</div>`;
+        return '<div class="tca-chart-empty">No strategy sessions match the current filters.</div>';
     }
 
     return `
@@ -754,17 +2879,23 @@ function renderStrategyLeaders(view) {
         const sessionLabel = row.session?.symbol || row.strategyType || 'Session';
         const selectedMarkout = selectedMarkoutFromRollup(row);
         return `
-                    <div class="tca-leader-row">
+                    <button
+                        type="button"
+                        class="tca-leader-row tca-leader-row-button"
+                        data-action="open-strategy-modal"
+                        data-session-id="${row.strategySessionId}"
+                        data-sub-account-id="${row.subAccountId || row.session?.subAccountId || state.currentAccount || ''}"
+                    >
                         <div>
                             <div class="tca-leader-title">${escapeHtml(row.strategyType || 'MANUAL')} · ${escapeHtml(sessionLabel || 'Unknown')}</div>
-                            <div class="tca-leader-subtitle">${escapeHtml(shortId(row.strategySessionId))} · ${row.session?.startedAt ? formatRelativeTime(row.session.startedAt) : 'No start time'}</div>
+                            <div class="tca-leader-subtitle">${escapeHtml(shortId(row.strategySessionId))} · ${row.session?.startedAt ? formatRelativeTime(row.session.startedAt) : 'No start time'} · inspect TCA</div>
                         </div>
                         <div class="tca-leader-metrics">
                             <span class="${formatPnlClass(-(row.avgArrivalSlippageBps || 0))}">${formatBps(row.avgArrivalSlippageBps)}</span>
                             <span class="${formatPnlClass(selectedMarkout || 0)}">${formatBps(selectedMarkout)}</span>
                             <span>${formatUsd(row.totalFillNotional || 0, 0)}</span>
                         </div>
-                    </div>
+                    </button>
                 `;
     }).join('')}
         </div>
@@ -773,44 +2904,55 @@ function renderStrategyLeaders(view) {
 
 function renderLifecycleTable(view) {
     if (!view.lifecycles.length) {
-        return `<div class="tca-chart-empty">No lifecycle rows match the current filter window.</div>`;
+        return '<div class="tca-chart-empty">No lifecycle rows match the current filter window.</div>';
     }
+
+    const sortArrow = (field) => {
+        if (PAGE.sortBy !== field) return '';
+        return PAGE.sortDir === 'asc' ? ' ↑' : ' ↓';
+    };
 
     return `
         <div class="tca-table-wrap">
             <table class="data-table tca-table">
                 <thead>
                     <tr>
-                        <th>Trade</th>
-                        <th>Quality</th>
-                        <th>Latency</th>
+                        <th><button type="button" class="tca-sort-btn" data-action="sort-lifecycles" data-sort-by="updatedAt">Trade${sortArrow('updatedAt')}</button></th>
+                        <th><button type="button" class="tca-sort-btn" data-action="sort-lifecycles" data-sort-by="finalStatus">Status${sortArrow('finalStatus')}</button></th>
+                        <th>Arrival / Markout ${renderInfoHelp(INFO_TIPS.lifecycleQuality)}</th>
+                        <th>Toxicity ${renderInfoHelp(INFO_TIPS.lifecycleToxicity)}</th>
+                        <th>Lineage ${renderInfoHelp(INFO_TIPS.lifecycleLineage)}</th>
                         <th>Fills</th>
-                        <th>Lineage</th>
                     </tr>
                 </thead>
                 <tbody>
-                    ${view.lifecycles.map((row) => `
+                    ${view.lifecycles.map((row) => {
+        const lineageStatus = String(row.lineageStatus || 'UNKNOWN').toUpperCase();
+        const lineageClass = lineageStatus === 'COMPLETE' ? 'is-complete' : (lineageStatus === 'PARTIAL' ? 'is-partial' : 'is-unknown');
+        return `
                         <tr class="${PAGE.selectedLifecycleId === row.lifecycleId ? 'tca-row-active' : ''}">
                             <td>
                                 <button type="button" class="tca-row-button" data-action="open-lifecycle" data-lifecycle-id="${row.lifecycleId}">
                                     <div class="tca-row-title">
                                         <span>${escapeHtml(row.symbol || 'Unknown')}</span>
                                         <span class="badge badge-${row.side === 'SELL' ? 'short' : 'long'}">${escapeHtml(row.side || 'N/A')}</span>
-                                        <span class="tca-state-pill ${statusClass(row.finalStatus)}">${escapeHtml(row.finalStatus || 'LIVE')}</span>
+                                        <span class="tca-meta-pill">${escapeHtml(row.orderRole || 'UNKNOWN')}</span>
                                     </div>
                                     <div class="tca-row-subtitle">${formatRelativeTime(row.doneTs || row.firstFillTs || row.intentTs || row.updatedAt)} · ${escapeHtml(row.originPath || 'UNKNOWN')}</div>
                                 </button>
                             </td>
+                            <td><span class="tca-state-pill ${statusClass(row.finalStatus)}">${escapeHtml(row.finalStatus || 'LIVE')}</span></td>
                             <td>
                                 <div class="tca-cell-stack">
                                     <span class="${formatPnlClass(-(row.arrivalSlippageBps || 0))}">${formatBps(row.arrivalSlippageBps)}</span>
                                     <span class="${formatPnlClass(row.selectedMarkout || 0)}">${formatBps(row.selectedMarkout)}</span>
                                 </div>
                             </td>
+                            <td><span class="tca-meta-pill ${formatPnlClass(-(row.toxicityScore || 0))}">${Number.isFinite(row.toxicityScore) ? row.toxicityScore.toFixed(2) : '—'}</span></td>
                             <td>
                                 <div class="tca-cell-stack">
-                                    <span>${formatMs(row.ackLatencyMs)}</span>
-                                    <span>${formatMs(row.workingTimeMs)}</span>
+                                    <span class="tca-lineage-pill ${lineageClass}">${lineageStatus}</span>
+                                    <button type="button" class="btn btn-outline btn-sm" data-action="inspect-lineage" data-lifecycle-id="${row.lifecycleId}">View</button>
                                 </div>
                             </td>
                             <td>
@@ -819,14 +2961,9 @@ function renderLifecycleTable(view) {
                                     <span>${row.avgFillPrice ? `$${formatPrice(row.avgFillPrice)}` : 'No fill price'}</span>
                                 </div>
                             </td>
-                            <td>
-                                <div class="tca-cell-stack">
-                                    <span>${escapeHtml(row.strategyType || 'MANUAL')}</span>
-                                    <span>${escapeHtml(shortId(row.strategySessionId || row.parentId || row.clientOrderId || row.lifecycleId))}</span>
-                                </div>
-                            </td>
                         </tr>
-                    `).join('')}
+                    `;
+    }).join('')}
                 </tbody>
             </table>
         </div>
@@ -835,13 +2972,12 @@ function renderLifecycleTable(view) {
 
 function renderDrawer(view) {
     if (!PAGE.selectedLifecycleId) return '';
-
     return `
         <div class="tca-drawer-overlay">
             <aside class="tca-drawer">
                 <div class="tca-drawer-header">
                     <div>
-                        <div class="card-title">Lifecycle Detail</div>
+                        <div class="card-title">Lifecycle Detail ${renderInfoHelp(INFO_TIPS.lifecycleDrawer)}</div>
                         <div class="tca-drawer-title">${PAGE.detail ? escapeHtml(PAGE.detail.symbol || 'Unknown') : 'Loading lifecycle'}</div>
                     </div>
                     <button type="button" class="modal-close" data-action="close-drawer">×</button>
@@ -866,16 +3002,17 @@ function renderDetailContent(view, detail) {
                 <span class="tca-state-pill ${statusClass(detail.finalStatus)}">${escapeHtml(detail.finalStatus || 'LIVE')}</span>
                 <span class="tca-meta-pill">${escapeHtml(detail.executionScope || 'SUB_ACCOUNT')}</span>
                 <span class="tca-meta-pill">${escapeHtml(detail.ownershipConfidence || 'HARD')}</span>
+                <span class="tca-meta-pill">${escapeHtml(detail.orderRole || 'UNKNOWN')}</span>
                 <span class="tca-meta-pill">${escapeHtml(detail.reconciliationStatus || 'PENDING')}</span>
             </div>
 
             <div class="tca-detail-grid">
                 <div class="stat-item">
-                    <div class="stat-label">Arrival</div>
+                    <div class="stat-label">Arrival <span class="tca-kpi-help">ⓘ<span class="tca-tip">Slippage from decision mid to fill price.</span></span></div>
                     <div class="stat-value ${formatPnlClass(-(detail.arrivalSlippageBps || 0))}">${formatBps(detail.arrivalSlippageBps)}</div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-label">Ack Latency</div>
+                    <div class="stat-label">Ack Latency <span class="tca-kpi-help">ⓘ<span class="tca-tip">Time from submit to exchange acknowledgement.</span></span></div>
                     <div class="stat-value">${formatMs(detail.ackLatencyMs)}</div>
                 </div>
                 <div class="stat-item">
@@ -893,10 +3030,11 @@ function renderDetailContent(view, detail) {
             <div class="glass-card tca-detail-card">
                 <div class="card-title">Price Path</div>
                 ${renderPricePath(pricePathPoints)}
+                ${renderPricePathBpsRow(pricePathPoints)}
             </div>
 
             <div class="glass-card tca-detail-card">
-                <div class="card-title">Lineage</div>
+                <div class="card-title">Lineage ${renderInfoHelp(INFO_TIPS.lifecycleLineage)}</div>
                 <div class="tca-lineage-grid">
                     <div><span>Strategy</span><strong>${escapeHtml(detail.strategyType || 'MANUAL')}</strong></div>
                     <div><span>Session</span><strong>${escapeHtml(shortId(detail.strategySessionId || detail.parentId || 'N/A'))}</strong></div>
@@ -912,26 +3050,54 @@ function renderDetailContent(view, detail) {
                         <span>${strategySession.startedAt ? formatRelativeTime(strategySession.startedAt) : 'No start time'}</span>
                     </div>
                 ` : ''}
+                ${(detail.lineageAnomalies || []).length ? `
+                    <div class="tca-session-strip" style="border-color:rgba(255,127,80,.35);color:#ffd9c9;">
+                        <span>Lineage anomaly</span>
+                        <span>${escapeHtml(detail.lineageAnomalies[0]?.payload?.reason || 'UNKNOWN')}</span>
+                    </div>
+                ` : ''}
+                ${renderLineageGraph(detail)}
+            </div>
+
+            <div class="glass-card tca-detail-card">
+                <div class="card-title">Role Quality ${renderInfoHelp(INFO_TIPS.executionQuality)}</div>
+                ${renderExecutionQualityGuide({ unknownRoleCount: detail.orderRole === 'UNKNOWN' ? 1 : 0 })}
+                ${renderRoleQuality(detail)}
             </div>
 
             <div class="glass-card tca-detail-card">
                 <div class="card-title">Fill Context</div>
                 ${fillRows.length ? `
                     <div class="tca-fill-list">
-                        ${fillRows.map((fill) => `
-                            <div class="tca-fill-row">
-                                <div>
-                                    <div class="tca-leader-title">${formatQty(fill.fillQty)} @ $${formatPrice(fill.fillPrice)}</div>
-                                    <div class="tca-leader-subtitle">${formatRelativeTime(fill.fillTs)} · ${escapeHtml(fill.makerTaker || 'Unknown liquidity')}</div>
+                        ${fillRows.map((fill) => {
+        const liqClass = (fill.makerTaker || '').toLowerCase().includes('maker') ? 'liq-maker' : 'liq-taker';
+        const liqLabel = (fill.makerTaker || '').toLowerCase().includes('maker') ? 'MAKER' : 'TAKER';
+        const mk1 = fill.markouts.find((r) => r.horizonMs === 1000);
+        const mk5 = fill.markouts.find((r) => r.horizonMs === 5000);
+        const mk30 = fill.markouts.find((r) => r.horizonMs === 30000);
+        const mkBadge = (label, mk) => {
+            if (!mk || !Number.isFinite(mk.markoutBps)) return `<span class="tca-fill-mkbadge mk-neutral">${label} —</span>`;
+            const cls = mk.markoutBps >= 0 ? 'mk-pos' : 'mk-neg';
+            const sign = mk.markoutBps > 0 ? '+' : '';
+            return `<span class="tca-fill-mkbadge ${cls}">${label} ${sign}${mk.markoutBps.toFixed(1)}</span>`;
+        };
+        return `
+                                <div class="tca-fill-row">
+                                    <div>
+                                        <div class="tca-leader-title" style="gap:6px;">
+                                            <span>${formatQty(fill.fillQty)} @ $${formatPrice(fill.fillPrice)}</span>
+                                            <span class="tca-fill-liq-pill ${liqClass}">${liqLabel}</span>
+                                        </div>
+                                        <div class="tca-leader-subtitle">${formatRelativeTime(fill.fillTs)} · Mid: ${fill.fillMid ? '$' + formatPrice(fill.fillMid) : '—'}</div>
+                                        <div class="tca-fill-markouts">
+                                            ${mkBadge('1s', mk1)}
+                                            ${mkBadge('5s', mk5)}
+                                            ${mkBadge('30s', mk30)}
+                                        </div>
+                                    </div>
                                 </div>
-                                <div class="tca-leader-metrics">
-                                    <span>${fill.fillMid ? `$${formatPrice(fill.fillMid)}` : 'No mid'}</span>
-                                    <span>${formatBps(fill.markouts.find((row) => row.horizonMs === 1000)?.markoutBps)}</span>
-                                    <span>${formatBps(fill.markouts.find((row) => row.horizonMs === 5000)?.markoutBps)}</span>
-                                    <span>${formatBps(fill.markouts.find((row) => row.horizonMs === 30000)?.markoutBps)}</span>
-                                </div>
-                            </div>
-                        `).join('')}
+                            `;
+    }).join('')}
                     </div>
                 ` : '<div class="tca-chart-empty">No fills recorded for this lifecycle.</div>'}
             </div>
@@ -939,19 +3105,33 @@ function renderDetailContent(view, detail) {
             <div class="glass-card tca-detail-card">
                 <div class="card-title">Timeline</div>
                 ${eventRows.length ? `
-                    <div class="tca-timeline">
-                        ${eventRows.map((event) => `
-                            <div class="tca-timeline-row">
-                                <div class="tca-timeline-meta">
-                                    <strong>${escapeHtml(event.eventType)}</strong>
-                                    <span>${formatAbsoluteTime(event.sourceTs || event.createdAt)}</span>
+                    <div class="tca-timeline" style="gap:8px;">
+                        ${eventRows.map((event) => {
+        const evtClass = getEventTypeClass(event.eventType);
+        const fields = parseEventPayload(event);
+        return `
+                                <div class="tca-evt-card">
+                                    <div class="tca-evt-header">
+                                        <span class="tca-evt-type ${evtClass}">${escapeHtml(event.eventType)}</span>
+                                        <span class="tca-evt-time">${formatAbsoluteTime(event.sourceTs || event.createdAt)}</span>
+                                    </div>
+                                    ${fields.length ? `
+                                        <div class="tca-evt-fields">
+                                            ${fields.map((f) => `
+                                                <div class="tca-evt-field">
+                                                    <span class="tca-evt-field-label">${escapeHtml(f.label)}</span>
+                                                    <span class="tca-evt-field-value">${escapeHtml(f.value)}</span>
+                                                </div>
+                                            `).join('')}
+                                        </div>
+                                    ` : ''}
+                                    <details class="tca-evt-raw">
+                                        <summary>Raw payload</summary>
+                                        <pre>${escapeHtml(JSON.stringify(event.payload || {}, null, 2))}</pre>
+                                    </details>
                                 </div>
-                                <details class="tca-event-details">
-                                    <summary>${escapeHtml(shortId(event.streamEventId, 28))}</summary>
-                                    <pre>${escapeHtml(JSON.stringify(event.payload || {}, null, 2))}</pre>
-                                </details>
-                            </div>
-                        `).join('')}
+                            `;
+    }).join('')}
                     </div>
                 ` : '<div class="tca-chart-empty">No lifecycle events persisted.</div>'}
             </div>
@@ -959,23 +3139,153 @@ function renderDetailContent(view, detail) {
     `;
 }
 
+function renderRoleQuality(detail) {
+    const rows = Object.entries(detail.qualityByRole || {});
+    if (!rows.length) return '<div class="tca-chart-empty">No role-level metrics available.</div>';
+    return `
+        <div class="tca-fill-list">
+            ${rows.map(([role, metrics]) => `
+                <div class="tca-fill-row">
+                    <div>
+                        <div class="tca-leader-title">${escapeHtml(role)}</div>
+                        <div class="tca-muted-line">${escapeHtml(roleDescription(role))}</div>
+                        <div class="tca-leader-subtitle">
+                            Arrival ${formatBps(metrics?.avgArrivalSlippageBps)} ·
+                            1s ${formatBps(metrics?.avgMarkout1sBps)} ·
+                            5s ${formatBps(metrics?.avgMarkout5sBps)} ·
+                            30s ${formatBps(metrics?.avgMarkout30sBps)}
+                        </div>
+                        <div class="tca-muted-line">${metrics?.lifecycleCount ?? 0} lifecycle(s) · ${metrics?.fillCount ?? 0} fill sample(s)</div>
+                    </div>
+                    <div class="tca-fill-mkbadge ${formatPnlClass(-(metrics?.toxicityScore || 0))}">
+                        Toxicity ${Number.isFinite(metrics?.toxicityScore) ? metrics.toxicityScore.toFixed(2) : '—'}
+                    </div>
+                </div>
+            `).join('')}
+        </div>
+    `;
+}
+
+function renderLineageGraph(detail) {
+    if (detail?.lineageGraphLoading) {
+        return '<div class="tca-chart-empty">Loading lineage graph…</div>';
+    }
+    if (detail?.lineageGraphError) {
+        return `<div class="tca-inline-error">${escapeHtml(detail.lineageGraphError)}</div>`;
+    }
+    const graph = detail.lineageGraph;
+    if (!graph || (!graph.nodes?.length && !graph.edges?.length)) {
+        return '<div class="tca-chart-empty">No lineage graph edges persisted yet.</div>';
+    }
+    const nodes = (graph.nodes || []).slice(0, 24);
+    const edges = (graph.edges || []).slice(0, 32);
+    return `
+        <div class="tca-session-strip">
+            <span>${graph.stats?.nodeCount || nodes.length} node(s)</span>
+            <span>${graph.stats?.edgeCount || edges.length} edge(s)</span>
+            ${graph.truncated ? '<span>truncated</span>' : ''}
+        </div>
+        <div class="tca-session-strip">
+            <span>Root</span>
+            <span>${escapeHtml(graph.stats?.rootNodeType || 'NODE')}</span>
+            <span>${escapeHtml(shortId(graph.stats?.rootNodeId || 'N/A', 22))}</span>
+        </div>
+        <div class="tca-fill-list">
+            ${nodes.map((node) => `
+                <div class="tca-fill-row">
+                    <div class="tca-leader-title">${escapeHtml(node.nodeType || 'NODE')}</div>
+                    <div class="tca-leader-subtitle">${escapeHtml(shortId(node.nodeId || 'N/A', 24))}</div>
+                </div>
+            `).join('')}
+        </div>
+        <div class="tca-timeline" style="gap:6px;">
+            ${edges.map((edge) => `
+                <div class="tca-evt-card">
+                    <div class="tca-evt-header">
+                        <span class="tca-evt-type evt-default">${escapeHtml(edge.relationType || 'REL')}</span>
+                        <span class="tca-evt-time">${formatAbsoluteTime(edge.sourceTs || edge.createdAt)}</span>
+                    </div>
+                    <div class="tca-evt-fields">
+                        <div class="tca-evt-field"><span class="tca-evt-field-label">From</span><span class="tca-evt-field-value">${escapeHtml(shortId(edge.parentNodeId || 'N/A', 22))}</span></div>
+                        <div class="tca-evt-field"><span class="tca-evt-field-label">To</span><span class="tca-evt-field-value">${escapeHtml(shortId(edge.childNodeId || 'N/A', 22))}</span></div>
+                    </div>
+                </div>
+            `).join('')}
+        </div>
+    `;
+}
+
+function getEventTypeClass(eventType) {
+    if (!eventType) return 'evt-default';
+    const t = eventType.toUpperCase();
+    if (t.includes('PLACE') || t.includes('NEW') || t.includes('SUBMIT')) return 'evt-placed';
+    if (t.includes('ACK') || t.includes('ACCEPT')) return 'evt-ack';
+    if (t.includes('FILL') || t.includes('TRADE')) return 'evt-fill';
+    if (t.includes('CANCEL') || t.includes('EXPIRE')) return 'evt-cancel';
+    if (t.includes('REJECT') || t.includes('ERROR')) return 'evt-reject';
+    if (t.includes('REPLACE') || t.includes('AMEND') || t.includes('REPRICE')) return 'evt-replace';
+    return 'evt-default';
+}
+
+function parseEventPayload(event) {
+    const payload = event.payload || {};
+    const fields = [];
+    const KEYS = [
+        'price',
+        'stopPrice',
+        'quantity',
+        'filledQty',
+        'side',
+        'status',
+        'orderType',
+        'order_role',
+        'strategy_session_id',
+        'parent_strategy_session_id',
+        'root_strategy_session_id',
+        'replaces_client_order_id',
+        'timeInForce',
+        'reason',
+        'rejectReason',
+        'executionType',
+        'makerTaker',
+    ];
+    for (const key of KEYS) {
+        if (payload[key] != null && payload[key] !== '') {
+            let val = payload[key];
+            if (typeof val === 'number') {
+                if (key.toLowerCase().includes('price')) val = '$' + formatPrice(val);
+                else if (key.toLowerCase().includes('qty') || key.toLowerCase().includes('quantity')) val = formatQty(val);
+            }
+            fields.push({ label: key.replace(/([A-Z])/g, ' $1').trim(), value: String(val) });
+        }
+    }
+    return fields;
+}
+
+function renderPricePathBpsRow(points) {
+    if (points.length < 2) return '';
+    const steps = [];
+    for (let i = 1; i < points.length; i += 1) {
+        const prev = points[i - 1];
+        const curr = points[i];
+        const bps = ((curr.value - prev.value) / prev.value) * 10000;
+        const cls = bps >= 0 ? 'pnl-up' : 'pnl-down';
+        const sign = bps > 0 ? '+' : '';
+        steps.push(`<span class="tca-pp-step"><span>${escapeHtml(prev.label)}</span><span class="pp-arrow">→</span><span>${escapeHtml(curr.label)}</span><span class="${cls}" style="font-weight:600;">${sign}${bps.toFixed(1)} bps</span></span>`);
+    }
+    return `<div class="tca-pricepath-detail">${steps.join('')}</div>`;
+}
+
 function buildPricePathPoints(detail) {
     const points = [];
-    if (Number.isFinite(detail.decisionMid)) {
-        points.push({ label: 'Decision', value: detail.decisionMid });
-    }
+    if (Number.isFinite(detail.decisionMid)) points.push({ label: 'Decision', value: detail.decisionMid });
     if (Array.isArray(detail.fills) && detail.fills.length) {
         const fillAnchor = average(detail.fills.map((fill) => fill.fillMid || fill.fillPrice));
         if (Number.isFinite(fillAnchor)) points.push({ label: 'Fill', value: fillAnchor });
     } else if (Number.isFinite(detail.avgFillPrice)) {
         points.push({ label: 'Fill', value: detail.avgFillPrice });
     }
-
-    const horizons = [
-        [1000, '1s'],
-        [5000, '5s'],
-        [30000, '30s'],
-    ];
+    const horizons = [[1000, '1s'], [5000, '5s'], [30000, '30s']];
     for (const [horizonMs, label] of horizons) {
         const values = (detail.fills || [])
             .map((fill) => fill.markouts.find((markout) => markout.horizonMs === horizonMs)?.markPrice)
@@ -987,9 +3297,7 @@ function buildPricePathPoints(detail) {
 }
 
 function renderPricePath(points) {
-    if (!points.length) {
-        return `<div class="tca-chart-empty">Not enough market context to draw a price path.</div>`;
-    }
+    if (!points.length) return '<div class="tca-chart-empty">Not enough market context to draw a price path.</div>';
 
     const width = 500;
     const height = 160;
@@ -1027,10 +3335,23 @@ function selectedMarkoutFromRollup(row) {
     return row.avgMarkout5sBps;
 }
 
+function selectedMarkoutFromLifecycle(row, benchmarkMs) {
+    if (benchmarkMs === 1000) return row.avgMarkout1sBps;
+    if (benchmarkMs === 30000) return row.avgMarkout30sBps;
+    return row.avgMarkout5sBps;
+}
+
 function selectedMarkoutFromDetail(detail, benchmarkMs) {
     if (benchmarkMs === 1000) return detail.markoutSummary?.avgMarkout1sBps;
     if (benchmarkMs === 30000) return detail.markoutSummary?.avgMarkout30sBps;
     return detail.markoutSummary?.avgMarkout5sBps;
+}
+
+function computeToxicityScore(avgArrivalSlippageBps, avgMarkout1sBps, avgMarkout5sBps) {
+    const mark1 = clamp(-(Number(avgMarkout1sBps) || 0), 0, 50);
+    const mark5 = clamp(-(Number(avgMarkout5sBps) || 0), 0, 50);
+    const arrival = clamp(Math.abs(Number(avgArrivalSlippageBps) || 0), 0, 50);
+    return (0.5 * mark1) + (0.3 * mark5) + (0.2 * arrival);
 }
 
 function average(values) {
@@ -1091,9 +3412,7 @@ function formatRelativeTime(value) {
     const minute = 60 * 1000;
     const hour = 60 * minute;
     const day = 24 * hour;
-
     if (absMs < minute) return 'just now';
-
     const suffix = diffMs >= 0 ? 'ago' : 'ahead';
     if (absMs < hour) return `${Math.round(absMs / minute)}m ${suffix}`;
     if (absMs < day) return `${Math.round(absMs / hour)}h ${suffix}`;
@@ -1135,3 +3454,18 @@ function escapeHtml(value) {
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
 }
+
+export const __tcaTestHooks = {
+    parseTcaHashState,
+    buildPaginationWindow,
+    buildViewModel,
+    resolveLineageRoleMetrics,
+    renderStrategyLeaders,
+    renderDetailContent,
+    renderRoleQuality,
+    renderLineageGraph,
+    renderStrategyLotLedger,
+    renderStrategyTimeline,
+    renderMultiSeriesChart,
+    roleMetricsFromStrategyDetail,
+};

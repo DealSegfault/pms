@@ -211,6 +211,15 @@ export function createWsClient({
                     return;
                 }
 
+                if (msg.type === 'scalper_progress') {
+                    if (isMyEvent) dispatchEvent('scalper_progress', msg.data);
+                    return;
+                }
+
+                if (msg.type === 'scalper_filled') {
+                    if (isMyEvent) dispatchEvent('scalper_filled', msg.data);
+                    return;
+                }
 
                 if (msg.type === 'twap_progress') {
                     if (isMyEvent) dispatchEvent('twap_progress', msg.data);

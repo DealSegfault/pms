@@ -7,6 +7,17 @@ import * as S from './state.js';
 import { _refreshEquityUpnl } from './order-form.js';
 import { cancelTwap } from './twap.js';
 import { scheduleTradingRefresh } from './refresh-scheduler.js';
+import { openTcaStrategyModal } from '../tca/strategy-modal.js';
+
+/** Compact notional formatter: $1.2K, $45.6K, $1.2M etc. */
+function _fmtNotional(v) {
+    if (!v || !Number.isFinite(v)) return '$0';
+    const abs = Math.abs(v);
+    if (abs >= 1e9) return `$${(v / 1e9).toFixed(1)}B`;
+    if (abs >= 1e6) return `$${(v / 1e6).toFixed(1)}M`;
+    if (abs >= 1e3) return `$${(v / 1e3).toFixed(1)}K`;
+    return `$${v.toFixed(0)}`;
+}
 
 // ── Optimistic Open Order Helpers (WS-driven, no HTTP) ──
 
@@ -254,6 +265,7 @@ export async function loadOpenOrders() {
             const sym = sp.symbol.split('/')[0];
             const children = scalperChildMap.get(sp.scalperId) || [];
             const fillCount = sp.totalFillCount || 0;
+            const statusLabel = String(sp.status || 'ACTIVE').toUpperCase();
             const longChildren = children.filter(c => c.side === 'LONG');
             const shortChildren = children.filter(c => c.side === 'SHORT');
             const totalLayers = sp.childCount * 2;
@@ -263,22 +275,36 @@ export async function loadOpenOrders() {
 
             // Parent row
             html += `
-        <div class="oo-row" data-scalper-id="${sp.scalperId}" style="border-left:3px solid #a855f7; background:rgba(168,85,247,0.06); cursor:pointer; user-select:none;" onclick="(function(row){const drawer=row.nextElementSibling; const open=drawer.style.display==='none'; drawer.style.display=open?'':'none'; const arrow=row.querySelector('.sc-arrow'); if(arrow) arrow.style.transform=open?'rotate(90deg)':'rotate(0deg)';})(this)">
-          <span class="oor-sym">
-            <span class="oor-name" data-oo-symbol="${sp.symbol}">${sym}</span>
-            <span data-edit-type="SCALPER" data-edit='${scalperEdit.replace(/'/g, "&#39;")}' style="font-size:9px; color:#a855f7; font-weight:700; margin-left:4px; cursor:pointer; text-decoration:underline dotted; text-underline-offset:2px;" title="Click to edit" onclick="event.stopPropagation()">⚔ SCALPER</span>
+        <div class="oo-row" data-scalper-id="${sp.scalperId}" style="border-left:3px solid #a855f7; background:rgba(168,85,247,0.06); cursor:pointer; user-select:none; padding:4px 8px;" onclick="(function(row){const drawer=row.nextElementSibling; const open=drawer.style.display==='none'; drawer.style.display=open?'':'none'; const arrow=row.querySelector('.sc-arrow'); if(arrow) arrow.style.transform=open?'rotate(90deg)':'rotate(0deg)';})(this)">
+          <span class="oor-sym" style="gap:4px;">
+            <button
+              type="button"
+              class="tca-inline-trigger"
+              data-open-scalper-tca="${sp.scalperId}"
+              data-open-scalper-sub-account="${sp.subAccountId || state.currentAccount || ''}"
+              title="Inspect strategy TCA"
+              onclick="event.stopPropagation()"
+            >TCA</button>
+            <span class="oor-name" data-oo-symbol="${sp.symbol}" style="font-size:12px;">${sym}</span>
+            <span data-edit-type="SCALPER" data-edit='${scalperEdit.replace(/'/g, "&#39;")}' style="font-size:8px; color:#a855f7; font-weight:700; cursor:pointer; text-decoration:underline dotted; text-underline-offset:2px;" title="Click to edit" onclick="event.stopPropagation()">⚔ SCALPER</span>
+            <span class="scalper-status-chip">${statusLabel}</span>
           </span>
-          <span class="oor-price" style="display:flex; flex-direction:column; align-items:flex-end; gap:1px;">
-            <span style="font-size:10px; font-weight:600;">${activeCount}/${totalLayers} layers</span>
-            <span style="font-size:9px; color:var(--text-muted);">${fillCount} fills</span>
+          <span class="oor-price" style="display:flex; align-items:center; gap:6px; font-size:10px;">
+            <span style="font-weight:600;">${activeCount}/${totalLayers}</span>
+            <span style="color:var(--text-muted);">${fillCount}f</span>
           </span>
-          <span class="oor-qty" style="min-width:60px; font-size:10px; display:flex; flex-direction:column; gap:1px;">
-            <span><span style="color:#06b6d4;">L ${sp.longOffsetPct?.toFixed(2) ?? '?'}%</span> &middot; <span style="color:#f97316;">S ${sp.shortOffsetPct?.toFixed(2) ?? '?'}%</span></span>
-            ${sp.longMaxPrice || sp.shortMinPrice ? `<span style="font-size:8px; color:var(--text-muted); opacity:0.8;">${sp.longMaxPrice ? `<span style="color:#06b6d4;" title="LONG won't restart above this price">↑$${formatPrice(sp.longMaxPrice)}</span>` : ''}${sp.longMaxPrice && sp.shortMinPrice ? ' · ' : ''}${sp.shortMinPrice ? `<span style="color:#f97316;" title="SHORT won't restart below this price">↓$${formatPrice(sp.shortMinPrice)}</span>` : ''}</span>` : ''}
+          <span class="oor-qty" style="min-width:auto; font-size:9px; display:flex; align-items:center; gap:4px;">
+            <span style="color:#06b6d4;">L ${sp.longOffsetPct?.toFixed(2) ?? '?'}%</span>
+            <span style="color:#f97316;">S ${sp.shortOffsetPct?.toFixed(2) ?? '?'}%</span>
           </span>
-          <span class="oor-notional" style="font-size:9px; color:#a855f7;"><span class="sc-arrow" style="display:inline-block; transition:transform 0.15s;">▸</span> ${sp.childCount}L</span>
-          <span class="oor-age">${age}</span>
-          <span class="oor-cancel" data-cancel-scalper="${sp.scalperId}" title="Stop Scalper" onclick="event.stopPropagation()">✕</span>
+          <span class="oor-notional" data-scalper-pnl="${sp.scalperId}" style="font-size:10px; font-weight:600; font-family:var(--font-mono); color:var(--text-muted);">
+            —
+          </span>
+          <span class="oor-age" style="font-size:9px;">${age}</span>
+          <span class="oor-cancel" onclick="event.stopPropagation()">
+            <span class="sc-arrow" style="display:inline-block; transition:transform 0.15s; margin-right:4px; color:#a855f7; font-size:10px;">▸</span>
+            <span data-cancel-scalper="${sp.scalperId}" title="Stop Scalper">✕</span>
+          </span>
         </div>
         <div data-scalper-drawer="${sp.scalperId}" style="display:none; background:rgba(168,85,247,0.03); border-left:3px solid rgba(168,85,247,0.25); padding-left:8px;">
       `;
@@ -401,6 +427,15 @@ export async function loadOpenOrders() {
             btn.addEventListener('click', e => {
                 e.stopPropagation();
                 import('./scalper.js').then(m => m.cancelScalper(btn.dataset.cancelScalper));
+            });
+        });
+        list.querySelectorAll('[data-open-scalper-tca]').forEach((btn) => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                void openTcaStrategyModal({
+                    subAccountId: btn.dataset.openScalperSubAccount || state.currentAccount,
+                    strategySessionId: btn.dataset.openScalperTca,
+                });
             });
         });
 
@@ -810,10 +845,12 @@ export function recalcCompactPnl(symbol, markPrice) {
         const pnlPct = totalMargin > 0 ? (pnl / totalMargin) * 100 : 0;
         const pnlSign = pnl >= 0 ? '+' : '';
         const sideLabel = isLong ? 'Long' : 'Short';
+        const liveNotional = markPrice * totalQty;
+        const notionalStr = _fmtNotional(liveNotional);
         try {
             line.applyOptions({
                 price: avgEntry,
-                title: `${sideLabel} ${pnlSign}$${Math.abs(pnl).toFixed(2)} (${pnlSign}${pnlPct.toFixed(1)}%)`,
+                title: `${sideLabel} ${notionalStr} ${pnlSign}$${Math.abs(pnl).toFixed(2)} (${pnlSign}${pnlPct.toFixed(1)}%)`,
             });
         } catch { /* line may have been removed */ }
     }
@@ -1067,6 +1104,7 @@ function _drawChartAnnotations(data, showPositions, showOpenOrders, showPastOrde
             const pnlPct = g.totalMargin > 0 ? (pnl / g.totalMargin) * 100 : 0;
             const pnlSign = pnl >= 0 ? '+' : '';
             const sideLabel = isLong ? 'Long' : 'Short';
+            const notionalStr = _fmtNotional(g.totalNotional || (g.totalQty * avgEntry));
 
             const entryLine = S.candleSeries.createPriceLine({
                 price: avgEntry,
@@ -1081,8 +1119,8 @@ function _drawChartAnnotations(data, showPositions, showOpenOrders, showPastOrde
             _positionLineRegistry.set(groupKey, entryLine);
             leftLabelSpecs.push({
                 price: avgEntry,
-                html: `<span style="opacity:0.85">${sideLabel}</span> ${pnlSign}$${Math.abs(pnl).toFixed(2)} <span style="opacity:0.75">(${pnlSign}${pnlPct.toFixed(1)}%)</span>`,
-                text: `${sideLabel} ${pnlSign}$${Math.abs(pnl).toFixed(2)} (${pnlSign}${pnlPct.toFixed(1)}%)`,
+                html: `<span style="opacity:0.85">${sideLabel}</span> <span style="opacity:0.7">${notionalStr}</span> ${pnlSign}$${Math.abs(pnl).toFixed(2)} <span style="opacity:0.75">(${pnlSign}${pnlPct.toFixed(1)}%)</span>`,
+                text: `${sideLabel} ${notionalStr} ${pnlSign}$${Math.abs(pnl).toFixed(2)} (${pnlSign}${pnlPct.toFixed(1)}%)`,
                 tone: isLong ? 'long' : 'short',
             });
 

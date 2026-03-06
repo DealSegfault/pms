@@ -488,6 +488,8 @@ class TWAPEngine:
                 # Fire lot
                 lot_qty = state.lot_sizes[i]
                 try:
+                    reduce_only = bool(getattr(state, "reduce_only", False))
+                    order_role = "UNWIND" if reduce_only else "ENTRY"
                     await self._om.place_market_order(
                         sub_account_id=state.sub_account_id,
                         symbol=state.symbol,
@@ -496,6 +498,10 @@ class TWAPEngine:
                         leverage=state.leverage,
                         origin="TWAP",
                         parent_id=state.id,
+                        order_role=order_role,
+                        strategy_session_id=state.id,
+                        root_strategy_session_id=state.id,
+                        reduce_only=reduce_only,
                     )
                     state.filled_lots += 1
                     state.filled_quantity += lot_qty

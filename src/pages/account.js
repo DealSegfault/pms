@@ -21,77 +21,7 @@ export function renderAccountPage(container) {
       </div>
 
       <!-- ═══════════════════════════════════ -->
-      <!-- THEME SELECTOR                     -->
-      <!-- ═══════════════════════════════════ -->
-      <div class="glass-card" style="margin-bottom:16px;">
-        <div class="card-title" style="margin-bottom:12px;">🎨 Theme</div>
-        <div id="theme-picker" style="display:flex; gap:10px; flex-wrap:wrap;">
-          ${THEMES.map(t => `
-            <button
-              class="theme-swatch${t.id === currentTheme ? ' theme-swatch-active' : ''}"
-              data-theme-id="${t.id}"
-              style="
-                flex:1; min-width:100px; padding:14px 12px;
-                background: linear-gradient(135deg, ${t.bg[0]}, ${t.bg[1]});
-                border: 2px solid ${t.id === currentTheme ? t.color : 'var(--border)'};
-                border-radius: var(--radius);
-                cursor: pointer;
-                transition: all 0.2s;
-                display:flex; flex-direction:column; align-items:center; gap:6px;
-                position:relative; overflow:hidden;
-              "
-            >
-              <span style="font-size:24px;">${t.emoji}</span>
-              <span style="font-size:13px; font-weight:700; color:${t.color};">${t.label}</span>
-              <div style="display:flex; gap:4px; margin-top:2px;">
-                <span style="width:12px;height:12px;border-radius:50%;background:${t.color};"></span>
-                <span style="width:12px;height:12px;border-radius:50%;background:${t.green};"></span>
-                <span style="width:12px;height:12px;border-radius:50%;background:${t.red};"></span>
-              </div>
-              ${t.id === currentTheme ? '<div style="position:absolute;top:6px;right:8px;font-size:12px;">✓</div>' : ''}
-            </button>
-          `).join('')}
-        </div>
-      </div>
-
-      <!-- ═══════════════════════════════════ -->
-      <!-- API KEY SECTION                    -->
-      <!-- ═══════════════════════════════════ -->
-      <div class="glass-card" style="margin-bottom:16px;">
-        <div class="card-title" style="margin-bottom:12px;">🔑 API Key</div>
-        <div style="font-size:11px; color:var(--text-muted); margin-bottom:10px;">Use this key to authenticate bot/API requests via the <code>X-PMS-Key</code> header.</div>
-        <div id="api-key-display" style="display:flex; align-items:center; gap:8px; margin-bottom:10px;">
-          <input id="api-key-value" type="text" readonly
-            style="flex:1; padding:8px 12px; background:var(--card-bg); color:var(--text-primary); border:1px solid var(--border); border-radius:8px; font-family:var(--font-mono); font-size:12px; cursor:default;"
-            value="Loading…" />
-          <button id="api-key-copy-btn" class="btn" style="padding:6px 12px; font-size:12px; white-space:nowrap;" disabled>📋 Copy</button>
-        </div>
-        <div style="display:flex; gap:8px;">
-          <button id="api-key-generate-btn" class="btn btn-primary" style="padding:6px 14px; font-size:12px;">Generate Key</button>
-          <button id="api-key-regenerate-btn" class="btn" style="padding:6px 14px; font-size:12px; display:none;">🔄 Regenerate</button>
-        </div>
-        <div id="api-key-status" style="font-size:10px; margin-top:6px;"></div>
-      </div>
-
-
-      <!-- ═══════════════════════════════════ -->
-      <!-- BIOMETRIC LOGIN SECTION            -->
-      <!-- ═══════════════════════════════════ -->
-      <div class="glass-card" style="margin-bottom:16px;">
-        <div class="card-title" style="margin-bottom:12px;">🔐 Biometric Login</div>
-        <div style="font-size:11px; color:var(--text-muted); margin-bottom:12px;">
-          Register your fingerprint, face, or security key for passwordless login.
-        </div>
-        <div id="webauthn-credentials-list" style="margin-bottom:12px;"></div>
-        <button id="webauthn-register-btn" class="btn btn-primary" style="padding:8px 16px; font-size:12px; display:flex; align-items:center; gap:6px;">
-          <span style="font-size:18px;">👆</span> Register Biometric
-        </button>
-        <div id="webauthn-status" style="font-size:11px; margin-top:8px;"></div>
-      </div>
-
-
-      <!-- ═══════════════════════════════════ -->
-      <!-- STATS TAB                          -->
+      <!-- STATS                              -->
       <!-- ═══════════════════════════════════ -->
       <div id="tab-stats">
         <!-- Balance Card -->
@@ -100,6 +30,12 @@ export function renderAccountPage(container) {
             <div class="price-label">Account Balance</div>
             <div id="acct-balance" class="price-big" style="font-size:28px;">—</div>
           </div>
+        </div>
+
+        <!-- Equity Curve -->
+        <div class="glass-card">
+          <div class="card-title" style="margin-bottom:10px;">Equity Curve</div>
+          <div id="equity-chart" style="height:200px; width:100%;"></div>
         </div>
 
         <!-- PnL Period Tabs -->
@@ -172,14 +108,88 @@ export function renderAccountPage(container) {
             </div>
           </div>
         </div>
-
-        <!-- Equity Curve -->
-        <div class="glass-card">
-          <div class="card-title" style="margin-bottom:10px;">Equity Curve</div>
-          <div id="equity-chart" style="height:200px; width:100%;"></div>
-        </div>
       </div>
 
+      <!-- ═══════════════════════════════════ -->
+      <!-- SETTINGS ACCORDION                 -->
+      <!-- ═══════════════════════════════════ -->
+      <div class="glass-card" style="margin-bottom:16px; padding:0 !important; overflow:hidden;">
+
+        <!-- Theme -->
+        <div class="acct-section-toggle open" data-section="theme">
+          <span style="font-weight:600;">🎨 Theme</span>
+          <span class="acct-chevron">▾</span>
+        </div>
+        <div class="acct-section-body open" data-section="theme">
+          <div id="theme-picker" style="display:flex; gap:10px; flex-wrap:wrap;">
+            ${THEMES.map(t => `
+              <button
+                class="theme-swatch${t.id === currentTheme ? ' theme-swatch-active' : ''}"
+                data-theme-id="${t.id}"
+                style="
+                  flex:1; min-width:100px; padding:14px 12px;
+                  background: linear-gradient(135deg, ${t.bg[0]}, ${t.bg[1]});
+                  border: 2px solid ${t.id === currentTheme ? t.color : 'var(--border)'};
+                  border-radius: var(--radius);
+                  cursor: pointer;
+                  transition: all 0.2s;
+                  display:flex; flex-direction:column; align-items:center; gap:6px;
+                  position:relative; overflow:hidden;
+                "
+              >
+                <span style="font-size:24px;">${t.emoji}</span>
+                <span style="font-size:13px; font-weight:700; color:${t.color};">${t.label}</span>
+                <div style="display:flex; gap:4px; margin-top:2px;">
+                  <span style="width:12px;height:12px;border-radius:50%;background:${t.color};"></span>
+                  <span style="width:12px;height:12px;border-radius:50%;background:${t.green};"></span>
+                  <span style="width:12px;height:12px;border-radius:50%;background:${t.red};"></span>
+                </div>
+                ${t.id === currentTheme ? '<div style="position:absolute;top:6px;right:8px;font-size:12px;">✓</div>' : ''}
+              </button>
+            `).join('')}
+          </div>
+        </div>
+
+        <div style="border-top: 1px solid var(--border);"></div>
+
+        <!-- API Key -->
+        <div class="acct-section-toggle" data-section="apikey">
+          <span style="font-weight:600;">🔑 API Key</span>
+          <span class="acct-chevron">▾</span>
+        </div>
+        <div class="acct-section-body" data-section="apikey">
+          <div style="font-size:11px; color:var(--text-muted); margin-bottom:10px;">Use this key to authenticate bot/API requests via the <code>X-PMS-Key</code> header.</div>
+          <div id="api-key-display" style="display:flex; align-items:center; gap:8px; margin-bottom:10px;">
+            <input id="api-key-value" type="text" readonly
+              style="flex:1; padding:8px 12px; background:var(--card-bg); color:var(--text-primary); border:1px solid var(--border); border-radius:8px; font-family:var(--font-mono); font-size:12px; cursor:default;"
+              value="Loading…" />
+            <button id="api-key-copy-btn" class="btn" style="padding:6px 12px; font-size:12px; white-space:nowrap;" disabled>📋 Copy</button>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button id="api-key-generate-btn" class="btn btn-primary" style="padding:6px 14px; font-size:12px;">Generate Key</button>
+            <button id="api-key-regenerate-btn" class="btn" style="padding:6px 14px; font-size:12px; display:none;">🔄 Regenerate</button>
+          </div>
+          <div id="api-key-status" style="font-size:10px; margin-top:6px;"></div>
+        </div>
+
+        <div style="border-top: 1px solid var(--border);"></div>
+
+        <!-- Biometric Login -->
+        <div class="acct-section-toggle" data-section="biometric">
+          <span style="font-weight:600;">🔐 Biometric Login</span>
+          <span class="acct-chevron">▾</span>
+        </div>
+        <div class="acct-section-body" data-section="biometric">
+          <div style="font-size:11px; color:var(--text-muted); margin-bottom:12px;">
+            Register your fingerprint, face, or security key for passwordless login.
+          </div>
+          <div id="webauthn-credentials-list" style="margin-bottom:12px;"></div>
+          <button id="webauthn-register-btn" class="btn btn-primary" style="padding:8px 16px; font-size:12px; display:flex; align-items:center; gap:6px;">
+            <span style="font-size:18px;">👆</span> Register Biometric
+          </button>
+          <div id="webauthn-status" style="font-size:11px; margin-top:8px;"></div>
+        </div>
+      </div>
 
     </div>
   `;
@@ -188,12 +198,21 @@ export function renderAccountPage(container) {
   initApiKeySection();
   initWebAuthnSection();
 
+  // 6a. Accordion section toggles
+  document.querySelectorAll('.acct-section-toggle').forEach(toggle => {
+    toggle.addEventListener('click', () => {
+      const section = toggle.dataset.section;
+      const body = document.querySelector(`.acct-section-body[data-section="${section}"]`);
+      toggle.classList.toggle('open');
+      if (body) body.classList.toggle('open');
+    });
+  });
+
   // Theme picker
   document.querySelectorAll('#theme-picker .theme-swatch').forEach(btn => {
     btn.addEventListener('click', () => {
       const themeId = btn.dataset.themeId;
       applyTheme(themeId);
-      // Re-render the page to update swatch states
       renderAccountPage(container);
     });
   });

@@ -327,7 +327,16 @@ async def main() -> int:
             except Exception as e:
                 logger.error("Startup backfill failed (non-fatal): %s", e)
 
-        # ── 8. Algo Engines ──
+        # ── 8. Event Buses (Redis Streams) ──
+        from trading_engine_python.events.event_bus import TradeEventBus
+        from trading_engine_python.events.runtime_bus import AlgoRuntimeBus
+
+        event_bus = TradeEventBus(redis_client)
+        runtime_bus = AlgoRuntimeBus(redis_client)
+        order_manager.set_event_bus(event_bus)
+        logger.debug("TradeEventBus created (stream: pms:stream:trade_events)")
+
+        # ── 8a. Algo Engines ──
         from trading_engine_python.algos.chase import ChaseEngine
         from trading_engine_python.algos.scalper import ScalperEngine
         from trading_engine_python.algos.twap import TWAPEngine
@@ -335,19 +344,12 @@ async def main() -> int:
 
         chase = ChaseEngine(order_manager, market_data, redis_client)
         chase.start_background_tasks()
-        scalper = ScalperEngine(order_manager, market_data, chase, redis_client)
+        scalper = ScalperEngine(order_manager, market_data, chase, redis_client, runtime_bus=runtime_bus, db=db)
         twap = TWAPEngine(order_manager, market_data, redis_client)
         trail_stop = TrailStopEngine(order_manager, market_data, redis_client)
         logger.debug("Algo engines created (Chase, Scalper, TWAP, TrailStop)")
 
         chase.set_scalper(scalper)
-
-        # ── 8a. Event Bus (Redis Stream) ──
-        from trading_engine_python.events.event_bus import TradeEventBus
-
-        event_bus = TradeEventBus(redis_client)
-        order_manager.set_event_bus(event_bus)
-        logger.debug("TradeEventBus created (stream: pms:stream:trade_events)")
 
         # ── 8a.1 Stream Consumers ──
         from trading_engine_python.events.algo_consumer import AlgoConsumer
@@ -357,32 +359,21 @@ async def main() -> int:
         from trading_engine_python.tca.collector import TCACollector
         from trading_engine_python.tca.market_sampler import TCAMarketSampler
         from trading_engine_python.tca.reconciler import TCAReconciler
+        from trading_engine_python.tca.runtime_collector import ScalperRuntimeCollector
         from trading_engine_python.tca.rollups import TCARollupWorker
+        from trading_engine_python.tca.strategy_lot_ledger import StrategyLotLedgerWorker
+        from trading_engine_python.tca.strategy_sampler import StrategySessionSampler
 
         order_consumer = OrderConsumer(order_manager._tracker, event_bus, order_manager)
         risk_consumer = RiskConsumer(order_manager, risk_engine, redis_client, db)
         algo_consumer = AlgoConsumer(chase, scalper, twap, trail_stop)
         tca_collector = TCACollector(LifecycleStore(db)) if db else None
+        runtime_collector = ScalperRuntimeCollector(db) if db else None
         tca_reconciler = TCAReconciler(db) if db else None
         tca_market_sampler = TCAMarketSampler(db, market_data, quote_store=quote_store) if db else None
+        strategy_lot_ledger = StrategyLotLedgerWorker(db) if db else None
+        strategy_sampler = StrategySessionSampler(db, market_data) if db else None
         tca_rollups = TCARollupWorker(db) if db else None
-
-        # ── 8b. Resume active algos from Redis (crash recovery) ──
-        try:
-            resumed_chases = await chase.resume_from_redis()
-            resumed_scalpers = await scalper.resume_from_redis()
-            resumed_trail_stops = await trail_stop.resume_from_redis(risk_engine=risk_engine)
-            resumed_twaps = await twap.resume_from_redis()
-            total_resumed = resumed_chases + resumed_scalpers + resumed_trail_stops + resumed_twaps
-            if total_resumed:
-                logger.warning(
-                    "Resumed %d algo(s) from Redis: %d chases, %d scalpers, %d trail stops, %d TWAPs",
-                    total_resumed, resumed_chases, resumed_scalpers, resumed_trail_stops, resumed_twaps,
-                )
-            else:
-                logger.info("No active algos to resume from Redis")
-        except Exception as e:
-            logger.error("Algo resume from Redis failed (non-fatal): %s", e)
 
         # ── 9. CommandHandler ──
         from trading_engine_python.commands.handler import CommandHandler
@@ -460,6 +451,27 @@ async def main() -> int:
                 tg.create_task(cmd_handler.run())
                 if api_key or paper_mode:
                     tg.create_task(user_stream.start())
+                    ready = await user_stream.wait_until_ready(timeout=45.0)
+                    if not ready:
+                        raise RuntimeError("User stream initial reconciliation did not complete before resume")
+
+                # ── 12a. Resume active algos only after user-stream initial sync/open-order recovery ──
+                try:
+                    resumed_chases = await chase.resume_from_redis()
+                    resumed_scalpers = await scalper.resume_from_redis()
+                    resumed_trail_stops = await trail_stop.resume_from_redis(risk_engine=risk_engine)
+                    resumed_twaps = await twap.resume_from_redis()
+                    total_resumed = resumed_chases + resumed_scalpers + resumed_trail_stops + resumed_twaps
+                    if total_resumed:
+                        logger.warning(
+                            "Resumed %d algo(s) from checkpoint: %d chases, %d scalpers, %d trail stops, %d TWAPs",
+                            total_resumed, resumed_chases, resumed_scalpers, resumed_trail_stops, resumed_twaps,
+                        )
+                    else:
+                        logger.info("No active algos to resume from checkpoint")
+                except Exception as e:
+                    logger.error("Algo resume from checkpoint failed (non-fatal): %s", e)
+
                 consumer_suffix = f"{socket.gethostname()}:{os.getpid()}"
                 tg.create_task(
                     event_bus.consume(
@@ -490,10 +502,22 @@ async def main() -> int:
                             handler=tca_collector.handle,
                         )
                     )
+                if runtime_collector:
+                    tg.create_task(
+                        runtime_bus.consume(
+                            consumer_name=f"runtime_collector:{consumer_suffix}",
+                            group_name=AlgoRuntimeBus.group_name("runtime_collector"),
+                            handler=runtime_collector.handle,
+                        )
+                    )
                 if tca_reconciler:
                     tg.create_task(tca_reconciler.run(shutdown_event))
                 if tca_market_sampler:
                     tg.create_task(tca_market_sampler.run(shutdown_event))
+                if strategy_lot_ledger:
+                    tg.create_task(strategy_lot_ledger.run(shutdown_event))
+                if strategy_sampler:
+                    tg.create_task(strategy_sampler.run(shutdown_event))
                 if tca_rollups:
                     tg.create_task(tca_rollups.run(shutdown_event))
                 tg.create_task(_periodic_cleanup(order_manager, shutdown_event))

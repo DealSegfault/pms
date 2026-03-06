@@ -30,6 +30,9 @@ async function getMarkets() {
             if (s.contractType !== 'PERPETUAL' || s.quoteAsset !== 'USDT') continue;
             if (s.status !== 'TRADING') continue;
             const ccxtSymbol = `${s.baseAsset}/USDT:USDT`;
+            const priceFilter = Array.isArray(s.filters)
+                ? s.filters.find((filter) => filter?.filterType === 'PRICE_FILTER')
+                : null;
             markets[ccxtSymbol] = {
                 id: s.symbol,
                 base: s.baseAsset,
@@ -49,6 +52,7 @@ async function getMarkets() {
                     },
                 },
                 contractSize: 1,
+                tickSize: priceFilter?.tickSize ? Number(priceFilter.tickSize) : null,
             };
         }
         marketsCache = markets;
@@ -103,6 +107,7 @@ router.get('/symbol-info/:symbol', async (req, res) => {
             minQty: market.limits?.amount?.min || 0.001,
             maxQty: market.limits?.amount?.max || null,
             pricePrecision: market.precision?.price || 2,
+            tickSize: market.tickSize || null,
             qtyPrecision: market.precision?.amount || 3,
             contractSize: market.contractSize || 1,
         });

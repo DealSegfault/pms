@@ -35,8 +35,9 @@ from contracts.common import normalize_side, ts_ms, ts_s_to_ms, EventType, Redis
 from contracts.events import (
     ScalperProgressEvent, ScalperFilledEvent, ScalperCancelledEvent,
     ScalperSlotInfo,
+    ScalperRuntimeSnapshotStreamEvent,
 )
-from contracts.state import ScalperRedisState
+from contracts.state import ScalperRedisState, ScalperRuntimeSnapshot, ScalperSlotSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class ScalperSlot:
     side: str                             # BUY / SELL
     qty: float = 0.0                      # Coin quantity for this layer
     offset_pct: float = 0.0              # Stalk offset %
+    offset_ticks: int = 0                # Fixed tick distance used by child chase
     reduce_only: bool = False
     chase_id: Optional[str] = None
     active: bool = False
@@ -106,6 +108,8 @@ class ScalperState:
     _last_fill_time: Dict[str, float] = field(default_factory=dict)
     _recent_fill_times: Dict[str, list] = field(default_factory=dict)
     _fill_refill_count: Dict[str, int] = field(default_factory=dict)
+    checkpoint_seq: int = 0
+    resume_status: str = "LIVE"
 
 
 # ── Layer Geometry ─────────────────────────────────────────────
@@ -130,6 +134,103 @@ def _generate_skew_weights(count: int, skew: int) -> List[float]:
     weights = [8 ** (s * (2 * (i / (count - 1)) - 1)) for i in range(count)]
     total = sum(weights)
     return [w / total for w in weights]
+
+
+def _offset_price(reference_price: float, side: str, offset_pct: float) -> float:
+    side_upper = str(side or "").upper()
+    if side_upper in ("BUY", "LONG"):
+        return reference_price * (1 - offset_pct / 100.0)
+    return reference_price * (1 + offset_pct / 100.0)
+
+
+def _price_to_offset_pct(reference_price: float, side: str, price: float) -> float:
+    if reference_price <= 0:
+        return 0.0
+    side_upper = str(side or "").upper()
+    if side_upper in ("BUY", "LONG"):
+        return max(0.0, (1 - (price / reference_price)) * 100.0)
+    return max(0.0, ((price / reference_price) - 1) * 100.0)
+
+
+def _truncate_to_tick(price: float, tick_size: float) -> float:
+    if tick_size <= 0:
+        return price
+    steps = math.floor((price / tick_size) + 1e-12)
+    return max(tick_size, steps * tick_size)
+
+
+def _enforce_tick_spaced_offsets(
+    reference_price: float,
+    side: str,
+    offsets: List[float],
+    tick_size: float,
+) -> List[float]:
+    """Expand dense percentage offsets until each layer lands on a unique tick.
+
+    Small-cap symbols like FUNUSDT can have a coarse tick relative to price, so
+    several nearby percentage offsets collapse into the same rounded limit price.
+    This widens later layers just enough to preserve one-tick spacing.
+    """
+    if reference_price <= 0 or tick_size <= 0 or len(offsets) <= 1:
+        return list(offsets)
+
+    side_upper = str(side or "").upper()
+    adjusted: List[float] = []
+    prev_price: Optional[float] = None
+
+    for offset in offsets:
+        rounded_price = _truncate_to_tick(_offset_price(reference_price, side_upper, offset), tick_size)
+        if prev_price is not None:
+            if side_upper in ("BUY", "LONG"):
+                max_allowed = max(tick_size, prev_price - tick_size)
+                if rounded_price > max_allowed:
+                    rounded_price = max_allowed
+            else:
+                min_allowed = prev_price + tick_size
+                if rounded_price < min_allowed:
+                    rounded_price = min_allowed
+                rounded_price = _truncate_to_tick(rounded_price, tick_size)
+
+        adjusted_offset = max(offset, _price_to_offset_pct(reference_price, side_upper, rounded_price))
+        adjusted.append(adjusted_offset)
+        prev_price = rounded_price
+
+    return adjusted
+
+
+def _price_to_tick_steps(reference_price: float, side: str, price: float, tick_size: float) -> int:
+    if reference_price <= 0 or tick_size <= 0:
+        return 0
+    side_upper = str(side or "").upper()
+    if side_upper in ("BUY", "LONG"):
+        delta = max(0.0, reference_price - price)
+    else:
+        delta = max(0.0, price - reference_price)
+    return max(0, int(round(delta / tick_size)))
+
+
+def _tick_steps_for_offsets(
+    reference_price: float,
+    side: str,
+    offsets: List[float],
+    tick_size: float,
+) -> List[int]:
+    if reference_price <= 0 or tick_size <= 0:
+        return [0 for _ in offsets]
+
+    steps: List[int] = []
+    prev = -1
+    side_upper = str(side or "").upper()
+    for offset in offsets:
+        rounded_price = _truncate_to_tick(_offset_price(reference_price, side_upper, offset), tick_size)
+        tick_steps = _price_to_tick_steps(reference_price, side_upper, rounded_price, tick_size)
+        if offset > 0:
+            tick_steps = max(1, tick_steps)
+        if tick_steps <= prev:
+            tick_steps = prev + 1
+        steps.append(tick_steps)
+        prev = tick_steps
+    return steps
 
 
 def _backoff_delay(retry_count: int) -> float:
@@ -328,16 +429,30 @@ class ScalperEngine:
         market_data: Any,
         chase_engine: Any,
         redis_client: Any = None,
+        runtime_bus: Any = None,
+        db: Any = None,
     ):
         self._om = order_manager
         self._md = market_data
         self._chase = chase_engine
         self._redis = redis_client
+        self._runtime_bus = runtime_bus
+        self._db = db
         self._active: Dict[str, ScalperState] = {}
         # Timer handles for slot retries: key = f"{scalperId}:{side}:{layerIdx}"
         self._slot_tasks: Dict[str, asyncio.Task] = {}
         self._bg_tasks: Dict[str, set[asyncio.Task]] = {}
         self._price_handlers: Dict[str, Callable] = {}  # scalper_id → L1 handler ref
+
+    def _tick_size_for_symbol(self, symbol: str) -> float:
+        symbol_info = getattr(self._om, "_symbol_info", None)
+        if not symbol_info or not hasattr(symbol_info, "get"):
+            return 0.0
+        try:
+            spec = symbol_info.get(symbol)
+            return float(getattr(spec, "tick_size", 0.0) or 0.0)
+        except Exception:
+            return 0.0
 
     # ── Public API ──
 
@@ -443,11 +558,32 @@ class ScalperEngine:
         opening_offset = long_offset if start_side == "LONG" else short_offset
         opening_size_usd = long_size_usd if start_side == "LONG" else short_size_usd
         offsets = _generate_layer_offsets(opening_offset, child_count)
+        tick_size = self._tick_size_for_symbol(state.symbol)
+        opening_reference_price = (
+            l1["bid"] if opening_side == "BUY" else l1["ask"]
+        ) if l1 else price
+        adjusted_offsets = _enforce_tick_spaced_offsets(
+            opening_reference_price,
+            opening_side,
+            offsets,
+            tick_size,
+        )
+        if adjusted_offsets != offsets:
+            logger.info(
+                "Scalper %s: widened %s offsets for %s tick spacing (%s -> %s ticks)",
+                scalper_id,
+                start_side,
+                state.symbol,
+                len({round(_truncate_to_tick(_offset_price(opening_reference_price, opening_side, offset), tick_size), 12) for offset in offsets}),
+                len({round(_truncate_to_tick(_offset_price(opening_reference_price, opening_side, offset), tick_size), 12) for offset in adjusted_offsets}),
+            )
+            offsets = adjusted_offsets
+        opening_tick_steps = _tick_steps_for_offsets(opening_reference_price, opening_side, offsets, tick_size)
         weights = _generate_skew_weights(child_count, skew)
         qtys = [(opening_size_usd * w) / price for w in weights]
 
         # Start opening leg
-        opening_slots = await self._start_leg(state, opening_side, offsets, qtys, reduce_only=False)
+        opening_slots = await self._start_leg(state, opening_side, offsets, opening_tick_steps, qtys, reduce_only=False)
         if opening_side == "BUY":
             state.long_slots = opening_slots
         else:
@@ -465,8 +601,20 @@ class ScalperEngine:
             other_offset = short_offset if start_side == "LONG" else long_offset
             other_size_usd = short_size_usd if start_side == "LONG" else long_size_usd
             other_offsets = _generate_layer_offsets(other_offset, child_count)
+            other_reference_price = (
+                l1["ask"] if other_side == "SELL" else l1["bid"]
+            ) if l1 else price
+            other_adjusted_offsets = _enforce_tick_spaced_offsets(
+                other_reference_price,
+                other_side,
+                other_offsets,
+                tick_size,
+            )
+            if other_adjusted_offsets != other_offsets:
+                other_offsets = other_adjusted_offsets
+            other_tick_steps = _tick_steps_for_offsets(other_reference_price, other_side, other_offsets, tick_size)
             other_qtys = [(other_size_usd * w) / price for w in weights]
-            other_slots = await self._start_leg(state, other_side, other_offsets, other_qtys, reduce_only=False)
+            other_slots = await self._start_leg(state, other_side, other_offsets, other_tick_steps, other_qtys, reduce_only=False)
             if other_side == "BUY":
                 state.long_slots = other_slots
             else:
@@ -481,7 +629,8 @@ class ScalperEngine:
             else:
                 state.long_slots = []
 
-        await self._save_state(state)
+        await self._publish_runtime_checkpoint(state, "START")
+        await self._start_heartbeat(state)
         await self._broadcast_progress(state)
 
         total_opening = sum(1 for s in opening_slots if s.chase_id)
@@ -502,6 +651,16 @@ class ScalperEngine:
         if state.status == "stopped":
             return False
         state.status = "stopped"
+        state.resume_status = "STOPPED"
+
+        await self._publish_runtime_checkpoint(
+            state,
+            "STOP",
+            status_override="CANCELLED",
+            resume_status="STOPPED",
+            save_hot_snapshot=False,
+            update_active_hash=False,
+        )
 
         # Clear all pending retry tasks and await their termination
         # to prevent in-flight restarts from spawning orphan chases
@@ -571,6 +730,9 @@ class ScalperEngine:
                             requested_qty=pos.quantity,
                             origin="SCALPER",
                             parent_id=scalper_id,
+                            order_role="FLATTEN",
+                            strategy_session_id=scalper_id,
+                            root_strategy_session_id=scalper_id,
                             cleanup_if_unexecutable=True,
                         )
                         if close_result.get("placed") or close_result.get("cleaned_up"):
@@ -586,13 +748,16 @@ class ScalperEngine:
         return True
 
     async def shutdown(self) -> None:
-        """Stop all active scalpers and cancel any pending background work."""
+        """Persist restartable checkpoints, cancel child chases, and stop background work."""
         active_ids = list(self._active.keys())
         for scalper_id in active_ids:
+            state = self._active.get(scalper_id)
+            if not state:
+                continue
             try:
-                await self.cancel_scalper(scalper_id)
+                await self._prepare_restartable_shutdown(state)
             except Exception as e:
-                logger.warning("Scalper %s: shutdown cancel failed: %s", scalper_id, e)
+                logger.warning("Scalper %s: shutdown prep failed: %s", scalper_id, e)
 
         leftover_tasks = []
         for scalper_id, tasks in list(self._bg_tasks.items()):
@@ -603,6 +768,58 @@ class ScalperEngine:
                 leftover_tasks.append(task)
         if leftover_tasks:
             await asyncio.gather(*leftover_tasks, return_exceptions=True)
+
+    async def _prepare_restartable_shutdown(self, state: ScalperState) -> None:
+        if state.status != "active":
+            return
+
+        await self._publish_runtime_checkpoint(
+            state,
+            "SHUTDOWN_PREP",
+            status_override="PAUSED_RESTARTABLE",
+            resume_status="RESTARTABLE",
+            update_active_hash=False,
+        )
+
+        state.status = "stopped"
+        state.resume_status = "RESTARTABLE"
+
+        keys_to_cancel = [k for k in self._slot_tasks if k.startswith(f"{state.id}:")]
+        tasks_to_await = []
+        for key in keys_to_cancel:
+            task = self._slot_tasks.pop(key, None)
+            if task and not task.done():
+                task.cancel()
+                tasks_to_await.append(task)
+        if tasks_to_await:
+            await asyncio.gather(*tasks_to_await, return_exceptions=True)
+
+        bg_tasks = list(self._bg_tasks.pop(state.id, set()))
+        for task in bg_tasks:
+            if not task.done():
+                task.cancel()
+        if bg_tasks:
+            await asyncio.gather(*bg_tasks, return_exceptions=True)
+
+        self._active.pop(state.id, None)
+
+        handler = self._price_handlers.pop(state.id, None)
+        if handler and self._md and hasattr(self._md, "unsubscribe"):
+            self._md.unsubscribe(state.symbol, handler)
+
+        if self._redis:
+            try:
+                await self._redis.hdel(RedisKey.active_scalper(state.sub_account_id), state.id)
+            except Exception:
+                pass
+
+        for slot in state.long_slots + state.short_slots:
+            if not slot.chase_id:
+                continue
+            try:
+                await self._chase.cancel_chase(slot.chase_id)
+            except Exception as e:
+                logger.warning("Scalper %s: shutdown child cancel failed for %s: %s", state.id, slot.chase_id, e)
 
     def get_state(self, scalper_id: str) -> Optional[ScalperState]:
         return self._active.get(scalper_id)
@@ -648,6 +865,13 @@ class ScalperEngine:
             _s, _side, market_price, get_entry_fn=self._get_position_entry
         )
 
+    def _resolve_child_order_role(self, state: ScalperState, slot: ScalperSlot) -> str:
+        if state.neutral_mode:
+            return "HEDGE"
+        if slot.reduce_only:
+            return "UNWIND"
+        return "ADD"
+
     # ── Leg Management ──
 
     async def _start_leg(
@@ -655,6 +879,7 @@ class ScalperEngine:
         state: ScalperState,
         side: str,
         offsets: List[float],
+        offset_ticks: List[int],
         qtys: List[float],
         reduce_only: bool,
     ) -> List[ScalperSlot]:
@@ -672,7 +897,11 @@ class ScalperEngine:
 
         for i, (offset, qty) in enumerate(zip(offsets, qtys)):
             slot = ScalperSlot(
-                layer_idx=i, side=side, qty=qty, offset_pct=offset,
+                layer_idx=i,
+                side=side,
+                qty=qty,
+                offset_pct=offset,
+                offset_ticks=int(offset_ticks[i]) if i < len(offset_ticks) else 0,
                 reduce_only=reduce_only,
             )
             slots.append(slot)
@@ -693,9 +922,11 @@ class ScalperEngine:
                 "quantity": slot.qty,
                 "leverage": state.leverage,
                 "stalkOffsetPct": slot.offset_pct,
+                "stalkOffsetTicks": slot.offset_ticks,
                 "stalkMode": "maintain",
                 "maxDistancePct": 0,
                 "reduceOnly": slot.reduce_only,
+                "orderRole": self._resolve_child_order_role(state, slot),
                 "parentScalperId": state.id,
                 "onFill": lambda fp, fq, _s=state, _sl=slot: self._on_child_fill(_s, _sl, fp, fq),
                 "onCancel": lambda reason, _s=state, _sl=slot: self._on_child_cancel(_s, _sl, reason),
@@ -750,9 +981,11 @@ class ScalperEngine:
                 "quantity": quantity,
                 "leverage": state.leverage,
                 "stalkOffsetPct": slot.offset_pct,
+                "stalkOffsetTicks": slot.offset_ticks,
                 "stalkMode": "maintain",
                 "maxDistancePct": 0,     # Scalper manages its own lifecycle
                 "reduceOnly": slot.reduce_only,
+                "orderRole": self._resolve_child_order_role(state, slot),
                 "parentScalperId": state.id,
                 # Wire fill/cancel callbacks back to this scalper
                 "onFill": lambda fp, fq, _s=state, _sl=slot: self._on_child_fill(_s, _sl, fp, fq),
@@ -811,6 +1044,7 @@ class ScalperEngine:
         await self._publish_event("scalper_filled", state,
                                    side=slot.side, layerIdx=slot.layer_idx,
                                    fillPrice=fill_price, fillQty=fill_qty)
+        await self._publish_runtime_checkpoint(state, "FILL")
 
         # ── Slow path: arm + restart (fire-and-forget with error logging) ──
         # Launched as a supervised task so the WS reader isn't blocked
@@ -939,14 +1173,26 @@ class ScalperEngine:
         ro_offset = state.short_offset_pct if state.start_side == "LONG" else state.long_offset_pct
         ro_size_usd = state.short_size_usd if state.start_side == "LONG" else state.long_size_usd
         price = state.last_known_price or 1
+        l1 = self._md.get_l1(state.symbol) if self._md else None
 
         offsets = _generate_layer_offsets(ro_offset, state.child_count)
+        tick_size = self._tick_size_for_symbol(state.symbol)
+        ro_reference_price = (
+            l1["ask"] if ro_side == "SELL" else l1["bid"]
+        ) if l1 else price
+        offsets = _enforce_tick_spaced_offsets(
+            ro_reference_price,
+            ro_side,
+            offsets,
+            tick_size,
+        )
+        ro_tick_steps = _tick_steps_for_offsets(ro_reference_price, ro_side, offsets, tick_size)
         weights = _generate_skew_weights(state.child_count, state.skew)
         qtys = [(ro_size_usd * w) / price for w in weights]
 
         logger.debug("Scalper %s: arming reduce-only %s leg (first opening fill)", state.id, ro_side)
         try:
-            slots = await self._start_leg(state, ro_side, offsets, qtys, reduce_only=True)
+            slots = await self._start_leg(state, ro_side, offsets, ro_tick_steps, qtys, reduce_only=True)
         except Exception:
             state.reduce_only_armed = False  # Reset — allow next fill to retry
             raise
@@ -970,7 +1216,7 @@ class ScalperEngine:
             if not slot.chase_id and slot.qty > 0:
                 await self._schedule_restart(state, slot, delay=2.0)
 
-        await self._save_state(state)
+        await self._publish_runtime_checkpoint(state, "RESTART")
         await self._broadcast_progress(state)
 
     async def _reactivate_reduce_only_leg(self, state: ScalperState) -> None:
@@ -995,6 +1241,7 @@ class ScalperEngine:
             woke += 1
 
         if woke:
+            await self._publish_runtime_checkpoint(state, "RESTART")
             logger.debug("Scalper %s: reactivated %d reduce-only slot(s) after opening fill",
                         state.id, woke)
 
@@ -1019,6 +1266,7 @@ class ScalperEngine:
                     slot.pause_reason = "fill_spread"
                     slot.retry_at = time.time() + wait_s
                     await self._broadcast_progress(state)
+                    await self._publish_runtime_checkpoint(state, "PAUSE")
                     slot._restarting = False
                     await self._schedule_restart(state, slot, delay=wait_s, is_fill=True)
                     return
@@ -1031,6 +1279,7 @@ class ScalperEngine:
                     slot.pause_reason = "burst_limit"
                     slot.retry_at = time.time() + wait_s
                     await self._broadcast_progress(state)
+                    await self._publish_runtime_checkpoint(state, "PAUSE")
                     slot._restarting = False
                     await self._schedule_restart(state, slot, delay=wait_s, is_fill=False)
                     return
@@ -1043,6 +1292,7 @@ class ScalperEngine:
                     slot.pause_reason = "refill_delay"
                     slot.retry_at = time.time() + delay_s
                     await self._broadcast_progress(state)
+                    await self._publish_runtime_checkpoint(state, "PAUSE")
                     slot._restarting = False
                     await self._schedule_restart(state, slot, delay=delay_s, is_fill=False)
                     return
@@ -1054,6 +1304,7 @@ class ScalperEngine:
                 slot.pause_reason = "price_filter"
                 slot.retry_at = time.time() + 30.0
                 await self._broadcast_progress(state)
+                await self._publish_runtime_checkpoint(state, "PAUSE")
                 slot._restarting = False
                 await self._schedule_restart(state, slot, delay=30.0)
                 return
@@ -1079,6 +1330,7 @@ class ScalperEngine:
                         slot.paused = True
                         slot.pause_reason = "no_position"
                         await self._broadcast_progress(state)
+                        await self._publish_runtime_checkpoint(state, "PAUSE")
                         return
                     place_qty = min(slot.qty, actual_pos.quantity)
                     price = state.last_known_price or 0
@@ -1128,7 +1380,7 @@ class ScalperEngine:
                 slot._start_pending = False
                 # Reset refill count on successful restart
                 state._fill_refill_count[slot.side] = 0
-                await self._save_state(state)
+                await self._publish_runtime_checkpoint(state, "RESTART")
                 await self._broadcast_progress(state)
             else:
                 # Failed — exponential backoff retry
@@ -1139,6 +1391,7 @@ class ScalperEngine:
                 logger.warning("Scalper %s: restart %s layer %d failed (attempt %d), retrying in %.0fs",
                                state.id, slot.side, slot.layer_idx, slot.retry_count, delay)
                 await self._broadcast_progress(state)
+                await self._publish_runtime_checkpoint(state, "PAUSE")
                 slot._restarting = False
                 await self._schedule_restart(state, slot, delay=delay)
                 return
@@ -1238,6 +1491,7 @@ class ScalperEngine:
             return ScalperSlotInfo(
                 layer_idx=s.layer_idx,
                 offset_pct=s.offset_pct,
+                offset_ticks=s.offset_ticks,
                 qty=s.qty,
                 active=bool(s.chase_id),
                 paused=s.paused,
@@ -1268,11 +1522,34 @@ class ScalperEngine:
 
     # ── Persistence ──
 
-    async def _save_state(self, state: ScalperState) -> None:
-        """Persist state to Redis using ScalperRedisState DTO."""
-        if not self._redis:
-            return
-        dto = ScalperRedisState(
+    def _slot_snapshot(self, slot: ScalperSlot) -> ScalperSlotSnapshot:
+        current_order_client_id = None
+        if slot.chase_id and getattr(self._chase, "_active", None):
+            chase_state = self._chase._active.get(slot.chase_id)
+            if chase_state:
+                current_order_client_id = getattr(chase_state, "current_order_id", None)
+        return ScalperSlotSnapshot(
+            layer_idx=slot.layer_idx,
+            side=slot.side,
+            qty=slot.qty,
+            offset_pct=slot.offset_pct,
+            offset_ticks=slot.offset_ticks,
+            active=bool(slot.chase_id),
+            paused=slot.paused,
+            pause_reason=slot.pause_reason,
+            retry_at=int(slot.retry_at * 1000) if slot.retry_at else None,
+            retry_count=slot.retry_count,
+            fills=slot.fills,
+            reduce_only=slot.reduce_only,
+            chase_id=slot.chase_id,
+            current_order_client_id=current_order_client_id,
+            restarting=slot._restarting,
+            restart_pending=slot._restart_pending,
+            start_pending=slot._start_pending,
+        )
+
+    def _slim_dto(self, state: ScalperState) -> ScalperRedisState:
+        return ScalperRedisState(
             scalper_id=state.id,
             sub_account_id=state.sub_account_id,
             symbol=state.symbol,
@@ -1298,14 +1575,134 @@ class ScalperEngine:
             started_at=ts_s_to_ms(state.created_at),
             reduce_only_armed=state.reduce_only_armed,
         )
-        data_json = json.dumps(dto.to_dict())
-        try:
-            await self._redis.set(RedisKey.scalper(state.id), data_json, ex=SCALPER_REDIS_TTL)
-            acct_key = RedisKey.active_scalper(state.sub_account_id)
-            await self._redis.hset(acct_key, state.id, data_json)
-            await self._redis.expire(acct_key, SCALPER_REDIS_TTL)
-        except Exception as e:
-            logger.error("Failed to save scalper state: %s", e)
+
+    def _runtime_snapshot(
+        self,
+        state: ScalperState,
+        checkpoint_reason: str,
+        *,
+        status_override: Optional[str] = None,
+        resume_status: Optional[str] = None,
+    ) -> ScalperRuntimeSnapshot:
+        child_chase_ids = [slot.chase_id for slot in state.long_slots + state.short_slots if slot.chase_id]
+        child_order_client_ids = []
+        if getattr(self._chase, "_active", None):
+            for chase_id in child_chase_ids:
+                chase_state = self._chase._active.get(chase_id)
+                if chase_state and getattr(chase_state, "current_order_id", None):
+                    child_order_client_ids.append(chase_state.current_order_id)
+        return ScalperRuntimeSnapshot(
+            scalper_id=state.id,
+            sub_account_id=state.sub_account_id,
+            symbol=state.symbol,
+            start_side=state.start_side,
+            child_count=state.child_count,
+            status=status_override or state.status.upper(),
+            checkpoint_seq=state.checkpoint_seq,
+            checkpoint_reason=checkpoint_reason,
+            total_fill_count=state.fill_count,
+            long_offset_pct=state.long_offset_pct,
+            short_offset_pct=state.short_offset_pct,
+            long_size_usd=state.long_size_usd,
+            short_size_usd=state.short_size_usd,
+            neutral_mode=state.neutral_mode,
+            leverage=state.leverage,
+            skew=state.skew,
+            long_max_price=state.long_max_price,
+            short_min_price=state.short_min_price,
+            min_fill_spread_pct=state.min_fill_spread_pct,
+            fill_decay_half_life_ms=state.fill_decay_half_life_ms,
+            min_refill_delay_ms=state.min_refill_delay_ms,
+            allow_loss=state.allow_loss,
+            max_loss_per_close_bps=state.max_loss_per_close_bps,
+            max_fills_per_minute=state.max_fills_per_minute,
+            pnl_feedback_mode=state.pnl_feedback_mode,
+            pin_long_to_entry=state.pin_long_to_entry,
+            pin_short_to_entry=state.pin_short_to_entry,
+            reduce_only_armed=state.reduce_only_armed,
+            last_known_price=state.last_known_price,
+            started_at=ts_s_to_ms(state.created_at),
+            source_ts=ts_ms(),
+            resume_status=resume_status or state.resume_status,
+            last_fill_price={k: float(v) for k, v in state._last_fill_price.items()},
+            last_fill_time={k: ts_s_to_ms(v) for k, v in state._last_fill_time.items()},
+            recent_fill_times={k: [ts_s_to_ms(item) for item in values] for k, values in state._recent_fill_times.items()},
+            fill_refill_count={k: int(v) for k, v in state._fill_refill_count.items()},
+            child_chase_ids=child_chase_ids,
+            child_order_client_ids=child_order_client_ids,
+            long_slots=[self._slot_snapshot(slot) for slot in state.long_slots],
+            short_slots=[self._slot_snapshot(slot) for slot in state.short_slots],
+        )
+
+    async def _publish_runtime_checkpoint(
+        self,
+        state: ScalperState,
+        checkpoint_reason: str,
+        *,
+        status_override: Optional[str] = None,
+        resume_status: Optional[str] = None,
+        save_hot_snapshot: bool = True,
+        update_active_hash: bool = True,
+    ) -> None:
+        state.checkpoint_seq += 1
+        runtime = self._runtime_snapshot(
+            state,
+            checkpoint_reason,
+            status_override=status_override,
+            resume_status=resume_status,
+        )
+        runtime_json = json.dumps(runtime.to_dict())
+
+        if self._redis and save_hot_snapshot:
+            try:
+                await self._redis.set(RedisKey.scalper(state.id), runtime_json, ex=SCALPER_REDIS_TTL)
+            except Exception as e:
+                logger.error("Failed to save scalper runtime snapshot: %s", e)
+
+        if self._redis and update_active_hash:
+            slim_json = json.dumps(self._slim_dto(state).to_dict())
+            try:
+                acct_key = RedisKey.active_scalper(state.sub_account_id)
+                await self._redis.hset(acct_key, state.id, slim_json)
+                await self._redis.expire(acct_key, SCALPER_REDIS_TTL)
+            except Exception as e:
+                logger.error("Failed to save active scalper snapshot: %s", e)
+
+        if self._runtime_bus:
+            try:
+                await self._runtime_bus.publish(
+                    "SCALPER_RUNTIME_SNAPSHOT",
+                    ScalperRuntimeSnapshotStreamEvent(
+                        strategy_session_id=state.id,
+                        sub_account_id=state.sub_account_id,
+                        checkpoint_seq=state.checkpoint_seq,
+                        checkpoint_reason=checkpoint_reason,
+                        status=status_override or state.status.upper(),
+                        snapshot_json=runtime_json,
+                        source_ts=runtime.source_ts,
+                    ).to_stream_dict(),
+                )
+            except Exception as e:
+                logger.error("Failed to publish scalper runtime checkpoint: %s", e)
+
+    async def _start_heartbeat(self, state: ScalperState) -> None:
+        async def _heartbeat_loop() -> None:
+            try:
+                while state.id in self._active and self._active.get(state.id) is state and state.status == "active":
+                    await asyncio.sleep(5.0)
+                    if state.id not in self._active or state.status != "active":
+                        break
+                    await self._publish_runtime_checkpoint(state, "HEARTBEAT")
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.error("Scalper %s heartbeat failed: %s", state.id, e)
+
+        self._track_task(state.id, asyncio.create_task(_heartbeat_loop()))
+
+    async def _save_state(self, state: ScalperState) -> None:
+        """Persist hot runtime snapshot + slim active snapshot."""
+        await self._publish_runtime_checkpoint(state, "STATE_CHANGE")
 
     @property
     def active_count(self) -> int:
@@ -1313,161 +1710,337 @@ class ScalperEngine:
 
     # ── Resume from Redis ──
 
-    async def resume_from_redis(self) -> int:
-        """Resume active scalpers from Redis on startup/reconnect.
+    async def _resume_price(self, scalper_id: str, symbol: str) -> float:
+        if self._md:
+            self._md.subscribe(symbol, self._make_price_handler(scalper_id))
+        price = 0.0
+        for _ in range(5):
+            await asyncio.sleep(0.4)
+            l1 = self._md.get_l1(symbol) if self._md else None
+            if l1 and l1.get("mid", 0) > 0:
+                price = float(l1["mid"])
+                break
+        return price
 
-        Scans pms:scalper:* keys, reconstructs ScalperState, re-subscribes
-        to market data, and re-creates child chases for all slots.
+    def _slot_from_payload(self, payload: dict) -> ScalperSlot:
+        retry_at_ms = payload.get("retryAt")
+        retry_at = (float(retry_at_ms) / 1000.0) if retry_at_ms else 0.0
+        return ScalperSlot(
+            layer_idx=int(payload.get("layerIdx", 0) or 0),
+            side=str(payload.get("side", "") or ""),
+            qty=float(payload.get("qty", 0) or 0),
+            offset_pct=float(payload.get("offsetPct", 0) or 0),
+            offset_ticks=int(payload.get("offsetTicks", 0) or 0),
+            reduce_only=bool(payload.get("reduceOnly", False)),
+            chase_id=payload.get("chaseId") or None,
+            active=bool(payload.get("active", False)),
+            paused=bool(payload.get("paused", False)),
+            pause_reason=payload.get("pauseReason") or None,
+            retry_at=retry_at,
+            retry_count=int(payload.get("retryCount", 0) or 0),
+            fills=int(payload.get("fills", 0) or 0),
+            _restarting=bool(payload.get("restarting", False)),
+            _restart_pending=bool(payload.get("restartPending", False)),
+            _start_pending=bool(payload.get("startPending", False)),
+        )
 
-        Returns count of resumed scalpers.
-        """
-        if not self._redis:
-            return 0
+    def _state_from_runtime_snapshot(self, data: dict) -> ScalperState:
+        neutral_mode = bool(data.get("neutralMode", False))
+        allow_loss = _resolve_allow_loss(data, neutral_mode)
+        return ScalperState(
+            id=data.get("scalperId", ""),
+            sub_account_id=data.get("subAccountId", ""),
+            symbol=data.get("symbol", ""),
+            start_side=data.get("startSide", "LONG"),
+            leverage=int(data.get("leverage", 1) or 1),
+            child_count=int(data.get("childCount", 1) or 1),
+            skew=int(data.get("skew", 0) or 0),
+            long_offset_pct=float(data.get("longOffsetPct", 0) or 0),
+            short_offset_pct=float(data.get("shortOffsetPct", 0) or 0),
+            long_size_usd=float(data.get("longSizeUsd", 0) or 0),
+            short_size_usd=float(data.get("shortSizeUsd", 0) or 0),
+            long_max_price=_parse_opt_float(data.get("longMaxPrice")),
+            short_min_price=_parse_opt_float(data.get("shortMinPrice")),
+            neutral_mode=neutral_mode,
+            min_fill_spread_pct=float(data.get("minFillSpreadPct", 0) or 0),
+            fill_decay_half_life_ms=float(data.get("fillDecayHalfLifeMs", 30000) or 30000),
+            min_refill_delay_ms=float(data.get("minRefillDelayMs", 0) or 0),
+            allow_loss=allow_loss,
+            max_loss_per_close_bps=int(data.get("maxLossPerCloseBps", 0) or 0),
+            max_fills_per_minute=int(data.get("maxFillsPerMinute", 0) or 0),
+            pnl_feedback_mode=str(data.get("pnlFeedbackMode", "off") or "off"),
+            long_slots=[self._slot_from_payload(slot) for slot in (data.get("longSlots") or [])],
+            short_slots=[self._slot_from_payload(slot) for slot in (data.get("shortSlots") or [])],
+            fill_count=int(data.get("totalFillCount", 0) or 0),
+            status="active",
+            created_at=(float(data.get("startedAt")) / 1000.0) if data.get("startedAt") else time.time(),
+            reduce_only_armed=bool(data.get("reduceOnlyArmed", False)),
+            last_known_price=float(data.get("lastKnownPrice", 0) or 0),
+            pin_long_to_entry=bool(data.get("pinLongToEntry", False)),
+            pin_short_to_entry=bool(data.get("pinShortToEntry", False)),
+            _last_fill_price={k: float(v) for k, v in (data.get("lastFillPrice") or {}).items()},
+            _last_fill_time={k: (float(v) / 1000.0) for k, v in (data.get("lastFillTime") or {}).items()},
+            _recent_fill_times={k: [(float(item) / 1000.0) for item in values] for k, values in (data.get("recentFillTimes") or {}).items()},
+            _fill_refill_count={k: int(v) for k, v in (data.get("fillRefillCount") or {}).items()},
+            checkpoint_seq=int(data.get("checkpointSeq", 0) or 0),
+            resume_status=str(data.get("resumeStatus", "RESTARTABLE") or "RESTARTABLE"),
+        )
 
-        resumed = 0
+    async def _mark_resume_failed(self, strategy_session_id: str, reason: str) -> None:
+        if not self._db:
+            return
         try:
-            keys = await self._redis.keys("pms:scalper:*")
-        except Exception as e:
-            logger.error("Scalper resume: failed to scan Redis keys: %s", e)
-            return 0
+            await self._db.execute(
+                "UPDATE algo_runtime_sessions SET status = ?, updated_at = datetime('now') WHERE strategy_session_id = ?",
+                ("FAILED", strategy_session_id),
+            )
+            logger.error("Scalper resume failed for %s: %s", strategy_session_id, reason)
+        except Exception:
+            logger.error("Scalper resume failed for %s: %s", strategy_session_id, reason)
 
-        for key in keys:
+    async def _load_resume_snapshots(self) -> list[dict]:
+        snapshots: dict[str, dict] = {}
+        if self._redis:
             try:
-                raw = await self._redis.get(key)
-                if not raw:
-                    continue
-                data = json.loads(raw)
-
-                scalper_id = data.get("scalperId", "")
-                if not scalper_id:
-                    continue
-
-                # Skip if already active
-                if scalper_id in self._active:
-                    continue
-
-                # Skip non-active
-                status = data.get("status", "").lower()
-                if status not in ("active",):
-                    await self._redis.delete(key)
-                    continue
-
-                # Reconstruct ScalperState
-                start_side = data.get("startSide", "LONG")
-                child_count = int(data.get("childCount", 1))
-                long_offset = float(data.get("longOffsetPct", 0.3))
-                short_offset = float(data.get("shortOffsetPct", 0.3))
-                long_size_usd = float(data.get("longSizeUsd", 0))
-                short_size_usd = float(data.get("shortSizeUsd", 0))
-                symbol = data.get("symbol", "")
-                leverage = int(data.get("leverage", 1))
-                neutral_mode = bool(data.get("neutralMode", False))
-                allow_loss = _resolve_allow_loss(data, neutral_mode)
-
-                state = ScalperState(
-                    id=scalper_id,
-                    sub_account_id=data.get("subAccountId", ""),
-                    symbol=symbol,
-                    start_side=start_side,
-                    leverage=leverage,
-                    child_count=child_count,
-                    skew=int(data.get("skew", 0)),
-                    long_offset_pct=long_offset,
-                    short_offset_pct=short_offset,
-                    long_size_usd=long_size_usd,
-                    short_size_usd=short_size_usd,
-                    neutral_mode=neutral_mode,
-                    min_fill_spread_pct=float(data.get("minFillSpreadPct", 0)),
-                    fill_decay_half_life_ms=float(data.get("fillDecayHalfLifeMs", 30000)),
-                    min_refill_delay_ms=float(data.get("minRefillDelayMs", 0)),
-                    allow_loss=allow_loss,
-                    fill_count=int(data.get("totalFillCount", 0)),
-                    reduce_only_armed=bool(data.get("reduceOnlyArmed", False)),
-                    pin_long_to_entry=bool(data.get("pinLongToEntry", False)),
-                    pin_short_to_entry=bool(data.get("pinShortToEntry", False)),
-                    created_at=data.get("startedAt", 0) / 1000.0 if data.get("startedAt") else time.time(),
-                )
-
-                # Subscribe to market data
-                if self._md:
-                    self._md.subscribe(symbol, self._make_price_handler(scalper_id))
-
-                # Wait for L1 price seed
-                price = 0
-                for attempt in range(5):
-                    await asyncio.sleep(0.4)
-                    l1 = self._md.get_l1(symbol) if self._md else None
-                    if l1 and l1.get("mid", 0) > 0:
-                        price = l1["mid"]
-                        break
-
-                if not price:
-                    logger.error("Scalper resume %s: cannot get price for %s — skipping", scalper_id, symbol)
-                    handler = self._price_handlers.pop(scalper_id, None)
-                    if handler and self._md:
-                        self._md.unsubscribe(symbol, handler)
-                    continue
-
-                state.last_known_price = price
-                self._active[scalper_id] = state
-
-                # Re-create child chases for opening leg
-                opening_side = _to_exchange_side(start_side)
-                opening_offset = long_offset if start_side == "LONG" else short_offset
-                opening_size_usd = long_size_usd if start_side == "LONG" else short_size_usd
-                offsets = _generate_layer_offsets(opening_offset, child_count)
-                weights = _generate_skew_weights(child_count, state.skew)
-                qtys = [(opening_size_usd * w) / price for w in weights]
-
-                opening_slots = await self._start_leg(state, opening_side, offsets, qtys,
-                                                      reduce_only=False)
-                if opening_side == "BUY":
-                    state.long_slots = opening_slots
-                else:
-                    state.short_slots = opening_slots
-
-                # Neutral mode: start closing leg too
-                if state.neutral_mode:
-                    other_side = "SELL" if opening_side == "BUY" else "BUY"
-                    other_offset = short_offset if start_side == "LONG" else long_offset
-                    other_size_usd = short_size_usd if start_side == "LONG" else long_size_usd
-                    other_offsets = _generate_layer_offsets(other_offset, child_count)
-                    other_qtys = [(other_size_usd * w) / price for w in weights]
-                    other_slots = await self._start_leg(state, other_side, other_offsets, other_qtys,
-                                                        reduce_only=False)
-                    if other_side == "BUY":
-                        state.long_slots = other_slots
-                    else:
-                        state.short_slots = other_slots
-                elif state.reduce_only_armed:
-                    # Non-neutral: restore the reduce-only (unwind) leg
-                    ro_side = "SELL" if start_side == "LONG" else "BUY"
-                    ro_offset = short_offset if start_side == "LONG" else long_offset
-                    ro_size_usd = short_size_usd if start_side == "LONG" else long_size_usd
-                    ro_offsets = _generate_layer_offsets(ro_offset, child_count)
-                    ro_qtys = [(ro_size_usd * w) / price for w in weights]
-                    ro_slots = await self._start_leg(state, ro_side, ro_offsets, ro_qtys,
-                                                      reduce_only=True)
-                    if ro_side == "BUY":
-                        state.long_slots = ro_slots
-                    else:
-                        state.short_slots = ro_slots
-                    logger.info("Scalper %s: resumed reduce-only %s leg (%d slots)",
-                                scalper_id, ro_side, sum(1 for s in ro_slots if s.chase_id))
-
-                # Schedule restart for any failed slots
-                for slot in state.long_slots + state.short_slots:
-                    if not slot.chase_id and slot.qty > 0:
-                        await self._schedule_restart(state, slot, delay=2.0)
-
-                resumed += 1
-                logger.info("Scalper resumed: %s %s %s (child_count=%d)", scalper_id, symbol, start_side, child_count)
-
+                keys = await self._redis.keys("pms:scalper:*")
             except Exception as e:
-                logger.error("Scalper resume: failed to restore %s: %s", key, e)
+                logger.error("Scalper resume: failed to scan Redis keys: %s", e)
+                keys = []
+
+            for key in keys:
+                try:
+                    raw = await self._redis.get(key)
+                    if not raw:
+                        continue
+                    data = json.loads(raw)
+                    scalper_id = data.get("scalperId")
+                    if scalper_id:
+                        snapshots[str(scalper_id)] = data
+                except Exception as e:
+                    logger.error("Scalper resume: failed to decode %s: %s", key, e)
+
+        if self._db:
+            rows = await self._db.fetch_all(
+                """SELECT strategy_session_id, status
+                   FROM algo_runtime_sessions
+                   WHERE strategy_type = ? AND status IN (?, ?)""",
+                ("SCALPER", "ACTIVE", "PAUSED_RESTARTABLE"),
+            )
+            for row in rows or []:
+                session_id = row.get("strategy_session_id")
+                if not session_id or session_id in snapshots:
+                    continue
+                checkpoint = await self._db.fetch_one(
+                    """SELECT snapshot_json
+                       FROM algo_runtime_checkpoints
+                       WHERE strategy_session_id = ?
+                       ORDER BY checkpoint_seq DESC
+                       LIMIT 1""",
+                    (session_id,),
+                )
+                if not checkpoint or not checkpoint.get("snapshot_json"):
+                    await self._mark_resume_failed(session_id, "missing checkpoint snapshot")
+                    continue
+                try:
+                    snapshots[session_id] = json.loads(checkpoint["snapshot_json"])
+                except Exception:
+                    await self._mark_resume_failed(session_id, "invalid checkpoint snapshot")
+        return list(snapshots.values())
+
+    async def _cancel_persisted_child_orders(self, data: dict) -> None:
+        for client_order_id in data.get("childOrderClientIds") or []:
+            if not client_order_id:
+                continue
+            try:
+                await self._om.cancel_order(client_order_id)
+            except Exception as e:
+                logger.warning("Scalper resume: persisted child cancel failed for %s: %s", client_order_id, e)
+
+    async def _restore_runtime_slots(self, state: ScalperState, data: dict) -> None:
+        await self._cancel_persisted_child_orders(data)
+        now = time.time()
+        for slot in state.long_slots + state.short_slots:
+            slot.chase_id = None
+            slot.active = False
+            slot._start_pending = False
+            if slot.paused and slot.pause_reason == "no_position":
+                continue
+            if slot.retry_at and slot.retry_at > now:
+                await self._schedule_restart(state, slot, delay=max(0.0, slot.retry_at - now))
+                continue
+            await self._restart_slot(state, slot, is_fill_restart=False)
+
+    async def _resume_legacy_snapshot(self, data: dict) -> Optional[ScalperState]:
+        start_side = data.get("startSide", "LONG")
+        child_count = int(data.get("childCount", 1) or 1)
+        long_offset = float(data.get("longOffsetPct", 0.3) or 0.3)
+        short_offset = float(data.get("shortOffsetPct", 0.3) or 0.3)
+        long_size_usd = float(data.get("longSizeUsd", 0) or 0)
+        short_size_usd = float(data.get("shortSizeUsd", 0) or 0)
+        symbol = data.get("symbol", "")
+        leverage = int(data.get("leverage", 1) or 1)
+        neutral_mode = bool(data.get("neutralMode", False))
+        allow_loss = _resolve_allow_loss(data, neutral_mode)
+
+        state = ScalperState(
+            id=data.get("scalperId", ""),
+            sub_account_id=data.get("subAccountId", ""),
+            symbol=symbol,
+            start_side=start_side,
+            leverage=leverage,
+            child_count=child_count,
+            skew=int(data.get("skew", 0) or 0),
+            long_offset_pct=long_offset,
+            short_offset_pct=short_offset,
+            long_size_usd=long_size_usd,
+            short_size_usd=short_size_usd,
+            neutral_mode=neutral_mode,
+            min_fill_spread_pct=float(data.get("minFillSpreadPct", 0) or 0),
+            fill_decay_half_life_ms=float(data.get("fillDecayHalfLifeMs", 30000) or 30000),
+            min_refill_delay_ms=float(data.get("minRefillDelayMs", 0) or 0),
+            allow_loss=allow_loss,
+            fill_count=int(data.get("totalFillCount", 0) or 0),
+            reduce_only_armed=bool(data.get("reduceOnlyArmed", False)),
+            pin_long_to_entry=bool(data.get("pinLongToEntry", False)),
+            pin_short_to_entry=bool(data.get("pinShortToEntry", False)),
+            created_at=(float(data.get("startedAt")) / 1000.0) if data.get("startedAt") else time.time(),
+            checkpoint_seq=int(data.get("checkpointSeq", 0) or 0),
+            resume_status="RESTARTABLE",
+        )
+
+        price = await self._resume_price(state.id, symbol)
+        if not price:
+            handler = self._price_handlers.pop(state.id, None)
+            if handler and self._md:
+                self._md.unsubscribe(symbol, handler)
+            return None
+
+        state.last_known_price = price
+        self._active[state.id] = state
+
+        opening_side = _to_exchange_side(start_side)
+        opening_offset = long_offset if start_side == "LONG" else short_offset
+        opening_size_usd = long_size_usd if start_side == "LONG" else short_size_usd
+        offsets = _generate_layer_offsets(opening_offset, child_count)
+        tick_size = self._tick_size_for_symbol(state.symbol)
+        l1 = self._md.get_l1(state.symbol) if self._md else None
+        opening_reference_price = (
+            l1["bid"] if opening_side == "BUY" else l1["ask"]
+        ) if l1 else price
+        offsets = _enforce_tick_spaced_offsets(
+            opening_reference_price,
+            opening_side,
+            offsets,
+            tick_size,
+        )
+        opening_tick_steps = _tick_steps_for_offsets(opening_reference_price, opening_side, offsets, tick_size)
+        weights = _generate_skew_weights(child_count, state.skew)
+        qtys = [(opening_size_usd * w) / price for w in weights]
+
+        opening_slots = await self._start_leg(state, opening_side, offsets, opening_tick_steps, qtys, reduce_only=False)
+        if opening_side == "BUY":
+            state.long_slots = opening_slots
+        else:
+            state.short_slots = opening_slots
+
+        if state.neutral_mode:
+            other_side = "SELL" if opening_side == "BUY" else "BUY"
+            other_offset = short_offset if start_side == "LONG" else long_offset
+            other_size_usd = short_size_usd if start_side == "LONG" else long_size_usd
+            other_offsets = _generate_layer_offsets(other_offset, child_count)
+            other_reference_price = (
+                l1["ask"] if other_side == "SELL" else l1["bid"]
+            ) if l1 else price
+            other_offsets = _enforce_tick_spaced_offsets(
+                other_reference_price,
+                other_side,
+                other_offsets,
+                tick_size,
+            )
+            other_tick_steps = _tick_steps_for_offsets(other_reference_price, other_side, other_offsets, tick_size)
+            other_qtys = [(other_size_usd * w) / price for w in weights]
+            other_slots = await self._start_leg(state, other_side, other_offsets, other_tick_steps, other_qtys, reduce_only=False)
+            if other_side == "BUY":
+                state.long_slots = other_slots
+            else:
+                state.short_slots = other_slots
+        elif state.reduce_only_armed:
+            ro_side = "SELL" if start_side == "LONG" else "BUY"
+            ro_offset = short_offset if start_side == "LONG" else long_offset
+            ro_size_usd = short_size_usd if start_side == "LONG" else long_size_usd
+            ro_offsets = _generate_layer_offsets(ro_offset, child_count)
+            ro_reference_price = (
+                l1["ask"] if ro_side == "SELL" else l1["bid"]
+            ) if l1 else price
+            ro_offsets = _enforce_tick_spaced_offsets(
+                ro_reference_price,
+                ro_side,
+                ro_offsets,
+                tick_size,
+            )
+            ro_tick_steps = _tick_steps_for_offsets(ro_reference_price, ro_side, ro_offsets, tick_size)
+            ro_qtys = [(ro_size_usd * w) / price for w in weights]
+            ro_slots = await self._start_leg(state, ro_side, ro_offsets, ro_tick_steps, ro_qtys, reduce_only=True)
+            if ro_side == "BUY":
+                state.long_slots = ro_slots
+            else:
+                state.short_slots = ro_slots
+
+        for slot in state.long_slots + state.short_slots:
+            if not slot.chase_id and slot.qty > 0:
+                await self._schedule_restart(state, slot, delay=2.0)
+        return state
+
+    async def resume_from_redis(self) -> int:
+        """Resume scalpers from hot Redis snapshots, with DB checkpoint fallback."""
+        snapshots = await self._load_resume_snapshots()
+        resumed = 0
+
+        for data in snapshots:
+            scalper_id = str(data.get("scalperId", "") or "")
+            symbol = str(data.get("symbol", "") or "")
+            if not scalper_id or not symbol or scalper_id in self._active:
+                continue
+
+            status = str(data.get("status", "") or "").upper()
+            if status not in ("ACTIVE", "PAUSED_RESTARTABLE", "ACTIVE".lower()):
+                continue
+
+            try:
+                if data.get("longSlots") is not None or data.get("shortSlots") is not None:
+                    state = self._state_from_runtime_snapshot(data)
+                    price = await self._resume_price(state.id, state.symbol)
+                    if not price and state.last_known_price <= 0:
+                        await self._mark_resume_failed(state.id, f"cannot seed price for {state.symbol}")
+                        handler = self._price_handlers.pop(state.id, None)
+                        if handler and self._md:
+                            self._md.unsubscribe(state.symbol, handler)
+                        continue
+                    state.last_known_price = price or state.last_known_price
+                    self._active[state.id] = state
+                    await self._restore_runtime_slots(state, data)
+                else:
+                    state = await self._resume_legacy_snapshot(data)
+                    if not state:
+                        await self._mark_resume_failed(scalper_id, f"cannot seed legacy price for {symbol}")
+                        continue
+
+                await self._publish_runtime_checkpoint(
+                    state,
+                    "RESUME",
+                    status_override="ACTIVE",
+                    resume_status="LIVE",
+                )
+                await self._start_heartbeat(state)
+                await self._broadcast_progress(state)
+                resumed += 1
+                logger.info("Scalper resumed: %s %s %s (child_count=%d)", state.id, state.symbol, state.start_side, state.child_count)
+            except Exception as e:
+                await self._mark_resume_failed(scalper_id, str(e))
+                logger.error("Scalper resume: failed to restore %s: %s", scalper_id, e)
 
         if resumed:
-            logger.warning("Scalper engine: resumed %d active scalper(s) from Redis", resumed)
+            logger.warning("Scalper engine: resumed %d active scalper(s) from checkpoint", resumed)
         return resumed
 
 

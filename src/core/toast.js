@@ -34,6 +34,9 @@ function _spawnToast(item) {
     toast.className = `toast ${item.type}`;
     toast.textContent = item.message;
 
+    // 7c. Tap-to-dismiss
+    toast.addEventListener('click', () => _removeToast(toast));
+
     activeToasts.push(toast);
     document.body.appendChild(toast);
     _reflow();

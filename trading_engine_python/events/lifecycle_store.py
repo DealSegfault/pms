@@ -15,11 +15,13 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from contracts.common import normalize_symbol, ts_external_to_s
+from trading_engine_python.tca.storage import upsert_tca_anomaly
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_VENUE = "BINANCE_FUTURES"
 DEFAULT_VENUE_ACCOUNT_KEY = os.getenv("TCA_VENUE_ACCOUNT_KEY", "binance:futures:main")
+ORDER_ROLES = {"ENTRY", "ADD", "UNWIND", "FLATTEN", "REPRICE", "HEDGE", "UNKNOWN"}
 
 
 def _db_now() -> datetime:
@@ -59,6 +61,13 @@ def _to_bool(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes")
 
 
+def _normalize_order_role(value: Any) -> str:
+    role = str(value or "").strip().upper()
+    if role in ORDER_ROLES:
+        return role
+    return "UNKNOWN"
+
+
 def _coalesce(*values: Any) -> Any:
     for value in values:
         if value not in (None, "", "None"):
@@ -94,11 +103,28 @@ def _strategy_type(origin: str, parent_id: Optional[str]) -> Optional[str]:
     return (origin or "MANUAL").upper()
 
 
+def _strategy_type_from_session_id(session_id: Optional[str], fallback: Optional[str] = None) -> Optional[str]:
+    text = str(session_id or "").strip().lower()
+    if text.startswith("scalper_") or text.startswith("scalper-"):
+        return "SCALPER"
+    if text.startswith("chase_") or text.startswith("chase-"):
+        return "CHASE"
+    if text.startswith("twap_") or text.startswith("twap-"):
+        return "TWAP"
+    if text.startswith("trail_stop_") or text.startswith("trail-stop_") or text.startswith("trailstop_"):
+        return "TRAIL_STOP"
+    if fallback:
+        return str(fallback).upper()
+    return None
+
+
 class LifecycleStore:
     """Persist lifecycle rows, event rows, and fill facts from stream events."""
 
     def __init__(self, db: Any) -> None:
         self._db = db
+        self._unknown_role_count = 0
+        self._unknown_lineage_count = 0
 
     async def record(self, event: dict, order: Any = None) -> Optional[str]:
         """Persist one canonical lifecycle event idempotently."""
@@ -129,6 +155,8 @@ class LifecycleStore:
 
         await self._insert_event(lifecycle_id, doc)
         await self._insert_fill_fact(lifecycle_id, doc)
+        await self._upsert_lineage_edges(lifecycle_id, doc)
+        await self._record_lineage_anomaly_if_needed(lifecycle_id, doc)
         return lifecycle_id
 
     async def _find_lifecycle(self, doc: dict) -> Optional[dict]:
@@ -150,50 +178,83 @@ class LifecycleStore:
 
     async def _ensure_strategy_session(self, doc: dict) -> None:
         strategy_session_id = doc["strategy_session_id"]
-        if not strategy_session_id:
-            return
+        parent_strategy_session_id = doc["parent_strategy_session_id"]
+        root_strategy_session_id = doc["root_strategy_session_id"] or strategy_session_id
+        session_started_at = doc["session_started_at"] or doc["event_ts"] or _db_now()
 
-        existing = await self._db.fetch_one(
-            "SELECT id, ended_at FROM strategy_sessions WHERE id = ?",
-            (strategy_session_id,),
-        )
-        if not existing:
+        async def _upsert_session(session_id: str, *, session_role: str, origin: str) -> None:
+            session_strategy_type = _strategy_type_from_session_id(session_id, doc["strategy_type"])
+            session_origin = session_strategy_type or str(origin or doc["origin"] or "MANUAL").upper()
+            existing = await self._db.fetch_one(
+                "SELECT id, ended_at FROM strategy_sessions WHERE id = ?",
+                (session_id,),
+            )
+            if not existing:
+                await self._db.execute(
+                    """INSERT INTO strategy_sessions
+                       (id, sub_account_id, origin, strategy_type, parent_strategy_session_id,
+                        root_strategy_session_id, session_role, symbol, side,
+                        started_at, ended_at, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        session_id,
+                        doc["sub_account_id"],
+                        session_origin,
+                        session_strategy_type,
+                        parent_strategy_session_id if session_role == "CHILD" else None,
+                        root_strategy_session_id,
+                        session_role,
+                        doc["symbol"],
+                        doc["side"],
+                        session_started_at,
+                        doc["done_ts"] if session_id == strategy_session_id else None,
+                        _db_now(),
+                        _db_now(),
+                    ),
+                )
+                return
+
             await self._db.execute(
-                """INSERT INTO strategy_sessions
-                   (id, sub_account_id, origin, strategy_type, symbol, side,
-                    started_at, ended_at, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                """UPDATE strategy_sessions
+                   SET origin = ?, strategy_type = ?, parent_strategy_session_id = ?,
+                       root_strategy_session_id = ?, session_role = ?, symbol = COALESCE(symbol, ?),
+                       side = COALESCE(side, ?), started_at = COALESCE(started_at, ?),
+                       ended_at = COALESCE(ended_at, ?), updated_at = ?
+                   WHERE id = ?""",
                 (
-                    strategy_session_id,
-                    doc["sub_account_id"],
-                    doc["origin"],
-                    doc["strategy_type"],
+                    session_origin,
+                    session_strategy_type,
+                    parent_strategy_session_id if session_role == "CHILD" else None,
+                    root_strategy_session_id,
+                    session_role,
                     doc["symbol"],
                     doc["side"],
-                    doc["session_started_at"] or doc["event_ts"] or _db_now(),
-                    doc["done_ts"],
+                    session_started_at,
+                    doc["done_ts"] if session_id == strategy_session_id else None,
                     _db_now(),
-                    _db_now(),
+                    session_id,
                 ),
             )
-            return
 
-        if doc["done_ts"] and not existing.get("ended_at"):
-            await self._db.execute(
-                "UPDATE strategy_sessions SET ended_at = ?, updated_at = ? WHERE id = ?",
-                (doc["done_ts"], _db_now(), strategy_session_id),
-            )
+        if root_strategy_session_id:
+            root_role = "ROOT"
+            await _upsert_session(root_strategy_session_id, session_role=root_role, origin=doc["origin"])
+
+        if strategy_session_id:
+            session_role = "ROOT" if strategy_session_id == root_strategy_session_id else ("CHILD" if parent_strategy_session_id else "STANDALONE")
+            await _upsert_session(strategy_session_id, session_role=session_role, origin=doc["origin"])
 
     async def _insert_lifecycle(self, lifecycle_id: str, doc: dict) -> None:
         await self._db.execute(
             """INSERT INTO order_lifecycles
                (id, execution_scope, sub_account_id, venue, venue_account_key,
-               ownership_confidence, origin_path, strategy_type, strategy_session_id, parent_id,
-                client_order_id, exchange_order_id, symbol, side, order_type, reduce_only,
+               ownership_confidence, origin_path, strategy_type, strategy_session_id, parent_strategy_session_id,
+               root_strategy_session_id, parent_id,
+                client_order_id, exchange_order_id, symbol, side, order_type, order_role, reduce_only,
                 requested_qty, limit_price, decision_bid, decision_ask, decision_mid, decision_spread_bps,
                 intent_ts, ack_ts, first_fill_ts, done_ts,
                 final_status, filled_qty, avg_fill_price, reprice_count, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 lifecycle_id,
                 doc["execution_scope"],
@@ -204,12 +265,15 @@ class LifecycleStore:
                 doc["origin_path"],
                 doc["strategy_type"],
                 doc["strategy_session_id"],
+                doc["parent_strategy_session_id"],
+                doc["root_strategy_session_id"],
                 doc["parent_id"],
                 doc["client_order_id"],
                 doc["exchange_order_id"],
                 doc["symbol"],
                 doc["side"],
                 doc["order_type"],
+                doc["order_role"],
                 doc["reduce_only"],
                 doc["requested_qty"],
                 doc["limit_price"],
@@ -240,12 +304,15 @@ class LifecycleStore:
             "origin_path": doc["origin_path"] or existing.get("origin_path") or "PYTHON_CMD",
             "strategy_type": existing.get("strategy_type") or doc["strategy_type"],
             "strategy_session_id": existing.get("strategy_session_id") or doc["strategy_session_id"],
+            "parent_strategy_session_id": existing.get("parent_strategy_session_id") or doc["parent_strategy_session_id"],
+            "root_strategy_session_id": existing.get("root_strategy_session_id") or doc["root_strategy_session_id"],
             "parent_id": existing.get("parent_id") or doc["parent_id"],
             "client_order_id": existing.get("client_order_id") or doc["client_order_id"],
             "exchange_order_id": existing.get("exchange_order_id") or doc["exchange_order_id"],
             "symbol": doc["symbol"] or existing.get("symbol"),
             "side": doc["side"] or existing.get("side"),
             "order_type": doc["order_type"] or existing.get("order_type"),
+            "order_role": doc["order_role"] if doc["order_role"] != "UNKNOWN" else (existing.get("order_role") or "UNKNOWN"),
             "reduce_only": bool(existing.get("reduce_only")) or doc["reduce_only"],
             "requested_qty": existing.get("requested_qty") or doc["requested_qty"],
             "limit_price": existing.get("limit_price") or doc["limit_price"],
@@ -266,8 +333,9 @@ class LifecycleStore:
             """UPDATE order_lifecycles
                SET execution_scope = ?, sub_account_id = ?, venue = ?, venue_account_key = ?,
                    ownership_confidence = ?, origin_path = ?, strategy_type = ?, strategy_session_id = ?,
-                   parent_id = ?, client_order_id = ?, exchange_order_id = ?, symbol = ?, side = ?,
-                   order_type = ?, reduce_only = ?, requested_qty = ?, limit_price = ?,
+                   parent_strategy_session_id = ?, root_strategy_session_id = ?, parent_id = ?,
+                   client_order_id = ?, exchange_order_id = ?, symbol = ?, side = ?,
+                   order_type = ?, order_role = ?, reduce_only = ?, requested_qty = ?, limit_price = ?,
                    decision_bid = ?, decision_ask = ?, decision_mid = ?, decision_spread_bps = ?,
                    intent_ts = ?, ack_ts = ?, first_fill_ts = ?, done_ts = ?, final_status = ?, filled_qty = ?,
                    avg_fill_price = ?, reprice_count = ?, updated_at = ?
@@ -281,12 +349,15 @@ class LifecycleStore:
                 merged["origin_path"],
                 merged["strategy_type"],
                 merged["strategy_session_id"],
+                merged["parent_strategy_session_id"],
+                merged["root_strategy_session_id"],
                 merged["parent_id"],
                 merged["client_order_id"],
                 merged["exchange_order_id"],
                 merged["symbol"],
                 merged["side"],
                 merged["order_type"],
+                merged["order_role"],
                 merged["reduce_only"],
                 merged["requested_qty"],
                 merged["limit_price"],
@@ -348,11 +419,195 @@ class LifecycleStore:
                 doc["first_fill_ts"] or doc["event_ts"] or _db_now(),
                 doc["fill_qty"],
                 doc["fill_price"],
-                0,
-                None,
+                doc["fee"] or 0,
+                doc["maker_taker"],
                 doc["origin"],
                 _db_now(),
             ),
+        )
+
+    async def _insert_lineage_edge(
+        self,
+        *,
+        execution_scope: str,
+        sub_account_id: Optional[str],
+        ownership_confidence: str,
+        parent_node_type: str,
+        parent_node_id: str,
+        child_node_type: str,
+        child_node_id: str,
+        relation_type: str,
+        source_event_id: Optional[str],
+        source_ts: Optional[datetime],
+        ingested_ts: Optional[datetime],
+    ) -> None:
+        if not parent_node_id or not child_node_id:
+            return
+        await self._db.execute(
+            """INSERT INTO algo_lineage_edges
+               (id, execution_scope, sub_account_id, ownership_confidence,
+                parent_node_type, parent_node_id, child_node_type, child_node_id,
+                relation_type, source_event_id, source_ts, ingested_ts, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(parent_node_type, parent_node_id, child_node_type, child_node_id, relation_type)
+               DO NOTHING""",
+            (
+                str(uuid.uuid4()),
+                execution_scope,
+                sub_account_id,
+                ownership_confidence,
+                parent_node_type,
+                parent_node_id,
+                child_node_type,
+                child_node_id,
+                relation_type,
+                source_event_id,
+                source_ts,
+                ingested_ts,
+                _db_now(),
+            ),
+        )
+
+    async def _upsert_lineage_edges(self, lifecycle_id: str, doc: dict) -> None:
+        strategy_session_id = doc.get("strategy_session_id")
+        parent_strategy_session_id = doc.get("parent_strategy_session_id")
+        if strategy_session_id:
+            await self._insert_lineage_edge(
+                execution_scope=doc["execution_scope"],
+                sub_account_id=doc["sub_account_id"],
+                ownership_confidence=doc["ownership_confidence"],
+                parent_node_type="STRATEGY_SESSION",
+                parent_node_id=str(strategy_session_id),
+                child_node_type="ORDER_LIFECYCLE",
+                child_node_id=lifecycle_id,
+                relation_type="SUBMITS_ORDER",
+                source_event_id=doc["stream_event_id"],
+                source_ts=doc["event_ts"],
+                ingested_ts=doc["ingested_ts"],
+            )
+
+        if strategy_session_id and parent_strategy_session_id and strategy_session_id != parent_strategy_session_id:
+            await self._insert_lineage_edge(
+                execution_scope=doc["execution_scope"],
+                sub_account_id=doc["sub_account_id"],
+                ownership_confidence=doc["ownership_confidence"],
+                parent_node_type="STRATEGY_SESSION",
+                parent_node_id=str(parent_strategy_session_id),
+                child_node_type="STRATEGY_SESSION",
+                child_node_id=str(strategy_session_id),
+                relation_type="SPAWNS_SESSION",
+                source_event_id=doc["stream_event_id"],
+                source_ts=doc["event_ts"],
+                ingested_ts=doc["ingested_ts"],
+            )
+
+        replaces_client_order_id = doc.get("replaces_client_order_id")
+        if replaces_client_order_id:
+            previous = await self._db.fetch_one(
+                "SELECT id FROM order_lifecycles WHERE client_order_id = ?",
+                (replaces_client_order_id,),
+            )
+            if previous and previous.get("id"):
+                await self._insert_lineage_edge(
+                    execution_scope=doc["execution_scope"],
+                    sub_account_id=doc["sub_account_id"],
+                    ownership_confidence=doc["ownership_confidence"],
+                    parent_node_type="ORDER_LIFECYCLE",
+                    parent_node_id=previous["id"],
+                    child_node_type="ORDER_LIFECYCLE",
+                    child_node_id=lifecycle_id,
+                    relation_type="REPRICES_ORDER",
+                    source_event_id=doc["stream_event_id"],
+                    source_ts=doc["event_ts"],
+                    ingested_ts=doc["ingested_ts"],
+                )
+
+        if doc.get("fill_qty") and doc.get("fill_price"):
+            fill = await self._db.fetch_one(
+                "SELECT id FROM fill_facts WHERE source_event_id = ?",
+                (doc["stream_event_id"],),
+            )
+            if fill and fill.get("id"):
+                await self._insert_lineage_edge(
+                    execution_scope=doc["execution_scope"],
+                    sub_account_id=doc["sub_account_id"],
+                    ownership_confidence=doc["ownership_confidence"],
+                    parent_node_type="ORDER_LIFECYCLE",
+                    parent_node_id=lifecycle_id,
+                    child_node_type="FILL_FACT",
+                    child_node_id=fill["id"],
+                    relation_type="GENERATES_FILL",
+                    source_event_id=doc["stream_event_id"],
+                    source_ts=doc["event_ts"],
+                    ingested_ts=doc["ingested_ts"],
+                )
+
+    async def _record_lineage_anomaly_if_needed(self, lifecycle_id: str, doc: dict) -> None:
+        origin = str(doc.get("origin") or "").upper()
+        is_algo = origin in {"SCALPER", "CHASE", "TWAP", "TRAIL_STOP"}
+        if not is_algo:
+            return
+
+        reasons: list[str] = []
+        if doc.get("order_role", "UNKNOWN") == "UNKNOWN":
+            self._unknown_role_count += 1
+        if not doc.get("strategy_session_id"):
+            if doc.get("order_role", "UNKNOWN") == "UNKNOWN":
+                reasons.append("UNKNOWN_ORDER_ROLE")
+            self._unknown_lineage_count += 1
+            reasons.append("MISSING_STRATEGY_SESSION")
+        if not reasons:
+            if doc.get("order_role", "UNKNOWN") == "UNKNOWN":
+                logger.info(
+                    "LifecycleStore role anomaly (UNKNOWN_ORDER_ROLE) unknown_role_count=%d unknown_lineage_count=%d",
+                    self._unknown_role_count,
+                    self._unknown_lineage_count,
+                )
+            return
+
+        reason = "|".join(reasons)
+        now = _db_now()
+        payload = {
+            "reason": reason,
+            "origin": origin or "UNKNOWN",
+            "orderRole": doc.get("order_role", "UNKNOWN"),
+            "strategySessionId": doc.get("strategy_session_id"),
+            "clientOrderId": doc.get("client_order_id"),
+        }
+        await self._db.execute(
+            """INSERT INTO order_lifecycle_events
+               (id, lifecycle_id, stream_event_id, event_type, source_ts, ingested_ts, payload_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(stream_event_id) DO NOTHING""",
+            (
+                str(uuid.uuid4()),
+                lifecycle_id,
+                f"lineage-anomaly:{doc['stream_event_id']}:{reason}",
+                "TCA_LINEAGE_ANOMALY",
+                doc["event_ts"] or now,
+                doc["ingested_ts"] or now,
+                json.dumps(payload, sort_keys=True),
+                now,
+            ),
+        )
+        await upsert_tca_anomaly(
+            self._db,
+            anomaly_key=f"LINEAGE:{lifecycle_id}:{reason}",
+            anomaly_type="LINEAGE",
+            sub_account_id=doc.get("sub_account_id"),
+            root_strategy_session_id=doc.get("root_strategy_session_id"),
+            strategy_session_id=doc.get("strategy_session_id"),
+            lifecycle_id=lifecycle_id,
+            severity="WARN",
+            status="OPEN",
+            payload=payload,
+            source_ts=doc["event_ts"] or now,
+        )
+        logger.info(
+            "LifecycleStore lineage anomaly (%s) unknown_role_count=%d unknown_lineage_count=%d",
+            reason,
+            self._unknown_role_count,
+            self._unknown_lineage_count,
         )
 
     def _normalize_event(self, event: dict, order: Any = None) -> dict:
@@ -395,6 +650,28 @@ class LifecycleStore:
             )
         )
 
+        strategy_session_id = _coalesce(
+            event.get("strategy_session_id"),
+            getattr(order, "strategy_session_id", None),
+            parent_id,
+        )
+        parent_strategy_session_id = _coalesce(
+            event.get("parent_strategy_session_id"),
+            getattr(order, "parent_strategy_session_id", None),
+        )
+        root_strategy_session_id = _coalesce(
+            event.get("root_strategy_session_id"),
+            getattr(order, "root_strategy_session_id", None),
+            strategy_session_id,
+        )
+        replaces_client_order_id = _coalesce(
+            event.get("replaces_client_order_id"),
+            getattr(order, "replaces_client_order_id", None),
+        )
+        order_role = _normalize_order_role(
+            _coalesce(event.get("order_role"), getattr(order, "order_role", None), "UNKNOWN")
+        )
+
         return {
             "stream_event_id": stream_event_id,
             "event_type": event_type,
@@ -407,9 +684,13 @@ class LifecycleStore:
             "ownership_confidence": _ownership_confidence(origin, _coalesce(event.get("sub_account_id"), getattr(order, "sub_account_id", None))),
             "origin_path": _origin_path(event_type, origin, event),
             "origin": str(origin),
-            "strategy_type": _strategy_type(str(origin), parent_id),
-            "strategy_session_id": parent_id,
+            "strategy_type": _strategy_type(str(origin), strategy_session_id),
+            "strategy_session_id": strategy_session_id,
+            "parent_strategy_session_id": parent_strategy_session_id,
+            "root_strategy_session_id": root_strategy_session_id,
             "parent_id": parent_id,
+            "order_role": order_role,
+            "replaces_client_order_id": replaces_client_order_id,
             "symbol": symbol or None,
             "side": _coalesce(event.get("side"), getattr(order, "side", None)),
             "order_type": _coalesce(event.get("order_type"), getattr(order, "order_type", None)),
@@ -429,6 +710,8 @@ class LifecycleStore:
             "avg_fill_price": avg_fill_price or fill_price,
             "fill_qty": fill_qty,
             "fill_price": fill_price or avg_fill_price,
+            "fee": _to_float(_coalesce(event.get("commission"), event.get("fee"))),
+            "maker_taker": _coalesce(event.get("maker_taker"), event.get("makerTaker")),
             "reprice_count": _to_int(event.get("reprice_count")),
             "session_started_at": event_ts if event_type == "ORDER_INTENT" else None,
             "event_ts": event_ts,

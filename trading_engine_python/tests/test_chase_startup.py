@@ -4,7 +4,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from trading_engine_python.algos.chase import ChaseEngine, ChaseState
-from trading_engine_python.algos.scalper import ScalperEngine, ScalperSlot, ScalperState
+from trading_engine_python.algos.scalper import (
+    ScalperEngine,
+    ScalperSlot,
+    ScalperState,
+    _enforce_tick_spaced_offsets,
+    _generate_layer_offsets,
+    _offset_price,
+    _tick_steps_for_offsets,
+    _truncate_to_tick,
+)
 from trading_engine_python.contracts.state import ScalperRedisState
 from trading_engine_python.orders.state import OrderState
 
@@ -257,6 +266,30 @@ def test_scalper_allow_loss_defaults_are_mode_aware_and_explicit_value_wins():
         await engine.cancel_scalper(explicit_false_id)
 
     asyncio.run(run())
+
+
+def test_tick_spaced_offsets_expand_dense_microcap_layers_to_unique_ticks():
+    reference_price = 0.0011675
+    tick_size = 0.000001
+    for side, base_offset in (("BUY", 0.2), ("SELL", 0.85)):
+        raw_offsets = _generate_layer_offsets(base_offset, 9)
+        raw_prices = [
+            _truncate_to_tick(_offset_price(reference_price, side, offset), tick_size)
+            for offset in raw_offsets
+        ]
+        adjusted_offsets = _enforce_tick_spaced_offsets(reference_price, side, raw_offsets, tick_size)
+        adjusted_prices = [
+            _truncate_to_tick(_offset_price(reference_price, side, offset), tick_size)
+            for offset in adjusted_offsets
+        ]
+        tick_steps = _tick_steps_for_offsets(reference_price, side, adjusted_offsets, tick_size)
+
+        assert len(set(raw_prices)) < len(raw_prices) or side == "SELL"
+        assert len(set(adjusted_prices)) == len(adjusted_prices)
+        assert adjusted_offsets == sorted(adjusted_offsets)
+        assert all(adjusted >= raw for adjusted, raw in zip(adjusted_offsets, raw_offsets))
+        assert tick_steps == sorted(tick_steps)
+        assert len(set(tick_steps)) == len(tick_steps)
 
 
 def test_scalper_progress_payload_preserves_pause_reason():

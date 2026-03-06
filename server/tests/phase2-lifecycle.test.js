@@ -47,6 +47,9 @@ test('buildOrderIntentLifecycleEvent tags bot intents with routing identity', ()
         decisionAsk: 101.5,
         decisionMid: 101.25,
         decisionSpreadBps: 49.382716049382715,
+        orderRole: 'ENTRY',
+        strategySessionId: 'twap-1',
+        rootStrategySessionId: 'twap-1',
     });
 
     assert.deepEqual(
@@ -58,6 +61,9 @@ test('buildOrderIntentLifecycleEvent tags bot intents with routing identity', ()
             decision_bid: event.decision_bid,
             decision_ask: event.decision_ask,
             decision_mid: event.decision_mid,
+            order_role: event.order_role,
+            strategy_session_id: event.strategy_session_id,
+            root_strategy_session_id: event.root_strategy_session_id,
             intent_ts: event.intent_ts,
             source_ts: event.source_ts,
         },
@@ -69,6 +75,9 @@ test('buildOrderIntentLifecycleEvent tags bot intents with routing identity', ()
             decision_bid: 101.0,
             decision_ask: 101.5,
             decision_mid: 101.25,
+            order_role: 'ENTRY',
+            strategy_session_id: 'twap-1',
+            root_strategy_session_id: 'twap-1',
             intent_ts: 1700000000123,
             source_ts: 1700000000123,
         },

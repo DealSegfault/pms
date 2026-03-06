@@ -51,6 +51,7 @@ class ChaseState:
     leverage: int = 1
     stalk_mode: str = "maintain"     # none, maintain, trail
     stalk_offset_pct: float = 0.0    # Offset from L1 as percentage
+    stalk_offset_ticks: int = 0      # Offset from L1 in ticks (for scalper ladders)
     max_distance_pct: float = 2.0    # Auto-cancel threshold
     initial_price: float = 0.0
     current_order_id: Optional[str] = None
@@ -60,6 +61,7 @@ class ChaseState:
     created_at: float = field(default_factory=time.time)
     status: str = "ACTIVE"           # ACTIVE, FILLED, CANCELLED
     reduce_only: bool = False
+    order_role: str = "ENTRY"
     parent_scalper_id: Optional[str] = None
     # Callbacks for parent algo (scalper) — NOT serialized
     on_chase_fill: Optional[Callable] = field(default=None, repr=False)
@@ -99,6 +101,29 @@ class ChaseEngine:
     def set_scalper(self, scalper_engine: Any) -> None:
         """Wire scalper reference for event-driven fill/cancel routing."""
         self._scalper = scalper_engine
+
+    def _tick_size_for_symbol(self, symbol: str) -> float:
+        symbol_info = getattr(self._om, "_symbol_info", None)
+        if not symbol_info or not hasattr(symbol_info, "get"):
+            return 0.0
+        try:
+            spec = symbol_info.get(symbol)
+            return float(getattr(spec, "tick_size", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _default_order_role(state: ChaseState) -> str:
+        if state.order_role and str(state.order_role).strip():
+            return str(state.order_role).strip().upper()
+        return "UNWIND" if state.reduce_only else "ENTRY"
+
+    @staticmethod
+    def _lineage_sessions(state: ChaseState) -> tuple[str, Optional[str], Optional[str]]:
+        strategy_session_id = state.id
+        parent_strategy_session_id = state.parent_scalper_id or None
+        root_strategy_session_id = state.parent_scalper_id or state.id
+        return strategy_session_id, parent_strategy_session_id, root_strategy_session_id
 
     # ── Background tasks ──
 
@@ -238,8 +263,12 @@ class ChaseEngine:
             leverage=int(params.get("leverage", 1)),
             stalk_mode=params.get("stalkMode", "maintain"),
             stalk_offset_pct=float(params.get("stalkOffsetPct") or 0),
+            stalk_offset_ticks=int(params.get("stalkOffsetTicks", 0) or 0),
             max_distance_pct=float(params.get("maxDistancePct") or 0),  # 0 = unlimited
             reduce_only=bool(params.get("reduceOnly", False)),
+            order_role=str(params.get("orderRole", "") or "").upper() or (
+                "UNWIND" if bool(params.get("reduceOnly", False)) else "ENTRY"
+            ),
             parent_scalper_id=params.get("parentScalperId"),
             on_chase_fill=params.get("onFill"),
             on_chase_cancel=params.get("onCancel"),
@@ -275,6 +304,7 @@ class ChaseEngine:
         price = self._compute_chase_price(state, l1)
         try:
             if price:
+                strategy_session_id, parent_strategy_session_id, root_strategy_session_id = self._lineage_sessions(state)
                 order = await self._om.place_limit_order(
                     sub_account_id=state.sub_account_id,
                     symbol=state.symbol,
@@ -284,6 +314,10 @@ class ChaseEngine:
                     leverage=state.leverage,
                     origin="CHASE",
                     parent_id=chase_id,
+                    order_role=self._default_order_role(state),
+                    strategy_session_id=strategy_session_id,
+                    parent_strategy_session_id=parent_strategy_session_id,
+                    root_strategy_session_id=root_strategy_session_id,
                     on_fill=lambda o: self._on_fill(state, o),
                     on_cancel=lambda o, r: self._on_cancel(state, o, r),
                     reduce_only=state.reduce_only,
@@ -338,8 +372,12 @@ class ChaseEngine:
                 leverage=int(params.get("leverage", 1)),
                 stalk_mode=params.get("stalkMode", "maintain"),
                 stalk_offset_pct=float(params.get("stalkOffsetPct") or 0),
+                stalk_offset_ticks=int(params.get("stalkOffsetTicks", 0) or 0),
                 max_distance_pct=float(params.get("maxDistancePct") or 0),
                 reduce_only=bool(params.get("reduceOnly", False)),
+                order_role=str(params.get("orderRole", "") or "").upper() or (
+                    "UNWIND" if bool(params.get("reduceOnly", False)) else "ENTRY"
+                ),
                 parent_scalper_id=params.get("parentScalperId"),
                 on_chase_fill=params.get("onFill"),
                 on_chase_cancel=params.get("onCancel"),
@@ -370,6 +408,7 @@ class ChaseEngine:
 
             price = self._compute_chase_price(state, l1)
             if price:
+                strategy_session_id, parent_strategy_session_id, root_strategy_session_id = self._lineage_sessions(state)
                 state_to_idx[state.id] = len(order_params)
                 order_params.append({
                     "sub_account_id": state.sub_account_id,
@@ -380,6 +419,10 @@ class ChaseEngine:
                     "leverage": state.leverage,
                     "origin": "CHASE",
                     "parent_id": state.id,
+                    "order_role": self._default_order_role(state),
+                    "strategy_session_id": strategy_session_id,
+                    "parent_strategy_session_id": parent_strategy_session_id,
+                    "root_strategy_session_id": root_strategy_session_id,
                     "on_fill": lambda o, s=state: self._on_fill(s, o),
                     "on_cancel": lambda o, r, s=state: self._on_cancel(s, o, r),
                     "reduce_only": state.reduce_only,
@@ -487,6 +530,11 @@ class ChaseEngine:
         """
         if not l1:
             return None
+        tick_size = self._tick_size_for_symbol(state.symbol)
+        if state.stalk_offset_ticks > 0 and tick_size > 0:
+            if state.side in ("BUY", "LONG"):
+                return max(tick_size, l1["bid"] - (state.stalk_offset_ticks * tick_size))
+            return l1["ask"] + (state.stalk_offset_ticks * tick_size)
         if state.side in ("BUY", "LONG"):
             base = l1["bid"]
             return base * (1 - state.stalk_offset_pct / 100.0)
@@ -596,6 +644,7 @@ class ChaseEngine:
                 price = self._compute_chase_price(state, l1)
                 if price:
                     try:
+                        strategy_session_id, parent_strategy_session_id, root_strategy_session_id = self._lineage_sessions(state)
                         order = await self._om.place_limit_order(
                             sub_account_id=state.sub_account_id,
                             symbol=state.symbol,
@@ -605,6 +654,10 @@ class ChaseEngine:
                             leverage=state.leverage,
                             origin="CHASE",
                             parent_id=state.id,
+                            order_role=self._default_order_role(state),
+                            strategy_session_id=strategy_session_id,
+                            parent_strategy_session_id=parent_strategy_session_id,
+                            root_strategy_session_id=root_strategy_session_id,
                             on_fill=lambda o: self._on_fill(state, o),
                             on_cancel=lambda o, r: self._on_cancel(state, o, r),
                             reduce_only=state.reduce_only,
@@ -789,12 +842,17 @@ class ChaseEngine:
         l1 = self._md.get_l1(state.symbol) if self._md else None
         price = self._compute_chase_price(state, l1)
         if price:
+            strategy_session_id, parent_strategy_session_id, root_strategy_session_id = self._lineage_sessions(state)
             new_order = await self._om.place_limit_order(
                 sub_account_id=state.sub_account_id,
                 symbol=state.symbol, side=state.side,
                 quantity=state.quantity, price=price,
                 leverage=state.leverage, origin="CHASE",
                 parent_id=state.id,
+                order_role=self._default_order_role(state),
+                strategy_session_id=strategy_session_id,
+                parent_strategy_session_id=parent_strategy_session_id,
+                root_strategy_session_id=root_strategy_session_id,
                 on_fill=lambda o: self._on_fill(state, o),
                 on_cancel=lambda o, r: self._on_cancel(state, o, r),
                 reduce_only=state.reduce_only,
@@ -923,12 +981,17 @@ class ChaseEngine:
         l1 = self._md.get_l1(state.symbol) if self._md else None
         price = self._compute_chase_price(state, l1)
         if price:
+            strategy_session_id, parent_strategy_session_id, root_strategy_session_id = self._lineage_sessions(state)
             new_order = await self._om.place_limit_order(
                 sub_account_id=state.sub_account_id,
                 symbol=state.symbol, side=state.side,
                 quantity=state.quantity, price=price,
                 leverage=state.leverage, origin="CHASE",
                 parent_id=state.id,
+                order_role=self._default_order_role(state),
+                strategy_session_id=strategy_session_id,
+                parent_strategy_session_id=parent_strategy_session_id,
+                root_strategy_session_id=root_strategy_session_id,
                 on_fill=lambda o: self._on_fill(state, o),
                 on_cancel=lambda o, r: self._on_cancel(state, o, r),
                 reduce_only=state.reduce_only,
@@ -973,6 +1036,7 @@ class ChaseEngine:
             leverage=state.leverage,
             stalk_mode=state.stalk_mode,
             stalk_offset_pct=state.stalk_offset_pct,
+            stalk_offset_ticks=state.stalk_offset_ticks,
             max_distance_pct=state.max_distance_pct,
             status=state.status,
             reprice_count=state.reprice_count,
@@ -980,6 +1044,7 @@ class ChaseEngine:
             current_order_price=current_price,
             size_usd=state.quantity * (current_price or 0),
             reduce_only=state.reduce_only,
+            order_role=self._default_order_role(state),
             parent_scalper_id=state.parent_scalper_id,
         )
         data_json = json.dumps(dto.to_dict())
@@ -1027,6 +1092,7 @@ class ChaseEngine:
                 reprice_count=state.reprice_count,
                 status=state.status,
                 stalk_offset_pct=state.stalk_offset_pct,
+                stalk_offset_ticks=state.stalk_offset_ticks,
                 initial_price=state.initial_price,
                 current_order_price=self._get_current_price(state),
                 parent_scalper_id=state.parent_scalper_id,
@@ -1103,10 +1169,14 @@ class ChaseEngine:
                     leverage=int(data.get("leverage", 1)),
                     stalk_mode=data.get("stalkMode", "maintain"),
                     stalk_offset_pct=float(data.get("stalkOffsetPct", 0)),
+                    stalk_offset_ticks=int(data.get("stalkOffsetTicks", 0) or 0),
                     max_distance_pct=float(data.get("maxDistancePct", 2.0)),
                     status="ACTIVE",
                     reprice_count=int(data.get("repriceCount", 0)),
                     reduce_only=bool(data.get("reduceOnly", False)),
+                    order_role=str(data.get("orderRole", "") or "").upper() or (
+                        "UNWIND" if bool(data.get("reduceOnly", False)) else "ENTRY"
+                    ),
                     created_at=data.get("startedAt", 0) / 1000.0 if data.get("startedAt") else time.time(),
                 )
 
@@ -1127,6 +1197,7 @@ class ChaseEngine:
                 price = self._compute_chase_price(state, l1)
                 try:
                     if price:
+                        strategy_session_id, parent_strategy_session_id, root_strategy_session_id = self._lineage_sessions(state)
                         order = await self._om.place_limit_order(
                             sub_account_id=state.sub_account_id,
                             symbol=state.symbol,
@@ -1136,6 +1207,10 @@ class ChaseEngine:
                             leverage=state.leverage,
                             origin="CHASE",
                             parent_id=chase_id,
+                            order_role=self._default_order_role(state),
+                            strategy_session_id=strategy_session_id,
+                            parent_strategy_session_id=parent_strategy_session_id,
+                            root_strategy_session_id=root_strategy_session_id,
                             on_fill=lambda o, _s=state: self._on_fill(_s, o),
                             on_cancel=lambda o, r, _s=state: self._on_cancel(_s, o, r),
                             reduce_only=state.reduce_only,

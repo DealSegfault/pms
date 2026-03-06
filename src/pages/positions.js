@@ -48,6 +48,12 @@ export function renderPositionsPage(container) {
             <div class="stat-value" id="stat-available">$0.00</div>
           </div>
           <div class="stat-item">
+            <div class="stat-label">Liq. Price</div>
+            <div class="stat-value" id="stat-liq-price" style="font-size: 13px; color: var(--red);">—</div>
+          </div>
+        </div>
+        <div class="stat-grid-extra" id="stat-extra">
+          <div class="stat-item">
             <div class="stat-label">Exposure</div>
             <div class="stat-value" id="stat-exposure">$0.00</div>
           </div>
@@ -55,11 +61,8 @@ export function renderPositionsPage(container) {
             <div class="stat-label">Margin Ratio</div>
             <div class="stat-value" id="stat-margin-ratio" style="font-size: 13px;">0.0%</div>
           </div>
-          <div class="stat-item">
-            <div class="stat-label">Liq. Price</div>
-            <div class="stat-value" id="stat-liq-price" style="font-size: 13px; color: var(--red);">—</div>
-          </div>
         </div>
+        <button class="stat-expand-btn" id="stat-expand-btn">More ▾</button>
 
       </div>
       
@@ -72,6 +75,7 @@ export function renderPositionsPage(container) {
           <button id="save-as-index-btn" class="btn btn-outline btn-sm" style="font-size: 11px; padding: 4px 12px; display: none; border-color: var(--accent); color: var(--accent);">
             📊 Save as Index
           </button>
+          <button id="compact-toggle" class="compact-pos-toggle">Compact</button>
           <button id="close-all-btn" class="btn btn-danger btn-sm" style="font-size: 11px; padding: 4px 12px; display: none;">
             Close All
           </button>
@@ -102,6 +106,28 @@ export function renderPositionsPage(container) {
 
   // Save as Index handler
   document.getElementById('save-as-index-btn')?.addEventListener('click', savePositionsAsIndex);
+
+  // 4a. Compact position toggle
+  document.getElementById('compact-toggle')?.addEventListener('click', () => {
+    const btn = document.getElementById('compact-toggle');
+    const isCompact = btn?.classList.toggle('active');
+    document.querySelectorAll('.position-card').forEach(card => {
+      card.classList.toggle('pos-card-compact', isCompact);
+    });
+    try { localStorage.setItem('pms_compact_pos', isCompact ? '1' : '0'); } catch { }
+  });
+  // Restore compact state
+  if (localStorage.getItem('pms_compact_pos') === '1') {
+    document.getElementById('compact-toggle')?.classList.add('active');
+  }
+
+  // 4c. Stat expand toggle
+  document.getElementById('stat-expand-btn')?.addEventListener('click', () => {
+    const extra = document.getElementById('stat-extra');
+    const btn = document.getElementById('stat-expand-btn');
+    if (extra) extra.classList.toggle('open');
+    if (btn) btn.textContent = extra?.classList.contains('open') ? 'Less ▴' : 'More ▾';
+  });
 
   // Reset cleanup flag
   cleanedUp = false;
@@ -361,6 +387,11 @@ function renderPositionsList(positions) {
 
   // Connect Binance markPrice WS for each unique position symbol
   connectMarkPriceStreams(positions);
+
+  // 4a. Apply compact mode if persisted
+  if (localStorage.getItem('pms_compact_pos') === '1') {
+    document.querySelectorAll('.position-card').forEach(c => c.classList.add('pos-card-compact'));
+  }
 }
 
 function getTimeHeld(openedAt) {

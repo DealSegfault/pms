@@ -83,7 +83,7 @@ CHASE_JS_KEYS = {
     "sizeUsd", "stalkMode", "stalkOffsetPct", "maxDistancePct",
     "repriceCount", "currentOrderPrice", "startedAt", "status",
     "reduceOnly",
-    # Optional: parentScalperId, layerIdx, paused, retryAt
+    # Optional: stalkOffsetTicks, parentScalperId, layerIdx, paused, retryAt
 }
 
 SCALPER_JS_KEYS = {
@@ -112,10 +112,11 @@ class TestChaseIntegrity:
     def test_keys_match_js_consumer(self):
         d = ChaseRedisState(
             chase_id="c1", sub_account_id="a1", symbol="BTCUSDT",
-            side="BUY", quantity=1.0, started_at=ts_ms(),
+            side="BUY", quantity=1.0, started_at=ts_ms(), stalk_offset_ticks=4,
         ).to_dict()
         assert CHASE_JS_KEYS.issubset(set(d.keys())), \
             f"Missing keys: {CHASE_JS_KEYS - set(d.keys())}"
+        assert d["stalkOffsetTicks"] == 4
 
     def test_no_bare_id(self):
         d = ChaseRedisState(chase_id="c1").to_dict()
@@ -285,6 +286,11 @@ class TestLifecycleContractAlignment:
             "sub_account_id",
             "decision_bid",
             "decision_mid",
+            "order_role",
+            "strategy_session_id",
+            "parent_strategy_session_id",
+            "root_strategy_session_id",
+            "replaces_client_order_id",
         ):
             assert marker in server_text
             assert marker in frontend_text
@@ -302,7 +308,17 @@ class TestLifecycleContractAlignment:
         ).to_stream_dict().keys())
 
         shared_required = {"client_order_id", "sub_account_id", "source_ts"}
-        intent_required = {"decision_bid", "decision_ask", "decision_mid", "decision_spread_bps"}
+        intent_required = {
+            "decision_bid",
+            "decision_ask",
+            "decision_mid",
+            "decision_spread_bps",
+            "order_role",
+            "strategy_session_id",
+            "parent_strategy_session_id",
+            "root_strategy_session_id",
+            "replaces_client_order_id",
+        }
         assert shared_required <= intent_keys
         assert shared_required <= rejected_keys
         assert intent_required <= intent_keys

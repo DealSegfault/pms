@@ -135,6 +135,11 @@ class OrderConsumer:
             state="placing",
             origin=event.get("origin", "BOT"),
             parent_id=event.get("parent_id") or None,
+            order_role=event.get("order_role", "UNKNOWN"),
+            strategy_session_id=event.get("strategy_session_id") or None,
+            parent_strategy_session_id=event.get("parent_strategy_session_id") or None,
+            root_strategy_session_id=event.get("root_strategy_session_id") or None,
+            replaces_client_order_id=event.get("replaces_client_order_id") or None,
             reduce_only=self._to_bool(event.get("reduce_only")),
             leverage=int(self._to_float(event.get("leverage"), 1.0)),
             created_at=self._to_float(event.get("intent_ts"), time.time() * 1000.0) / 1000.0,
@@ -166,6 +171,11 @@ class OrderConsumer:
             "quantity": str(order.quantity),
             "origin": order.origin,
             "parent_id": order.parent_id or "",
+            "order_role": getattr(order, "order_role", "UNKNOWN"),
+            "strategy_session_id": getattr(order, "strategy_session_id", "") or "",
+            "parent_strategy_session_id": getattr(order, "parent_strategy_session_id", "") or "",
+            "root_strategy_session_id": getattr(order, "root_strategy_session_id", "") or "",
+            "replaces_client_order_id": getattr(order, "replaces_client_order_id", "") or "",
             "sub_account_id": order.sub_account_id,
             "reduce_only": str(order.reduce_only),
             "error": event.get("error", event.get("reason", "REJECTED")),
@@ -205,6 +215,11 @@ class OrderConsumer:
             "quantity": str(order.quantity),
             "origin": order.origin,
             "parent_id": order.parent_id or "",
+            "order_role": getattr(order, "order_role", "UNKNOWN"),
+            "strategy_session_id": getattr(order, "strategy_session_id", "") or "",
+            "parent_strategy_session_id": getattr(order, "parent_strategy_session_id", "") or "",
+            "root_strategy_session_id": getattr(order, "root_strategy_session_id", "") or "",
+            "replaces_client_order_id": getattr(order, "replaces_client_order_id", "") or "",
             "sub_account_id": order.sub_account_id,
             "reduce_only": str(order.reduce_only),
         })
@@ -225,7 +240,14 @@ class OrderConsumer:
             "filled_qty": str(order.filled_qty),
             "origin": order.origin,
             "parent_id": order.parent_id or "",
+            "order_role": getattr(order, "order_role", "UNKNOWN"),
+            "strategy_session_id": getattr(order, "strategy_session_id", "") or "",
+            "parent_strategy_session_id": getattr(order, "parent_strategy_session_id", "") or "",
+            "root_strategy_session_id": getattr(order, "root_strategy_session_id", "") or "",
+            "replaces_client_order_id": getattr(order, "replaces_client_order_id", "") or "",
             "sub_account_id": order.sub_account_id,
+            "commission": event.get("commission", "0"),
+            "maker_taker": event.get("maker_taker", ""),
         })
 
     async def _on_filled(self, order: Any, event: dict) -> None:
@@ -265,9 +287,16 @@ class OrderConsumer:
             "quantity": str(order.quantity),
             "origin": order.origin,
             "parent_id": order.parent_id or "",
+            "order_role": getattr(order, "order_role", "UNKNOWN"),
+            "strategy_session_id": getattr(order, "strategy_session_id", "") or "",
+            "parent_strategy_session_id": getattr(order, "parent_strategy_session_id", "") or "",
+            "root_strategy_session_id": getattr(order, "root_strategy_session_id", "") or "",
+            "replaces_client_order_id": getattr(order, "replaces_client_order_id", "") or "",
             "sub_account_id": order.sub_account_id,
             "reduce_only": str(order.reduce_only),
             "leverage": str(getattr(order, "leverage", 1)),
+            "commission": event.get("commission", "0"),
+            "maker_taker": event.get("maker_taker", ""),
         })
 
     async def _on_cancelled(self, order: Any, event: dict, status: str) -> None:
@@ -283,6 +312,11 @@ class OrderConsumer:
             "reason": status,
             "origin": order.origin,
             "parent_id": order.parent_id or "",
+            "order_role": getattr(order, "order_role", "UNKNOWN"),
+            "strategy_session_id": getattr(order, "strategy_session_id", "") or "",
+            "parent_strategy_session_id": getattr(order, "parent_strategy_session_id", "") or "",
+            "root_strategy_session_id": getattr(order, "root_strategy_session_id", "") or "",
+            "replaces_client_order_id": getattr(order, "replaces_client_order_id", "") or "",
             "sub_account_id": order.sub_account_id,
         })
 
@@ -305,6 +339,11 @@ class OrderConsumer:
             "reduce_only": event.get("reduce_only", False),
             "parent_id": event.get("parent_id", ""),
             "origin": event.get("origin", "BOT"),
+            "order_role": event.get("order_role", "UNKNOWN"),
+            "strategy_session_id": event.get("strategy_session_id", ""),
+            "parent_strategy_session_id": event.get("parent_strategy_session_id", ""),
+            "root_strategy_session_id": event.get("root_strategy_session_id", ""),
+            "replaces_client_order_id": event.get("replaces_client_order_id", ""),
             "sub_account_id": event.get("sub_account_id", ""),
         }
 

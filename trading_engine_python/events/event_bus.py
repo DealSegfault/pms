@@ -26,10 +26,12 @@ import logging
 import time
 from typing import Any, Callable, Optional
 
+from contracts.common import RedisKey
+
 logger = logging.getLogger(__name__)
 
 # Stream configuration
-STREAM_KEY = "pms:stream:trade_events"
+STREAM_KEY = RedisKey.trade_stream()
 MAX_STREAM_LEN = 50_000  # Trim stream to last 50k events (~1 day at high volume)
 BLOCK_MS = 2000           # XREADGROUP block timeout
 BATCH_SIZE = 50           # Max events per XREADGROUP call
@@ -51,9 +53,17 @@ class TradeEventBus:
         await bus.consume("order_consumer", handler)
     """
 
-    def __init__(self, redis_client: Any) -> None:
+    def __init__(
+        self,
+        redis_client: Any,
+        *,
+        stream_key: str = STREAM_KEY,
+        max_stream_len: int = MAX_STREAM_LEN,
+    ) -> None:
         self._redis = redis_client
         self._running = True
+        self._stream_key = stream_key
+        self._max_stream_len = max_stream_len
 
     @staticmethod
     def group_name(name: str) -> str:
@@ -68,10 +78,10 @@ class TradeEventBus:
         """
         try:
             await self._redis.xgroup_create(
-                STREAM_KEY, group_name, id="0", mkstream=True
+                self._stream_key, group_name, id="0", mkstream=True
             )
             logger.info("Created consumer group '%s' on stream '%s'",
-                        group_name, STREAM_KEY)
+                        group_name, self._stream_key)
         except Exception as e:
             # BUSYGROUP = group already exists — safe to ignore
             if "BUSYGROUP" in str(e):
@@ -106,7 +116,7 @@ class TradeEventBus:
                 **{k: str(v) for k, v in data.items()},
             }
             event_id = await self._redis.xadd(
-                STREAM_KEY, entry, maxlen=MAX_STREAM_LEN, approximate=True
+                self._stream_key, entry, maxlen=self._max_stream_len, approximate=True
             )
             return event_id
         except Exception as e:
@@ -132,7 +142,7 @@ class TradeEventBus:
         group = group_name or self.group_name(consumer_name)
         await self.ensure_group(group)
         logger.debug("Consumer '%s' starting on stream '%s' group '%s'",
-                     consumer_name, STREAM_KEY, group)
+                     consumer_name, self._stream_key, group)
 
         # First: process any pending events (from previous crash/restart)
         await self._process_pending(group, consumer_name, handler, batch_size)
@@ -144,7 +154,7 @@ class TradeEventBus:
                 results = await self._redis.xreadgroup(
                     group,
                     consumer_name,
-                    {STREAM_KEY: ">"},  # ">" = only new, undelivered events
+                    {self._stream_key: ">"},  # ">" = only new, undelivered events
                     count=batch_size,
                     block=BLOCK_MS,
                 )
@@ -175,7 +185,7 @@ class TradeEventBus:
 
                     # ACK all processed events
                     event_ids = [e["_event_id"] for e in parsed]
-                    await self._redis.xack(STREAM_KEY, group, *event_ids)
+                    await self._redis.xack(self._stream_key, group, *event_ids)
 
             except asyncio.CancelledError:
                 logger.info("Consumer '%s' cancelled", consumer_name)
@@ -207,7 +217,7 @@ class TradeEventBus:
                 results = await self._redis.xreadgroup(
                     group_name,
                     consumer_name,
-                    {STREAM_KEY: last_id},
+                    {self._stream_key: last_id},
                     count=batch_size,
                     block=0,  # Don't block for pending
                 )
@@ -228,7 +238,7 @@ class TradeEventBus:
                     try:
                         await handler(parsed)
                         event_ids = [e["_event_id"] for e in parsed]
-                        await self._redis.xack(STREAM_KEY, group_name, *event_ids)
+                        await self._redis.xack(self._stream_key, group_name, *event_ids)
                         pending_count += len(parsed)
                     except Exception as e:
                         logger.error("Consumer '%s' pending recovery error: %s",
@@ -256,7 +266,7 @@ class TradeEventBus:
             group = group_name or self.group_name(consumer_name)
             # Get pending entries idle > CLAIM_IDLE_MS
             pending = await self._redis.xpending_range(
-                STREAM_KEY, group,
+                self._stream_key, group,
                 min="-", max="+", count=100,
             )
 
@@ -266,7 +276,7 @@ class TradeEventBus:
                 if idle_ms > CLAIM_IDLE_MS:
                     event_id = entry["message_id"]
                     await self._redis.xclaim(
-                        STREAM_KEY, group, consumer_name,
+                        self._stream_key, group, consumer_name,
                         min_idle_time=CLAIM_IDLE_MS,
                         message_ids=[event_id],
                     )
@@ -284,8 +294,8 @@ class TradeEventBus:
     async def stream_info(self) -> dict:
         """Get stream info for monitoring."""
         try:
-            info = await self._redis.xinfo_stream(STREAM_KEY)
-            groups = await self._redis.xinfo_groups(STREAM_KEY)
+            info = await self._redis.xinfo_stream(self._stream_key)
+            groups = await self._redis.xinfo_groups(self._stream_key)
             return {
                 "length": info.get("length", 0),
                 "first_entry": info.get("first-entry"),

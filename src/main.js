@@ -140,17 +140,19 @@ const routes = {
 
 function navigate() {
     const hash = location.hash.slice(1) || '/trade';
+    const [pathOnly] = hash.split('?');
+    const routePath = pathOnly || '/trade';
     const page = document.getElementById('page-content');
 
-    if (hash === '/admin' && state.user?.role !== 'ADMIN') {
+    if (routePath === '/admin' && state.user?.role !== 'ADMIN') {
         location.hash = '#/account';
         return;
     }
 
-    const renderFn = routes[hash] || routes['/trade'];
+    const renderFn = routes[routePath] || routes['/trade'];
 
     document.querySelectorAll('.nav-item').forEach((item) => {
-        item.classList.toggle('active', item.getAttribute('href') === `#${hash}`);
+        item.classList.toggle('active', item.getAttribute('href') === `#${routePath}`);
     });
 
     cleanupActivePages();

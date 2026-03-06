@@ -13,7 +13,18 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, Column, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Column,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import relationship
 
 from .base import Base
@@ -218,12 +229,15 @@ class OrderLifecycle(Base):
     origin_path = Column(String, default="PYTHON_CMD")
     strategy_type = Column(String, nullable=True)
     strategy_session_id = Column(String, nullable=True)
+    parent_strategy_session_id = Column(String, nullable=True)
+    root_strategy_session_id = Column(String, nullable=True)
     parent_id = Column(String, nullable=True)
     client_order_id = Column(String, nullable=True)
     exchange_order_id = Column(String, nullable=True)
     symbol = Column(String, nullable=True)
     side = Column(String, nullable=True)
     order_type = Column(String, nullable=True)
+    order_role = Column(String, default="UNKNOWN")
     reduce_only = Column(Boolean, default=False)
     requested_qty = Column(Float, nullable=True)
     limit_price = Column(Float, nullable=True)
@@ -250,6 +264,7 @@ class OrderLifecycle(Base):
         Index("idx_ol_client_order_id", "client_order_id"),
         Index("idx_ol_exchange_order_id", "exchange_order_id"),
         Index("idx_ol_symbol_ts", "symbol", "created_at"),
+        Index("idx_ol_root_session_ts", "root_strategy_session_id", "created_at"),
         Index("idx_ol_reconcile_status_updated", "reconciliation_status", "updated_at"),
     )
 
@@ -269,6 +284,38 @@ class OrderLifecycleEvent(Base):
     __table_args__ = (
         Index("idx_ole_lifecycle_created", "lifecycle_id", "created_at"),
         Index("idx_ole_event_type_source", "event_type", "source_ts"),
+    )
+
+
+class AlgoLineageEdge(Base):
+    __tablename__ = "algo_lineage_edges"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    execution_scope = Column(String, default="SUB_ACCOUNT")
+    sub_account_id = Column(String, ForeignKey("sub_accounts.id"), nullable=True)
+    ownership_confidence = Column(String, default="HARD")
+    parent_node_type = Column(String, nullable=False)
+    parent_node_id = Column(String, nullable=False)
+    child_node_type = Column(String, nullable=False)
+    child_node_id = Column(String, nullable=False)
+    relation_type = Column(String, nullable=False)
+    source_event_id = Column(String, nullable=True)
+    source_ts = Column(BigInteger, nullable=True)
+    ingested_ts = Column(BigInteger, nullable=True)
+    created_at = Column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "parent_node_type",
+            "parent_node_id",
+            "child_node_type",
+            "child_node_id",
+            "relation_type",
+            name="uq_lineage_edge_tuple",
+        ),
+        Index("idx_ale_sub_source", "sub_account_id", "source_ts"),
+        Index("idx_ale_parent", "parent_node_type", "parent_node_id"),
+        Index("idx_ale_child", "child_node_type", "child_node_id"),
     )
 
 
@@ -341,6 +388,9 @@ class StrategySession(Base):
     sub_account_id = Column(String, ForeignKey("sub_accounts.id"), nullable=True)
     origin = Column(String, default="MANUAL")
     strategy_type = Column(String, nullable=True)
+    parent_strategy_session_id = Column(String, nullable=True)
+    root_strategy_session_id = Column(String, nullable=True)
+    session_role = Column(String, default="STANDALONE")
     symbol = Column(String, nullable=True)
     side = Column(String, nullable=True)
     started_at = Column(BigInteger, nullable=True)
@@ -350,6 +400,7 @@ class StrategySession(Base):
 
     __table_args__ = (
         Index("idx_ss_sub_started", "sub_account_id", "started_at"),
+        Index("idx_ss_root_started", "root_strategy_session_id", "started_at"),
     )
 
 
@@ -360,6 +411,7 @@ class SubAccountTcaRollup(Base):
     sub_account_id = Column(String, ForeignKey("sub_accounts.id"), nullable=False)
     execution_scope = Column(String, default="SUB_ACCOUNT")
     ownership_confidence = Column(String, default="HARD")
+    quality_by_role_json = Column(Text, nullable=True)
     order_count = Column(Integer, default=0)
     terminal_order_count = Column(Integer, default=0)
     fill_count = Column(Integer, default=0)
@@ -376,11 +428,22 @@ class SubAccountTcaRollup(Base):
     avg_markout_1s_bps = Column(Float, nullable=True)
     avg_markout_5s_bps = Column(Float, nullable=True)
     avg_markout_30s_bps = Column(Float, nullable=True)
+    realized_pnl = Column(Float, default=0)
+    unrealized_pnl = Column(Float, default=0)
+    net_pnl = Column(Float, default=0)
+    fees_total = Column(Float, default=0)
+    last_sampled_at = Column(BigInteger, nullable=True)
     total_reprice_count = Column(Integer, default=0)
     created_at = Column(BigInteger, nullable=True)
     updated_at = Column(BigInteger, nullable=True)
 
     __table_args__ = (
+        UniqueConstraint(
+            "sub_account_id",
+            "execution_scope",
+            "ownership_confidence",
+            name="uq_sub_account_rollup_scope",
+        ),
         Index("idx_satr_scope_conf", "execution_scope", "ownership_confidence"),
     )
 
@@ -392,8 +455,10 @@ class StrategyTcaRollup(Base):
     strategy_session_id = Column(String, nullable=False)
     sub_account_id = Column(String, ForeignKey("sub_accounts.id"), nullable=True)
     strategy_type = Column(String, nullable=True)
+    rollup_level = Column(String, default="SESSION")
     execution_scope = Column(String, default="SUB_ACCOUNT")
     ownership_confidence = Column(String, default="HARD")
+    quality_by_role_json = Column(Text, nullable=True)
     order_count = Column(Integer, default=0)
     terminal_order_count = Column(Integer, default=0)
     fill_count = Column(Integer, default=0)
@@ -410,10 +475,247 @@ class StrategyTcaRollup(Base):
     avg_markout_1s_bps = Column(Float, nullable=True)
     avg_markout_5s_bps = Column(Float, nullable=True)
     avg_markout_30s_bps = Column(Float, nullable=True)
+    realized_pnl = Column(Float, default=0)
+    unrealized_pnl = Column(Float, default=0)
+    net_pnl = Column(Float, default=0)
+    fees_total = Column(Float, default=0)
+    open_qty = Column(Float, default=0)
+    open_notional = Column(Float, default=0)
+    close_count = Column(Integer, default=0)
+    win_count = Column(Integer, default=0)
+    loss_count = Column(Integer, default=0)
+    win_rate = Column(Float, nullable=True)
+    max_drawdown_pnl = Column(Float, nullable=True)
+    max_runup_pnl = Column(Float, nullable=True)
+    last_sampled_at = Column(BigInteger, nullable=True)
     total_reprice_count = Column(Integer, default=0)
     created_at = Column(BigInteger, nullable=True)
     updated_at = Column(BigInteger, nullable=True)
 
     __table_args__ = (
+        UniqueConstraint(
+            "strategy_session_id",
+            "execution_scope",
+            "ownership_confidence",
+            "rollup_level",
+            name="uq_strategy_rollup_scope_level",
+        ),
         Index("idx_str_scope_conf", "execution_scope", "ownership_confidence"),
+    )
+
+
+class TcaWorkerCursor(Base):
+    __tablename__ = "tca_worker_cursors"
+
+    worker_key = Column(String, primary_key=True)
+    cursor_json = Column(Text, nullable=True)
+    last_run_started_at = Column(BigInteger, nullable=True)
+    last_run_completed_at = Column(BigInteger, nullable=True)
+    last_success_at = Column(BigInteger, nullable=True)
+    last_run_meta_json = Column(Text, nullable=True)
+    created_at = Column(BigInteger, nullable=True)
+    updated_at = Column(BigInteger, nullable=True)
+
+
+class TcaAnomaly(Base):
+    __tablename__ = "tca_anomalies"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    anomaly_key = Column(String, nullable=False, unique=True)
+    anomaly_type = Column(String, nullable=False)
+    sub_account_id = Column(String, ForeignKey("sub_accounts.id"), nullable=True)
+    root_strategy_session_id = Column(String, ForeignKey("strategy_sessions.id"), nullable=True)
+    strategy_session_id = Column(String, nullable=True)
+    lifecycle_id = Column(String, nullable=True)
+    fill_fact_id = Column(String, nullable=True)
+    severity = Column(String, default="WARN")
+    status = Column(String, default="OPEN")
+    payload_json = Column(Text, nullable=True)
+    source_ts = Column(BigInteger, nullable=True)
+    first_seen_at = Column(BigInteger, nullable=True)
+    last_seen_at = Column(BigInteger, nullable=True)
+    resolved_at = Column(BigInteger, nullable=True)
+    created_at = Column(BigInteger, nullable=True)
+    updated_at = Column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        Index("idx_tca_anom_sub_status_type", "sub_account_id", "status", "anomaly_type"),
+        Index("idx_tca_anom_root_status_type", "root_strategy_session_id", "status", "anomaly_type"),
+        Index("idx_tca_anom_session_status_type", "strategy_session_id", "status", "anomaly_type"),
+        Index("idx_tca_anom_lifecycle_type", "lifecycle_id", "anomaly_type"),
+        Index("idx_tca_anom_fill_type", "fill_fact_id", "anomaly_type"),
+    )
+
+
+class AlgoRuntimeSession(Base):
+    __tablename__ = "algo_runtime_sessions"
+
+    strategy_session_id = Column(String, ForeignKey("strategy_sessions.id"), primary_key=True)
+    sub_account_id = Column(String, ForeignKey("sub_accounts.id"), nullable=False)
+    strategy_type = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    resume_policy = Column(String, default="RECREATE_CHILD_ORDERS")
+    started_at = Column(BigInteger, nullable=True)
+    stopped_at = Column(BigInteger, nullable=True)
+    last_heartbeat_at = Column(BigInteger, nullable=True)
+    latest_checkpoint_id = Column(String, nullable=True)
+    initial_config_json = Column(Text, nullable=True)
+    current_config_json = Column(Text, nullable=True)
+    created_at = Column(BigInteger, nullable=True)
+    updated_at = Column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        Index("idx_ars_sub_updated", "sub_account_id", "updated_at"),
+        Index("idx_ars_status_updated", "status", "updated_at"),
+    )
+
+
+class AlgoRuntimeCheckpoint(Base):
+    __tablename__ = "algo_runtime_checkpoints"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    strategy_session_id = Column(String, ForeignKey("strategy_sessions.id"), nullable=False)
+    sub_account_id = Column(String, ForeignKey("sub_accounts.id"), nullable=False)
+    strategy_type = Column(String, nullable=False)
+    checkpoint_seq = Column(Integer, nullable=False)
+    checkpoint_ts = Column(BigInteger, nullable=False)
+    checkpoint_reason = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    snapshot_json = Column(Text, nullable=False)
+    created_at = Column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("strategy_session_id", "checkpoint_seq", name="uq_runtime_checkpoint_seq"),
+        Index("idx_arc_sub_ts", "sub_account_id", "checkpoint_ts"),
+        Index("idx_arc_session_ts", "strategy_session_id", "checkpoint_ts"),
+    )
+
+
+class StrategyPositionLot(Base):
+    __tablename__ = "strategy_position_lots"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    sub_account_id = Column(String, ForeignKey("sub_accounts.id"), nullable=False)
+    root_strategy_session_id = Column(String, ForeignKey("strategy_sessions.id"), nullable=False)
+    source_strategy_session_id = Column(String, nullable=False)
+    symbol = Column(String, nullable=False)
+    position_side = Column(String, nullable=False)
+    source_lifecycle_id = Column(String, nullable=True)
+    source_fill_fact_id = Column(String, nullable=True)
+    opened_ts = Column(BigInteger, nullable=False)
+    open_qty = Column(Float, nullable=False)
+    remaining_qty = Column(Float, nullable=False)
+    open_price = Column(Float, nullable=False)
+    open_fee = Column(Float, default=0)
+    status = Column(String, default="OPEN")
+    closed_ts = Column(BigInteger, nullable=True)
+    created_at = Column(BigInteger, nullable=True)
+    updated_at = Column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        Index("idx_spl_sub_opened", "sub_account_id", "opened_ts"),
+        Index("idx_spl_root_symbol_side_status", "root_strategy_session_id", "symbol", "position_side", "status"),
+        Index("idx_spl_source_fill", "source_fill_fact_id"),
+    )
+
+
+class StrategyLotRealization(Base):
+    __tablename__ = "strategy_lot_realizations"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    lot_id = Column(String, ForeignKey("strategy_position_lots.id"), nullable=False)
+    sub_account_id = Column(String, ForeignKey("sub_accounts.id"), nullable=False)
+    root_strategy_session_id = Column(String, ForeignKey("strategy_sessions.id"), nullable=False)
+    source_strategy_session_id = Column(String, nullable=False)
+    close_lifecycle_id = Column(String, nullable=True)
+    close_fill_fact_id = Column(String, nullable=True)
+    realized_ts = Column(BigInteger, nullable=False)
+    allocated_qty = Column(Float, nullable=False)
+    open_price = Column(Float, nullable=False)
+    close_price = Column(Float, nullable=False)
+    gross_realized_pnl = Column(Float, nullable=False)
+    open_fee_allocated = Column(Float, default=0)
+    close_fee_allocated = Column(Float, default=0)
+    net_realized_pnl = Column(Float, nullable=False)
+    created_at = Column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        Index("idx_slr_sub_realized", "sub_account_id", "realized_ts"),
+        Index("idx_slr_root_realized", "root_strategy_session_id", "realized_ts"),
+        Index("idx_slr_close_fill", "close_fill_fact_id"),
+    )
+
+
+class StrategySessionPnlSample(Base):
+    __tablename__ = "strategy_session_pnl_samples"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    strategy_session_id = Column(String, ForeignKey("strategy_sessions.id"), nullable=False)
+    sub_account_id = Column(String, ForeignKey("sub_accounts.id"), nullable=False)
+    sampled_at = Column(BigInteger, nullable=False)
+    mark_price = Column(Float, nullable=True)
+    realized_pnl = Column(Float, default=0)
+    unrealized_pnl = Column(Float, default=0)
+    net_pnl = Column(Float, default=0)
+    fees_total = Column(Float, default=0)
+    open_qty = Column(Float, default=0)
+    open_notional = Column(Float, default=0)
+    fill_count = Column(Integer, default=0)
+    close_count = Column(Integer, default=0)
+    win_count = Column(Integer, default=0)
+    loss_count = Column(Integer, default=0)
+    created_at = Column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("strategy_session_id", "sampled_at", name="uq_strategy_pnl_sample"),
+        Index("idx_ssps_sub_sampled", "sub_account_id", "sampled_at"),
+        Index("idx_ssps_session_sampled", "strategy_session_id", "sampled_at"),
+    )
+
+
+class StrategySessionParamSample(Base):
+    __tablename__ = "strategy_session_param_samples"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    strategy_session_id = Column(String, ForeignKey("strategy_sessions.id"), nullable=False)
+    sub_account_id = Column(String, ForeignKey("sub_accounts.id"), nullable=False)
+    sampled_at = Column(BigInteger, nullable=False)
+    sample_reason = Column(String, nullable=False)
+    status = Column(String, nullable=True)
+    start_side = Column(String, nullable=True)
+    neutral_mode = Column(Boolean, default=False)
+    allow_loss = Column(Boolean, default=True)
+    reduce_only_armed = Column(Boolean, default=False)
+    leverage = Column(Integer, nullable=True)
+    child_count = Column(Integer, nullable=True)
+    skew = Column(Integer, nullable=True)
+    long_offset_pct = Column(Float, nullable=True)
+    short_offset_pct = Column(Float, nullable=True)
+    long_size_usd = Column(Float, nullable=True)
+    short_size_usd = Column(Float, nullable=True)
+    long_max_price = Column(Float, nullable=True)
+    short_min_price = Column(Float, nullable=True)
+    pin_long_to_entry = Column(Boolean, default=False)
+    pin_short_to_entry = Column(Boolean, default=False)
+    min_fill_spread_pct = Column(Float, nullable=True)
+    fill_decay_half_life_ms = Column(Float, nullable=True)
+    min_refill_delay_ms = Column(Float, nullable=True)
+    max_loss_per_close_bps = Column(Integer, nullable=True)
+    max_fills_per_minute = Column(Integer, nullable=True)
+    pnl_feedback_mode = Column(String, nullable=True)
+    last_known_price = Column(Float, nullable=True)
+    total_fill_count = Column(Integer, default=0)
+    long_active_slots = Column(Integer, default=0)
+    short_active_slots = Column(Integer, default=0)
+    long_paused_slots = Column(Integer, default=0)
+    short_paused_slots = Column(Integer, default=0)
+    long_retrying_slots = Column(Integer, default=0)
+    short_retrying_slots = Column(Integer, default=0)
+    pause_reasons_json = Column(Text, nullable=True)
+    created_at = Column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("strategy_session_id", "sampled_at", "sample_reason", name="uq_strategy_param_sample"),
+        Index("idx_ssprs_sub_sampled", "sub_account_id", "sampled_at"),
+        Index("idx_ssprs_session_sampled", "strategy_session_id", "sampled_at"),
     )

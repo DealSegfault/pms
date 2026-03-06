@@ -89,6 +89,9 @@ export function initWebSockets() {
             S.set('currentPrice', price);
             const priceEl = document.getElementById('sym-price');
             if (priceEl) priceEl.textContent = formatPrice(price);
+            // 2d. Mini-ticker sync
+            const miniP = document.getElementById('ux-mini-price');
+            if (miniP) miniP.textContent = '$' + formatPrice(price);
 
             for (const [, pos] of S._positionMap) {
                 if (pos.symbol === S.selectedSymbol) pos.markPrice = price;
@@ -146,6 +149,9 @@ export function initWebSockets() {
             S.set('currentPrice', candle.close);
             const priceEl = document.getElementById('sym-price');
             if (priceEl) priceEl.textContent = formatPrice(candle.close);
+            // 2d. Mini-ticker sync
+            const miniP = document.getElementById('ux-mini-price');
+            if (miniP) miniP.textContent = '$' + formatPrice(candle.close);
 
             for (const [, pos] of S._positionMap) {
                 if (pos.symbol === S.selectedSymbol) pos.markPrice = candle.close;

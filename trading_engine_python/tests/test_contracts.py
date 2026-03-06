@@ -232,13 +232,14 @@ class TestChaseEvents:
     def test_progress_keys(self):
         evt = ChaseProgressEvent(
             chase_id="c1", sub_account_id="a1", symbol="BTCUSDT",
-            side="BUY", quantity=1.0, current_order_price=50000,
+            side="BUY", quantity=1.0, current_order_price=50000, stalk_offset_ticks=3,
         )
         d = evt.to_dict()
         _assert_keys(d, ["type", "chaseId", "subAccountId", "symbol", "side",
                          "quantity", "repriceCount", "status", "stalkOffsetPct",
                          "initialPrice", "currentOrderPrice", "timestamp"])
         assert d["type"] == "chase_progress"
+        assert d["stalkOffsetTicks"] == 3
         _assert_json_roundtrip(d)
 
     def test_filled_keys(self):
@@ -270,6 +271,8 @@ class TestLifecycleStreamEvents:
         _assert_keys(d, [
             "type", "client_order_id", "sub_account_id", "routing_prefix",
             "symbol", "side", "order_type", "quantity", "price",
+            "order_role", "strategy_session_id", "parent_strategy_session_id",
+            "root_strategy_session_id", "replaces_client_order_id",
             "execution_scope", "decision_bid", "decision_ask", "decision_mid",
             "decision_spread_bps", "intent_ts", "source_ts",
         ])
@@ -297,6 +300,8 @@ class TestLifecycleStreamEvents:
         _assert_keys(d, [
             "type", "client_order_id", "sub_account_id", "symbol",
             "side", "order_type", "error", "reason", "status",
+            "order_role", "strategy_session_id", "parent_strategy_session_id",
+            "root_strategy_session_id", "replaces_client_order_id",
             "rejected_ts", "source_ts",
         ])
         assert d["type"] == StreamEventType.ORDER_REJECTED
@@ -319,7 +324,7 @@ class TestOrderEventBase:
 
 class TestScalperEvents:
     def test_progress_keys(self):
-        slot = ScalperSlotInfo(layer_idx=0, active=True, fills=3)
+        slot = ScalperSlotInfo(layer_idx=0, active=True, fills=3, offset_ticks=4)
         d = ScalperProgressEvent(
             scalper_id="s1", sub_account_id="a1", symbol="BTCUSDT",
             long_slots=[slot], short_slots=[],
@@ -327,6 +332,7 @@ class TestScalperEvents:
         _assert_keys(d, ["type", "scalperId", "totalFillCount", "longSlots", "shortSlots"])
         assert d["longSlots"][0]["layerIdx"] == 0
         assert d["longSlots"][0]["fills"] == 3
+        assert d["longSlots"][0]["offsetTicks"] == 4
 
     def test_filled_keys(self):
         d = ScalperFilledEvent(scalper_id="s1", fill_price=50000, layer_idx=1).to_dict()
@@ -417,11 +423,12 @@ class TestChaseRedisState:
     def test_keys(self):
         d = ChaseRedisState(
             chase_id="c1", sub_account_id="a1", symbol="BTCUSDT",
-            side="BUY", quantity=1.0, started_at=ts_ms(),
+            side="BUY", quantity=1.0, started_at=ts_ms(), stalk_offset_ticks=2,
         ).to_dict()
         _assert_keys(d, ["chaseId", "subAccountId", "symbol", "side",
                          "quantity", "stalkMode", "stalkOffsetPct", "startedAt",
                          "currentOrderPrice", "sizeUsd", "reduceOnly"])
+        assert d["stalkOffsetTicks"] == 2
         # No bare "id" key
         assert "id" not in d
 

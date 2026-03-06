@@ -92,6 +92,15 @@ class BinanceFutures:
         # If a proxy IS needed, set these to the correct http:// URLs.
         self.proxies = {}
         self.client = UMFutures(key=api_key, secret=api_secret, proxies=self.proxies)
+
+        # Increase urllib3 connection pool to avoid
+        # "Connection pool is full, discarding connection" warnings
+        # under high-frequency order traffic.
+        from requests.adapters import HTTPAdapter
+        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+        self.client.session.mount("https://", adapter)
+        self.client.session.mount("http://", adapter)
+
         config_logging(logging, logging.INFO)
         self.logger = logging.getLogger(__name__)
 

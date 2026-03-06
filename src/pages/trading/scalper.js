@@ -22,8 +22,11 @@ export function updateScalperPreview() {
     const perSideUsd = totalSizeUsd;
     const price = S.currentPrice || 0;
     const weights = _computeSkewWeights(count, skew);
-    const longLayers = _computePreviewOffsets(longOff, count);
-    const shortLayers = _computePreviewOffsets(shortOff, count);
+    const tickSize = _tickSize();
+    const longLayerSpec = _buildPreviewLayers(price, 'BUY', _computePreviewOffsets(longOff, count), tickSize);
+    const shortLayerSpec = _buildPreviewLayers(price, 'SELL', _computePreviewOffsets(shortOff, count), tickSize);
+    const longLayers = longLayerSpec.adjustedOffsets;
+    const shortLayers = shortLayerSpec.adjustedOffsets;
     const effMin = _effectiveMinNotional();
     const minNotional = _minLayerNotional(perSideUsd, count, skew, price);
     const tooSmall = minNotional + 0.001 < effMin && price > 0 && perSideUsd > 0;
@@ -33,27 +36,32 @@ export function updateScalperPreview() {
 
     // ── Mini orderbook display ─────────────────────────────────
     // Short layers (sells) at top, long layers at bottom — mimics an OB
-    const mkRow = (offsets, ws, side) => offsets.map((off, i) => {
+    const mkRow = (layers, ws, side) => layers.map((layer, i) => {
         const layerUsd = perSideUsd > 0 ? ws[i] * perSideUsd : null;
         const barPct = Math.round((ws[i] / maxW) * 100);
         const sideColor = side === 'long' ? 'var(--cyan,#06b6d4)' : 'var(--orange,#f97316)';
         const barBg = side === 'long' ? 'rgba(6,182,212,0.22)' : 'rgba(249,115,22,0.22)';
-        const barAlign = side === 'long' ? 'right' : 'left';
         const sizeStr = layerUsd != null ? `$${layerUsd.toFixed(1)}` : '';
         const barStyle = side === 'long'
             // Long bar fills from RIGHT (mimics bid side of OB)
             ? `background:linear-gradient(to left, ${barBg} ${barPct}%, transparent ${barPct}%)`
             : `background:linear-gradient(to right, ${barBg} ${barPct}%, transparent ${barPct}%)`;
-        return `<div style="display:flex; justify-content:space-between; align-items:center; padding:1px 0; font-size:9px; ${barStyle}">
-  <span style="color:${sideColor}; font-family:var(--font-mono); font-weight:600; min-width:48px;">${off.toFixed(3)}%</span>
-  <span style="color:var(--text-muted); font-size:8px;">L${i + 1}</span>
+        const priceStr = layer.price > 0 ? _formatLayerPrice(layer.price) : '—';
+        const offsetLabel = `${layer.offsetPct.toFixed(3)}%`;
+        const widened = Math.abs(layer.offsetPct - layer.rawOffsetPct) > 1e-9;
+        return `<div style="display:flex; justify-content:space-between; align-items:center; gap:6px; padding:2px 0; font-size:9px; ${barStyle}">
+  <span style="color:${sideColor}; font-family:var(--font-mono); font-weight:700; min-width:72px;">${priceStr}</span>
+  <span style="display:flex; flex-direction:column; align-items:center; min-width:52px;">
+    <span style="color:var(--text-muted); font-size:8px;">L${i + 1}</span>
+    <span style="color:${widened ? '#fbbf24' : 'var(--text-secondary)'}; font-size:8px;">${offsetLabel}</span>
+  </span>
   <span style="color:${sideColor}; font-family:var(--font-mono); min-width:40px; text-align:right;">${sizeStr}</span>
 </div>`;
     }).join('');
 
     // Render: SHORT on top, spread label in middle, LONG on bottom
-    const shortRows = mkRow([...shortLayers].reverse(), [...weights].reverse(), 'short');
-    const longRows = mkRow(longLayers, weights, 'long');
+    const shortRows = mkRow([...shortLayerSpec.layers].reverse(), [...weights].reverse(), 'short');
+    const longRows = mkRow(longLayerSpec.layers, weights, 'long');
 
     let html = `<div style="border:1px solid rgba(255,255,255,0.07); border-radius:5px; overflow:hidden; margin-bottom:4px;">`;
     if (scalperMode !== 'LONG') {
@@ -76,6 +84,16 @@ export function updateScalperPreview() {
         const skewNote = skew !== 0 ? ' (adjusted for skew)' : ` (${count} layers × $${effMin})`;
         html += `<span style="color:#f43f5e; font-size:10px;">⚠ Min size: $${minSize}/side${skewNote}</span>`;
     }
+    const compressionNotes = [];
+    if (longLayerSpec.collapsedCount > 0 && scalperMode !== 'SHORT') {
+        compressionNotes.push(`LONG ${longLayerSpec.rawUniqueCount}/${count} raw ticks`);
+    }
+    if (shortLayerSpec.collapsedCount > 0 && scalperMode !== 'LONG') {
+        compressionNotes.push(`SHORT ${shortLayerSpec.rawUniqueCount}/${count} raw ticks`);
+    }
+    if (compressionNotes.length) {
+        html += `<br><span style="color:#fbbf24; font-size:9px;">Tick-aware spacing active (${compressionNotes.join(' · ')}). Working layers are widened to stay on distinct prices.</span>`;
+    }
     if (scalperMode === 'NEUTRAL') {
         html += `<br><span style="color:#a855f7; font-size:9px; font-weight:600;">🧲 NEUTRAL — both legs open, position rides freely</span>`;
     }
@@ -89,6 +107,86 @@ function _computePreviewOffsets(baseOffset, count, maxSpread = 2.0) {
     return Array.from({ length: count }, (_, i) =>
         baseOffset * Math.exp(-Math.log(maxSpread) / 2 + step * i)
     );
+}
+
+function _tickSize() {
+    const tick = Number(S.symbolInfo?.tickSize || 0);
+    if (Number.isFinite(tick) && tick > 0) return tick;
+    const precision = Number(S.symbolInfo?.pricePrecision);
+    return Number.isFinite(precision) && precision >= 0 ? 1 / Math.pow(10, precision) : 0;
+}
+
+function _truncateToTick(price, tickSize) {
+    if (!(tickSize > 0)) return price;
+    const steps = Math.floor((price / tickSize) + 1e-12);
+    return Math.max(tickSize, steps * tickSize);
+}
+
+function _offsetPrice(referencePrice, side, offsetPct) {
+    if (String(side).toUpperCase() === 'BUY') {
+        return referencePrice * (1 - (offsetPct / 100));
+    }
+    return referencePrice * (1 + (offsetPct / 100));
+}
+
+function _priceToOffset(referencePrice, side, price) {
+    if (!(referencePrice > 0)) return 0;
+    if (String(side).toUpperCase() === 'BUY') {
+        return Math.max(0, (1 - (price / referencePrice)) * 100);
+    }
+    return Math.max(0, ((price / referencePrice) - 1) * 100);
+}
+
+function _enforceTickSpacing(referencePrice, side, offsets, tickSize) {
+    if (!(referencePrice > 0) || !(tickSize > 0) || offsets.length <= 1) return [...offsets];
+    const adjusted = [];
+    let prevPrice = null;
+    for (const offset of offsets) {
+        let rounded = _truncateToTick(_offsetPrice(referencePrice, side, offset), tickSize);
+        if (prevPrice != null) {
+            if (String(side).toUpperCase() === 'BUY') {
+                const maxAllowed = Math.max(tickSize, prevPrice - tickSize);
+                if (rounded > maxAllowed) rounded = maxAllowed;
+            } else {
+                const minAllowed = prevPrice + tickSize;
+                if (rounded < minAllowed) rounded = minAllowed;
+                rounded = _truncateToTick(rounded, tickSize);
+            }
+        }
+        adjusted.push(Math.max(offset, _priceToOffset(referencePrice, side, rounded)));
+        prevPrice = rounded;
+    }
+    return adjusted;
+}
+
+function _buildPreviewLayers(referencePrice, side, offsets, tickSize) {
+    const rawPrices = offsets.map((offset) => _truncateToTick(_offsetPrice(referencePrice, side, offset), tickSize));
+    const adjustedOffsets = _enforceTickSpacing(referencePrice, side, offsets, tickSize);
+    const layers = adjustedOffsets.map((offsetPct, index) => ({
+        offsetPct,
+        rawOffsetPct: offsets[index],
+        price: _truncateToTick(_offsetPrice(referencePrice, side, offsetPct), tickSize),
+    }));
+    const rawUniqueCount = new Set(rawPrices.map((price) => Number(price || 0).toFixed(12))).size;
+    return {
+        layers,
+        adjustedOffsets,
+        rawUniqueCount,
+        collapsedCount: Math.max(0, offsets.length - rawUniqueCount),
+    };
+}
+
+function _formatLayerPrice(price) {
+    if (!(price > 0)) return '—';
+    const tickSize = _tickSize();
+    if (tickSize > 0) {
+        const decimals = Math.max(0, Math.round(-Math.log10(tickSize)));
+        return `$${price.toFixed(decimals)}`;
+    }
+    if (S.symbolInfo?.pricePrecision != null) {
+        return `$${price.toFixed(S.symbolInfo.pricePrecision)}`;
+    }
+    return `$${price.toFixed(6)}`;
 }
 
 function _computeSkewWeights(count, skew) {

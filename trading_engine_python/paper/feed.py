@@ -39,6 +39,7 @@ class PaperUserStream:
         self._market_data = market_data
         self._running = False
         self._subscribed_symbols: Set[str] = set()
+        self._initial_sync_complete = asyncio.Event()
 
         # Wire matching engine events → OrderManager
         if self._matching:
@@ -56,6 +57,7 @@ class PaperUserStream:
         forwards ALL L1 ticks to the matching engine.
         """
         self._running = True
+        self._initial_sync_complete.set()
         logger.info("🧻 PaperUserStream started — monitoring price ticks for order matching")
 
         # Run the tick router as a background task
@@ -76,6 +78,14 @@ class PaperUserStream:
                 self._market_data.unsubscribe(symbol, self._on_l1_tick)
                 self._subscribed_symbols.discard(symbol)
         logger.info("PaperUserStream stopped")
+
+    async def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
+        """Paper mode readiness means the local loop has started."""
+        try:
+            await asyncio.wait_for(self._initial_sync_complete.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def _sync_subscriptions(self) -> None:
         """

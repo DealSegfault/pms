@@ -77,6 +77,7 @@ export function buildTradingHTML() {
                 <button id="chart-settings-btn" class="tf-btn" title="Chart settings" style="font-size:13px;">⚙</button>
               </div>
             </div>
+            <div id="chart-settings-backdrop" class="chart-settings-backdrop" style="display:none;"></div>
             <div id="chart-settings-panel" style="display:none; background:var(--bg-card); border:1px solid var(--border); border-radius:6px; padding:10px 12px; position:absolute; top:32px; right:4px; z-index:50; font-size:11px; min-width:220px; box-shadow: 0 4px 16px rgba(0,0,0,0.5);">
               <div style="font-weight:600; margin-bottom:8px; color:var(--text);">Chart Settings</div>
               <div style="border-top:1px solid var(--border); margin-top:6px; padding-top:6px; font-weight:600; margin-bottom:4px; color:var(--text);">Overlays</div>
@@ -177,6 +178,10 @@ export function buildTradingHTML() {
             <span>Place Order</span>
             <span id="form-account" class="form-account">${accountName}</span>
           </div>
+          <div class="ux-mini-ticker" id="ux-mini-ticker">
+            <span id="ux-mini-sym">${symBase}</span>
+            <span id="ux-mini-price" style="color:var(--text-muted)">—</span>
+          </div>
 
           <div class="account-info-panel" id="account-info" style="padding: 6px 8px;">
             <div class="acct-info-row">
@@ -184,18 +189,20 @@ export function buildTradingHTML() {
               <div style="display:flex; align-items:center; gap:6px;">
                 <span id="acct-available" style="color: var(--green); font-weight: 600;">$0.00</span>
                 <div style="position:relative;">
-                  <button id="lev-btn" style="font-size:10px; padding:1px 6px; background:var(--surface-2); border:1px solid var(--border); border-radius:3px; color:var(--accent); cursor:pointer; font-family:var(--font-mono); font-weight:600; white-space:nowrap;">${S.leverage}×</button>
+                  <button id="lev-btn" class="lev-btn-enhanced" style="background:var(--surface-2); border:1px solid var(--border); border-radius:3px; color:var(--accent); cursor:pointer; font-family:var(--font-mono); white-space:nowrap;">${S.leverage}×</button>
                   <div id="lev-dropdown" style="display:none; position:absolute; top:100%; right:0; margin-top:4px; background:var(--bg-card); border:1px solid var(--border); border-radius:6px; box-shadow:0 4px 16px rgba(0,0,0,0.5); z-index:60; padding:4px; min-width:120px;">
                     <div id="lev-presets" style="display:grid; grid-template-columns:repeat(4,1fr); gap:3px;">
                       ${[1, 2, 3, 5, 10, 20, 50, 100].map(v => `<button data-lev="${v}" style="font-size:11px; padding:4px 2px; background:${S.leverage === v ? 'var(--accent)' : 'var(--surface-2)'}; color:${S.leverage === v ? 'white' : 'var(--text)'}; border:1px solid ${S.leverage === v ? 'var(--accent)' : 'var(--border)'}; border-radius:4px; cursor:pointer; font-family:var(--font-mono); font-weight:600;">${v}×</button>`).join('')}
+                    </div>
+                    <div class="lev-custom-row">
+                      <input type="number" id="lev-custom-input" class="lev-custom-input" placeholder="Custom" min="1" max="125" />
+                      <button id="lev-custom-go" class="lev-custom-btn">Set</button>
                     </div>
                   </div>
                 </div>
               </div>
             </div>
           </div>
-
-
           <div class="ot-dropdown" id="ot-dropdown" style="margin: 8px 10px 4px; position:relative; user-select:none;">
             <button id="ot-trigger" class="ot-trigger">
               <span class="ot-selected-icon" id="ot-selected-icon">${{ 'MARKET': '⚡', 'LIMIT': '📌', 'SCALE': '📊', 'TWAP': '⏱️', 'TRAIL': '🛡️', 'CHASE': '🎯', 'SCALPER': '⚔️' }[S.orderType] || '⚡'}</span>
@@ -424,9 +431,14 @@ export function buildTradingHTML() {
                 <span>Heavy far ▶</span>
               </div>
             </div>
+            <!-- Advanced section toggle -->
+            <button class="ux-advanced-toggle" id="scalper-adv-toggle">
+              <span class="ux-adv-chevron">▶</span> Advanced Settings
+            </button>
+            <div class="ux-advanced-content" id="scalper-adv-content">
             <!-- Price Filter -->
             <div style="margin-bottom:8px;">
-              <div style="font-size:10px; color:var(--text-muted); margin-bottom:6px; letter-spacing:0.03em;">Price Filters <span style="opacity:0.5; font-style:italic;">(optional)</span></div>
+              <div class="label-sm" style="margin-bottom:6px; letter-spacing:0.03em;">Price Filters <span style="opacity:0.5; font-style:italic;">(optional)</span></div>
               <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
                 <div>
                   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2px;">
@@ -530,6 +542,7 @@ export function buildTradingHTML() {
 
               </div>
             </div>
+            </div><!-- /ux-advanced-content -->
             <div id="scalper-preview" style="font-size:10px; color:var(--text-muted); text-align:center; min-height:20px; margin-bottom:4px;"></div>
           </div>
 
@@ -556,10 +569,6 @@ export function buildTradingHTML() {
                 <span class="slider-diamond" data-pct="75"></span>
                 <span class="slider-diamond" data-pct="100"></span>
               </div>
-            </div>
-            <div style="display: flex; justify-content: space-between; margin-top: 4px; font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);">
-              <span id="size-buy-label">Buy 0 USDT</span>
-              <span id="size-sell-label">Sell 0 USDT</span>
             </div>
           </div>
 

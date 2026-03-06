@@ -36,6 +36,11 @@ class LifecycleStreamEventBase:
     reduce_only: bool = False
     origin: str = "MANUAL"
     parent_id: Optional[str] = None
+    order_role: str = "UNKNOWN"
+    strategy_session_id: Optional[str] = None
+    parent_strategy_session_id: Optional[str] = None
+    root_strategy_session_id: Optional[str] = None
+    replaces_client_order_id: Optional[str] = None
     execution_scope: str = "SUB_ACCOUNT"
     source_ts: int = 0
 
@@ -52,6 +57,11 @@ class LifecycleStreamEventBase:
             "reduce_only": self.reduce_only,
             "origin": self.origin,
             "parent_id": self.parent_id or "",
+            "order_role": self.order_role,
+            "strategy_session_id": self.strategy_session_id or "",
+            "parent_strategy_session_id": self.parent_strategy_session_id or "",
+            "root_strategy_session_id": self.root_strategy_session_id or "",
+            "replaces_client_order_id": self.replaces_client_order_id or "",
             "execution_scope": self.execution_scope,
             "source_ts": self.source_ts or ts_ms(),
         }
@@ -75,6 +85,11 @@ class LifecycleStreamEventBase:
             reduce_only=order.reduce_only,
             origin=order.origin,
             parent_id=order.parent_id,
+            order_role=getattr(order, "order_role", "UNKNOWN"),
+            strategy_session_id=getattr(order, "strategy_session_id", None),
+            parent_strategy_session_id=getattr(order, "parent_strategy_session_id", None),
+            root_strategy_session_id=getattr(order, "root_strategy_session_id", None),
+            replaces_client_order_id=getattr(order, "replaces_client_order_id", None),
             source_ts=source_ts or ts_ms(),
         )
 
@@ -123,6 +138,33 @@ class OrderRejectedStreamEvent(LifecycleStreamEventBase):
         }
 
 
+@dataclass
+class ScalperRuntimeSnapshotStreamEvent:
+    """Dedicated runtime checkpoint event published to pms:stream:algo_runtime."""
+
+    strategy_session_id: str
+    sub_account_id: str
+    strategy_type: str = "SCALPER"
+    checkpoint_seq: int = 0
+    checkpoint_reason: str = "HEARTBEAT"
+    status: str = "ACTIVE"
+    snapshot_json: str = "{}"
+    source_ts: int = 0
+
+    def to_stream_dict(self) -> dict:
+        return {
+            "type": StreamEventType.SCALPER_RUNTIME_SNAPSHOT,
+            "strategy_session_id": self.strategy_session_id,
+            "sub_account_id": self.sub_account_id,
+            "strategy_type": self.strategy_type,
+            "checkpoint_seq": self.checkpoint_seq,
+            "checkpoint_reason": self.checkpoint_reason,
+            "status": self.status,
+            "snapshot_json": self.snapshot_json,
+            "source_ts": self.source_ts or ts_ms(),
+        }
+
+
 # ══════════════════════════════════════════════════════════════
 # Order Events (from OrderManager)
 # ══════════════════════════════════════════════════════════════
@@ -146,6 +188,11 @@ class OrderEventBase:
     last_fill_qty: float = 0.0
     origin: str = "MANUAL"
     parent_id: Optional[str] = None
+    order_role: str = "UNKNOWN"
+    strategy_session_id: Optional[str] = None
+    parent_strategy_session_id: Optional[str] = None
+    root_strategy_session_id: Optional[str] = None
+    replaces_client_order_id: Optional[str] = None
     leverage: int = 1
     created_at: float = 0.0            # seconds (Python internal)
     updated_at: float = 0.0
@@ -168,6 +215,11 @@ class OrderEventBase:
             "lastFillQty": self.last_fill_qty,
             "origin": self.origin,
             "parentId": self.parent_id,
+            "orderRole": self.order_role,
+            "strategySessionId": self.strategy_session_id,
+            "parentStrategySessionId": self.parent_strategy_session_id,
+            "rootStrategySessionId": self.root_strategy_session_id,
+            "replacesClientOrderId": self.replaces_client_order_id,
             "leverage": self.leverage,
             "createdAt": ts_s_to_ms(self.created_at),
             "updatedAt": ts_s_to_ms(self.updated_at),
@@ -193,6 +245,11 @@ class OrderEventBase:
             last_fill_qty=order.last_fill_qty,
             origin=order.origin,
             parent_id=order.parent_id,
+            order_role=getattr(order, "order_role", "UNKNOWN"),
+            strategy_session_id=getattr(order, "strategy_session_id", None),
+            parent_strategy_session_id=getattr(order, "parent_strategy_session_id", None),
+            root_strategy_session_id=getattr(order, "root_strategy_session_id", None),
+            replaces_client_order_id=getattr(order, "replaces_client_order_id", None),
             leverage=order.leverage,
             created_at=order.created_at,
             updated_at=order.updated_at,
@@ -306,6 +363,7 @@ class ChaseProgressEvent:
     reprice_count: int = 0
     status: str = "ACTIVE"
     stalk_offset_pct: float = 0.0
+    stalk_offset_ticks: Optional[int] = None
     initial_price: float = 0.0
     current_order_price: Optional[float] = None
     parent_scalper_id: Optional[str] = None
@@ -330,6 +388,8 @@ class ChaseProgressEvent:
             "ask": self.ask,
             "timestamp": ts_ms(),
         }
+        if self.stalk_offset_ticks is not None:
+            d["stalkOffsetTicks"] = self.stalk_offset_ticks
         if self.parent_scalper_id:
             d["parentScalperId"] = self.parent_scalper_id
         return d
@@ -402,6 +462,7 @@ class ScalperSlotInfo:
     """Per-slot state for scalper_progress events."""
     layer_idx: int = 0
     offset_pct: float = 0.0
+    offset_ticks: Optional[int] = None
     qty: float = 0.0
     active: bool = False
     paused: bool = False
@@ -411,7 +472,7 @@ class ScalperSlotInfo:
     fills: int = 0
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "layerIdx": self.layer_idx,
             "offsetPct": self.offset_pct,
             "qty": self.qty,
@@ -422,6 +483,9 @@ class ScalperSlotInfo:
             "pauseReason": self.pause_reason,
             "fills": self.fills,
         }
+        if self.offset_ticks is not None:
+            data["offsetTicks"] = self.offset_ticks
+        return data
 
 
 @dataclass

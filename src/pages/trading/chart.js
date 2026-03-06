@@ -106,7 +106,16 @@ export function initChart() {
 
 
     const vs = S.chart.addHistogramSeries({
-        priceFormat: { type: 'volume' },
+        priceFormat: {
+            type: 'custom',
+            formatter: (v) => {
+                if (!v || !Number.isFinite(v)) return '0';
+                if (v >= 1e9) return `${(v / 1e9).toFixed(2)}B`;
+                if (v >= 1e6) return `${(v / 1e6).toFixed(2)}M`;
+                if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
+                return v.toFixed(0);
+            },
+        },
         priceScaleId: '',
     });
     S.set('volumeSeries', vs);

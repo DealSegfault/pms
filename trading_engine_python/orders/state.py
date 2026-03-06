@@ -41,6 +41,24 @@ VALID_TRANSITIONS = {
 
 TERMINAL_STATES = {"filled", "cancelled", "expired", "failed"}
 
+ORDER_ROLE_ENTRY = "ENTRY"
+ORDER_ROLE_ADD = "ADD"
+ORDER_ROLE_UNWIND = "UNWIND"
+ORDER_ROLE_FLATTEN = "FLATTEN"
+ORDER_ROLE_REPRICE = "REPRICE"
+ORDER_ROLE_HEDGE = "HEDGE"
+ORDER_ROLE_UNKNOWN = "UNKNOWN"
+
+VALID_ORDER_ROLES = {
+    ORDER_ROLE_ENTRY,
+    ORDER_ROLE_ADD,
+    ORDER_ROLE_UNWIND,
+    ORDER_ROLE_FLATTEN,
+    ORDER_ROLE_REPRICE,
+    ORDER_ROLE_HEDGE,
+    ORDER_ROLE_UNKNOWN,
+}
+
 
 ROUTING_PREFIX_LEN = 12
 LEGACY_ROUTING_PREFIX_LEN = 8
@@ -86,6 +104,13 @@ def generate_client_order_id(sub_account_id: str, order_type: str) -> str:
     return f"PMS{prefix}_{order_type}_{uid}"
 
 
+def normalize_order_role(value: Optional[str]) -> str:
+    role = str(value or "").strip().upper()
+    if role in VALID_ORDER_ROLES:
+        return role
+    return ORDER_ROLE_UNKNOWN
+
+
 @dataclass
 class OrderState:
     """
@@ -122,6 +147,11 @@ class OrderState:
     # ── Metadata ──
     origin: str = "MANUAL"                        # MANUAL / CHASE / SCALPER / TWAP / TRAIL_STOP / BASKET
     parent_id: Optional[str] = None               # Parent algo ID (chase_id, scalper_id, etc.)
+    order_role: str = ORDER_ROLE_UNKNOWN
+    strategy_session_id: Optional[str] = None
+    parent_strategy_session_id: Optional[str] = None
+    root_strategy_session_id: Optional[str] = None
+    replaces_client_order_id: Optional[str] = None
     leverage: int = 1
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -216,6 +246,11 @@ class OrderState:
             "lastFillQty": self.last_fill_qty,
             "origin": self.origin,
             "parentId": self.parent_id,
+            "orderRole": normalize_order_role(self.order_role),
+            "strategySessionId": self.strategy_session_id,
+            "parentStrategySessionId": self.parent_strategy_session_id,
+            "rootStrategySessionId": self.root_strategy_session_id,
+            "replacesClientOrderId": self.replaces_client_order_id,
             "leverage": self.leverage,
             "createdAt": ts_s_to_ms(self.created_at),
             "updatedAt": ts_s_to_ms(self.updated_at),

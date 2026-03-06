@@ -1101,7 +1101,7 @@ class RiskEngine:
             try:
                 await self._db.execute(
                     "UPDATE virtual_positions SET status='CLOSED', closed_at=?, realized_pnl=0 WHERE id=?",
-                    (int(time.time() * 1000), pos.id),
+                    (_db_now(), pos.id),
                 )
             except Exception as e:
                 logger.error("Failed to DB-close stale position %s: %s", pos.id[:8], e)

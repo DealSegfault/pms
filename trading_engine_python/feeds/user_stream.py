@@ -89,6 +89,7 @@ class UserStreamService:
         self._running = False
         self._ws = None
         self._keepalive_task: Optional[asyncio.Task] = None
+        self._initial_sync_complete = asyncio.Event()
 
         # Fill price cache — bounded at 500, used for reconciliation
         self._recent_fills: OrderedDict[str, Dict] = OrderedDict()
@@ -144,6 +145,14 @@ class UserStreamService:
             except Exception:
                 pass
         logger.info("UserStreamService stopped")
+
+    async def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
+        """Wait until the first startup reconciliation/open-order sync is complete."""
+        try:
+            await asyncio.wait_for(self._initial_sync_complete.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     # ── Main Loop ──
 
@@ -267,6 +276,8 @@ class UserStreamService:
                     "fill_qty": mapped["last_filled_qty"],
                     "accumulated_filled_qty": mapped["accumulated_filled_qty"],
                     "avg_price": mapped["avg_price"],
+                    "commission": mapped.get("commission", "0"),
+                    "maker_taker": str(raw.get("m", "")),
                     "reduce_only": str(mapped.get("reduce_only", False)),
                     "source_ts": str(raw.get("T") or message.get("E") or 0),
                 })
@@ -379,6 +390,7 @@ class UserStreamService:
                     "fill_qty": mapped["last_filled_qty"],
                     "accumulated_filled_qty": mapped["accumulated_filled_qty"],
                     "avg_price": mapped["avg_price"],
+                    "commission": str(data.get("n", "0")),
                     "source_ts": str(data.get("T", 0) or 0),
                 })
                 if not event_id:
@@ -423,6 +435,7 @@ class UserStreamService:
                     logger.info("Recovered %d open orders from exchange on startup", count)
             except Exception as e:
                 logger.error("Failed to load open orders on startup: %s", e)
+        self._initial_sync_complete.set()
 
     # ── Fill Price Cache ──
 

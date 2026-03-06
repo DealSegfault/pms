@@ -85,6 +85,11 @@ export const LIFECYCLE_STREAM_EVENTS = {
  * @property {string|number} price
  * @property {string|boolean} reduce_only
  * @property {string} origin
+ * @property {string} order_role
+ * @property {string} strategy_session_id
+ * @property {string} parent_strategy_session_id
+ * @property {string} root_strategy_session_id
+ * @property {string} replaces_client_order_id
  * @property {string} execution_scope
  * @property {string|number} decision_bid
  * @property {string|number} decision_ask
@@ -103,6 +108,11 @@ export const LIFECYCLE_STREAM_EVENTS = {
  * @property {string} symbol
  * @property {string} side
  * @property {string} order_type
+ * @property {string} order_role
+ * @property {string} strategy_session_id
+ * @property {string} parent_strategy_session_id
+ * @property {string} root_strategy_session_id
+ * @property {string} replaces_client_order_id
  * @property {string} error
  * @property {string} reason
  * @property {string} status
@@ -122,6 +132,7 @@ export const LIFECYCLE_STREAM_EVENTS = {
  * @property {number} leverage
  * @property {string} stalkMode                - maintain / none
  * @property {number} stalkOffsetPct
+ * @property {number} [stalkOffsetTicks]
  * @property {number} maxDistancePct
  * @property {string} status                   - ACTIVE / FILLED / CANCELLED
  * @property {number} repriceCount
@@ -142,6 +153,7 @@ export const LIFECYCLE_STREAM_EVENTS = {
  * @property {string} side
  * @property {number} qty
  * @property {number} offsetPct
+ * @property {number} [offsetTicks]
  * @property {boolean} active
  * @property {boolean} paused
  * @property {number|null} retryAt             - ms timestamp

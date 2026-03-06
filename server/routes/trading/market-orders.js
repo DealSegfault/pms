@@ -340,6 +340,208 @@ router.get('/history/:subAccountId', requireOwnership(), async (req, res) => {
     }
 });
 
+// GET /api/trade/position-history/:subAccountId — Position history with fee enrichment
+router.get('/position-history/:subAccountId', requireOwnership(), async (req, res) => {
+    try {
+        const subAccountId = req.params.subAccountId;
+        const { symbol, period, status: statusFilter, limit = 200, offset = 0 } = req.query;
+
+        // Build time filter
+        let fromDate = null;
+        if (period) {
+            const now = new Date();
+            if (period === 'today') fromDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            else if (period === '7d') fromDate = new Date(now - 7 * 86400000);
+            else if (period === '30d') fromDate = new Date(now - 30 * 86400000);
+        }
+
+        // Which statuses to include
+        const statuses = statusFilter
+            ? statusFilter.split(',').map(s => s.trim().toUpperCase())
+            : ['CLOSED', 'LIQUIDATED', 'TAKEN_OVER'];
+        const includeOpen = !statusFilter || statusFilter.toUpperCase().includes('OPEN');
+
+        // Build where clause for closed/liquidated positions
+        const where = { subAccountId, status: { in: statuses } };
+        if (symbol) {
+            const normalizedSymbol = symbol.toUpperCase().includes('/') ? symbol : `${symbol.toUpperCase()}/USDT:USDT`;
+            where.symbol = normalizedSymbol;
+        }
+        if (fromDate) {
+            where.closedAt = { gte: fromDate };
+        }
+
+        // Query closed positions
+        const closedPositions = await prisma.virtualPosition.findMany({
+            where,
+            orderBy: { closedAt: 'desc' },
+            take: parseInt(limit),
+            skip: parseInt(offset),
+        });
+
+        const closedTotal = await prisma.virtualPosition.count({ where });
+
+        // Get fee totals per position from TradeExecution
+        const positionIds = closedPositions.map(p => p.id);
+        let feesByPosition = {};
+        let tradeCountByPosition = {};
+        if (positionIds.length > 0) {
+            const feeAgg = await prisma.tradeExecution.groupBy({
+                by: ['positionId'],
+                where: { positionId: { in: positionIds } },
+                _sum: { fee: true },
+                _count: true,
+            });
+            for (const row of feeAgg) {
+                feesByPosition[row.positionId] = row._sum.fee || 0;
+                tradeCountByPosition[row.positionId] = row._count || 0;
+            }
+        }
+
+        // Enrich closed positions
+        const enrichedClosed = closedPositions.map(p => {
+            const totalFees = feesByPosition[p.id] || 0;
+            const grossPnl = p.realizedPnl || 0;
+            const netPnl = grossPnl - totalFees;
+            const durationMs = p.closedAt && p.openedAt
+                ? new Date(p.closedAt).getTime() - new Date(p.openedAt).getTime()
+                : null;
+            return {
+                id: p.id,
+                symbol: p.symbol,
+                side: p.side,
+                entryPrice: p.entryPrice,
+                quantity: p.quantity,
+                notional: p.notional,
+                leverage: p.leverage,
+                status: p.status,
+                realizedPnl: grossPnl,
+                totalFees,
+                netPnl,
+                durationMs,
+                tradeCount: tradeCountByPosition[p.id] || 0,
+                openedAt: p.openedAt,
+                closedAt: p.closedAt,
+            };
+        });
+
+        // Include OPEN positions from Redis
+        let openPositions = [];
+        if (includeOpen) {
+            const snapshot = await getRiskSnapshot(subAccountId);
+            if (snapshot?.positions?.length > 0) {
+                let livePositions = snapshot.positions;
+                if (symbol) {
+                    const normalizedSymbol = symbol.toUpperCase().includes('/') ? symbol : `${symbol.toUpperCase()}/USDT:USDT`;
+                    livePositions = livePositions.filter(p => {
+                        const ps = (p.symbol || '').toUpperCase();
+                        return ps === normalizedSymbol.toUpperCase() || ps === normalizedSymbol.replace(':USDT', '').toUpperCase();
+                    });
+                }
+                openPositions = livePositions.map(p => ({
+                    id: p.id || p.positionId,
+                    symbol: p.symbol,
+                    side: p.side,
+                    entryPrice: p.entryPrice,
+                    quantity: p.quantity,
+                    notional: p.notional || (p.quantity * (p.markPrice || p.entryPrice)),
+                    leverage: p.leverage,
+                    status: 'OPEN',
+                    realizedPnl: 0,
+                    unrealizedPnl: p.unrealizedPnl || 0,
+                    markPrice: p.markPrice || 0,
+                    totalFees: 0,
+                    netPnl: p.unrealizedPnl || 0,
+                    durationMs: p.openedAt ? Date.now() - new Date(p.openedAt).getTime() : null,
+                    tradeCount: 0,
+                    openedAt: p.openedAt,
+                    closedAt: null,
+                }));
+            }
+        }
+
+        // Merge: open positions first, then closed
+        const allPositions = [...openPositions, ...enrichedClosed];
+
+        // Build per-symbol rollups
+        const symbolMap = {};
+        for (const p of allPositions) {
+            const sym = p.symbol;
+            if (!symbolMap[sym]) {
+                symbolMap[sym] = {
+                    symbol: sym,
+                    count: 0,
+                    openCount: 0,
+                    closedCount: 0,
+                    wins: 0,
+                    losses: 0,
+                    cumulativePnl: 0,
+                    totalFees: 0,
+                    netPnl: 0,
+                    totalDurationMs: 0,
+                    durationCount: 0,
+                    pnlSeries: [], // for sparkline
+                };
+            }
+            const r = symbolMap[sym];
+            r.count++;
+            if (p.status === 'OPEN') {
+                r.openCount++;
+                r.cumulativePnl += p.unrealizedPnl || 0;
+                r.netPnl += p.unrealizedPnl || 0;
+            } else {
+                r.closedCount++;
+                const pnl = p.realizedPnl || 0;
+                if (pnl > 0) r.wins++;
+                else if (pnl < 0) r.losses++;
+                r.cumulativePnl += pnl;
+                r.totalFees += p.totalFees;
+                r.netPnl += p.netPnl;
+                if (p.durationMs) {
+                    r.totalDurationMs += p.durationMs;
+                    r.durationCount++;
+                }
+                // Add to PnL series (sorted by closedAt for sparkline)
+                r.pnlSeries.push({ ts: p.closedAt, pnl });
+            }
+        }
+
+        const symbolRollups = Object.values(symbolMap).map(r => {
+            // Sort PnL series by time and compute cumulative
+            r.pnlSeries.sort((a, b) => new Date(a.ts) - new Date(b.ts));
+            let cumulative = 0;
+            const sparklineData = r.pnlSeries.map(s => {
+                cumulative += s.pnl;
+                return cumulative;
+            });
+            return {
+                symbol: r.symbol,
+                count: r.count,
+                openCount: r.openCount,
+                closedCount: r.closedCount,
+                wins: r.wins,
+                losses: r.losses,
+                winRate: r.closedCount > 0 ? r.wins / r.closedCount : 0,
+                cumulativePnl: r.cumulativePnl,
+                totalFees: r.totalFees,
+                netPnl: r.netPnl,
+                avgDurationMs: r.durationCount > 0 ? r.totalDurationMs / r.durationCount : null,
+                sparklineData,
+            };
+        }).sort((a, b) => Math.abs(b.cumulativePnl) - Math.abs(a.cumulativePnl));
+
+        res.json({
+            positions: allPositions,
+            symbolRollups,
+            total: closedTotal + openPositions.length,
+            closedTotal,
+            openTotal: openPositions.length,
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // GET /api/trade/chart-data/:subAccountId — Data for chart annotations (positions, orders, trades)
 router.get('/chart-data/:subAccountId', requireOwnership(), async (req, res) => {
     try {
@@ -388,6 +590,74 @@ router.get('/chart-data/:subAccountId', requireOwnership(), async (req, res) => 
         });
 
         res.json({ positions, trades, openOrders });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /api/trade/stats/:subAccountId — Account stats for My Account page
+router.get('/stats/:subAccountId', requireOwnership(), async (req, res) => {
+    try {
+        const subAccountId = req.params.subAccountId;
+        const account = await prisma.subAccount.findUnique({ where: { id: subAccountId } });
+        if (!account) return res.status(404).json({ error: 'Account not found' });
+
+        // All close trades (actions that realize PnL)
+        const closeTrades = await prisma.tradeExecution.findMany({
+            where: { subAccountId, action: { notIn: ['OPEN', 'ADD'] } },
+            orderBy: { timestamp: 'asc' },
+        });
+
+        const allTrades = await prisma.tradeExecution.findMany({
+            where: { subAccountId },
+            orderBy: { timestamp: 'asc' },
+        });
+
+        const now = new Date();
+        const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const week = new Date(now - 7 * 86400000);
+        const month = new Date(now - 30 * 86400000);
+
+        function pnlForPeriod(trades, from) {
+            const filtered = from ? trades.filter(t => new Date(t.timestamp) >= from) : trades;
+            const rpnl = filtered.reduce((s, t) => s + (t.realizedPnl || 0), 0);
+            const wins = filtered.filter(t => (t.realizedPnl || 0) > 0).length;
+            const losses = filtered.filter(t => (t.realizedPnl || 0) < 0).length;
+            const totalFees = filtered.reduce((s, t) => s + (t.fee || 0), 0);
+            return { rpnl, count: filtered.length, wins, losses, totalFees };
+        }
+
+        const periods = {
+            today: pnlForPeriod(closeTrades, todayStart),
+            week: pnlForPeriod(closeTrades, week),
+            month: pnlForPeriod(closeTrades, month),
+            all: pnlForPeriod(closeTrades, null),
+        };
+
+        // Activity stats
+        const totalTrades = allTrades.length;
+        const totalFees = allTrades.reduce((s, t) => s + (t.fee || 0), 0);
+        const avgPnl = periods.all.count > 0 ? periods.all.rpnl / periods.all.count : 0;
+        const pnls = closeTrades.map(t => t.realizedPnl || 0);
+        const bestTrade = pnls.length > 0 ? Math.max(...pnls) : 0;
+        const worstTrade = pnls.length > 0 ? Math.min(...pnls) : 0;
+        const grossProfit = pnls.filter(p => p > 0).reduce((s, p) => s + p, 0);
+        const grossLoss = Math.abs(pnls.filter(p => p < 0).reduce((s, p) => s + p, 0));
+        const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? Infinity : 0;
+
+        // Equity curve from balance logs
+        const balanceLogs = await prisma.balanceLog.findMany({
+            where: { subAccountId },
+            orderBy: { timestamp: 'asc' },
+            select: { timestamp: true, balanceAfter: true },
+        });
+
+        res.json({
+            account: { id: account.id, name: account.name, balance: account.currentBalance },
+            periods,
+            activity: { totalTrades, totalFees, avgPnl, bestTrade, worstTrade, profitFactor },
+            equityCurve: balanceLogs.map(l => ({ time: l.timestamp, value: l.balanceAfter })),
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
