@@ -63,12 +63,9 @@ source "$PROJECT_DIR/trading_engine_python/.venv/bin/activate"
 pip install -q -r "$PROJECT_DIR/trading_engine_python/requirements.txt"
 ok "Python dependencies installed"
 
-# ─── 6. Kill old Vite/npm dev screens ───
-step "Cleaning up old dev screens..."
-screen -ls | grep -oP '\d+\.\S+' | while read s; do
-    screen -S "$s" -X quit 2>/dev/null || true
-done
-ok "Old screens cleared"
+# ─── 6. Kill old PMS dev screen (keep PG!) ───
+step "Cleaning up old PMS dev screen..."
+screen -S PMS -X quit 2>/dev/null && ok "Killed old PMS screen" || ok "No old PMS screen found"
 
 # ─── 7. Start ENGINE screen ───
 step "Starting Python engine in screen session 'ENGINE'..."
@@ -88,7 +85,7 @@ echo -e "${GREEN}  ✔ VPS Setup Complete!${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo -e "  ${CYAN}Services:${NC}"
-echo -e "    Backend:  sudo systemctl status pms-backend"
+echo -e "    Backend:  pm2 status / pm2 logs pms-backend"
 echo -e "    Engine:   screen -rd ENGINE"
 echo -e "    Nginx:    sudo systemctl status nginx"
 echo ""

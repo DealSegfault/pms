@@ -285,7 +285,8 @@ case "$choice" in
         ;;
     6)
         echo -e "${CYAN}Running first-time VPS setup...${NC}"
-        $SSH_CMD "cd ${VPS_PROJECT} && bash deploy/vps-setup.sh"
+        echo -e "${YELLOW}This will git pull first, then run the setup script.${NC}"
+        $SSH_CMD "cd ${VPS_PROJECT} && git pull && bash deploy/vps-setup.sh"
         exit 0
         ;;
     *)
