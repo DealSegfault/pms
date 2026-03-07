@@ -47,7 +47,7 @@ router.get('/orders/:subAccountId', validate(SubAccountIdParam, 'params'), valid
         const trades = await prisma.tradeExecution.findMany({
             where,
             skip: offset,
-            take: Math.min(limit, 1000),
+            take: Math.min(limit, 200),
             orderBy: { timestamp: 'desc' },
         });
 
@@ -88,7 +88,7 @@ router.get('/trades/:subAccountId', validate(SubAccountIdParam, 'params'), valid
 
         const trades = await prisma.tradeExecution.findMany({
             where,
-            take: Math.min(limit, 1000),
+            take: Math.min(limit, 200),
             orderBy: { timestamp: 'desc' },
             include: {
                 position: { select: { id: true, symbol: true, side: true, entryPrice: true } },
@@ -220,7 +220,7 @@ router.get('/all', validate(AllHistoryQuery, 'query'), async (req, res) => {
 
         const trades = await prisma.tradeExecution.findMany({
             skip: offset,
-            take: Math.min(limit, 1000),
+            take: Math.min(limit, 200),
             orderBy: { timestamp: 'desc' },
             include: {
                 subAccount: { select: { id: true, name: true, type: true } },

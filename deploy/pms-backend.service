@@ -1,0 +1,31 @@
+[Unit]
+Description=PMS Trading Backend
+After=network.target redis.service postgresql.service
+Wants=redis.service postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/minimalte
+ExecStart=/usr/bin/node --max-old-space-size=384 server/index.js
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+# Environment
+Environment=NODE_ENV=production
+Environment=PORT=3900
+EnvironmentFile=-/root/minimalte/.env
+
+# Memory guard — let the OS kill this before everything else dies
+MemoryMax=400M
+OOMScoreAdjust=500
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pms-backend
+
+[Install]
+WantedBy=multi-user.target

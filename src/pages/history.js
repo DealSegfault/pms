@@ -7,7 +7,7 @@ const HISTORY_LIMIT = 50;
 
 let posHistoryOffset = 0;
 let posHistoryTotal = 0;
-const POS_HISTORY_LIMIT = 100;
+const POS_HISTORY_LIMIT = 30;
 
 let activeHistTab = 'trades'; // 'trades' | 'positions'
 let posGroupMode = 'individual'; // 'individual' | 'symbol'
@@ -721,7 +721,7 @@ async function exportCSV() {
   if (!state.currentAccount) return;
   try {
     if (activeHistTab === 'positions') {
-      const data = await api(`/trade/position-history/${state.currentAccount}?limit=10000`);
+      const data = await api(`/trade/position-history/${state.currentAccount}?limit=1000`);
       const positions = data.positions || [];
       if (!positions.length) return;
 
@@ -745,7 +745,7 @@ async function exportCSV() {
     }
 
     // Trades CSV (existing)
-    const data = await api(`/trade/history/${state.currentAccount}?limit=10000`);
+    const data = await api(`/trade/history/${state.currentAccount}?limit=1000`);
     const trades = data.trades || data;
     if (!trades.length) return;
 

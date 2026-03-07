@@ -1205,11 +1205,12 @@ async function loadOverview({ silent = false } = {}) {
     if (lookbackStart) sessionParams.set('from', lookbackStart.toISOString());
 
     try {
-        const [rollups, strategyRollups, strategySessions] = await Promise.all([
-            tcaApi(`/trade/tca/rollups/${subAccountId}?${commonParams.toString()}`, { signal: controller.signal }, { key: 'overview.rollups' }),
-            tcaApi(`/trade/tca/strategy-rollups/${subAccountId}?${strategyRollupParams.toString()}`, { signal: controller.signal }, { key: 'overview.strategy-rollups' }),
-            tcaApi(`/trade/tca/strategy-sessions/${subAccountId}?${sessionParams.toString()}`, { signal: controller.signal }, { key: 'overview.strategy-sessions' }),
-        ]);
+        // Sequential to reduce peak DB memory (3 parallel queries crashed 500MB VPS)
+        const rollups = await tcaApi(`/trade/tca/rollups/${subAccountId}?${commonParams.toString()}`, { signal: controller.signal }, { key: 'overview.rollups' });
+        if (requestSeq !== PAGE.requestSeqOverview) return;
+        const strategyRollups = await tcaApi(`/trade/tca/strategy-rollups/${subAccountId}?${strategyRollupParams.toString()}`, { signal: controller.signal }, { key: 'overview.strategy-rollups' });
+        if (requestSeq !== PAGE.requestSeqOverview) return;
+        const strategySessions = await tcaApi(`/trade/tca/strategy-sessions/${subAccountId}?${sessionParams.toString()}`, { signal: controller.signal }, { key: 'overview.strategy-sessions' });
         if (requestSeq !== PAGE.requestSeqOverview) return;
         PAGE.data = {
             rollups: Array.isArray(rollups) ? rollups : [],
@@ -2092,12 +2093,12 @@ function renderLineageTab(view) {
                 </div>
             </div>
             ${PAGE.detail
-        ? renderLineageGraph(PAGE.detail)
-        : PAGE.detailError
-            ? `<div class="tca-inline-error">${escapeHtml(PAGE.detailError)}</div>`
-        : (PAGE.lifecyclePage.items?.length
-            ? '<div class="tca-chart-empty">Loading preview from the newest visible lifecycle…</div>'
-            : '<div class="tca-chart-empty">No lifecycle rows are available in the current filter window.</div>')}
+            ? renderLineageGraph(PAGE.detail)
+            : PAGE.detailError
+                ? `<div class="tca-inline-error">${escapeHtml(PAGE.detailError)}</div>`
+                : (PAGE.lifecyclePage.items?.length
+                    ? '<div class="tca-chart-empty">Loading preview from the newest visible lifecycle…</div>'
+                    : '<div class="tca-chart-empty">No lifecycle rows are available in the current filter window.</div>')}
         </section>
     `;
 }
@@ -2203,16 +2204,16 @@ function renderStrategyStudio() {
                         </div>
                     </div>
                     ${PAGE.strategyParamsExpanded
-        ? renderMultiSeriesChart(
-            timeseries?.series?.params || [],
-            [
-                ['longOffsetPct', 'Long Offset', '#8b5cf6'],
-                ['shortOffsetPct', 'Short Offset', '#ec4899'],
-                ['longActiveSlots', 'Long Active', '#14b8a6'],
-                ['shortPausedSlots', 'Short Paused', '#ef4444'],
-            ],
-        )
-        : '<div class="tca-chart-empty">Parameter evolution is hidden until requested. Open it when you need slot pressure or offset drift without paying for it on every default load.</div>'}
+                ? renderMultiSeriesChart(
+                    timeseries?.series?.params || [],
+                    [
+                        ['longOffsetPct', 'Long Offset', '#8b5cf6'],
+                        ['shortOffsetPct', 'Short Offset', '#ec4899'],
+                        ['longActiveSlots', 'Long Active', '#14b8a6'],
+                        ['shortPausedSlots', 'Short Paused', '#ef4444'],
+                    ],
+                )
+                : '<div class="tca-chart-empty">Parameter evolution is hidden until requested. Open it when you need slot pressure or offset drift without paying for it on every default load.</div>'}
                 </div>
             </section>
             <section class="tca-grid tca-strategy-grid">

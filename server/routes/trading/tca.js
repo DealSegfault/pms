@@ -2,6 +2,7 @@ import { Router } from 'express';
 import prisma from '../../db/prisma.js';
 import { buildApiErrorBody } from '../../http/api-taxonomy.js';
 import { requireOwnership } from '../../ownership.js';
+import { classifyTcaReadWeight, runTcaReadTask } from '../../tca-request-gate.js';
 import { buildTcaCacheKey, modalCache, embedCache } from '../../tca-modal-cache.js';
 import {
     buildLifecyclePageQuery,
@@ -95,6 +96,16 @@ function sendTcaInfraError(res, err, fallbackCode, fallbackMessage) {
         }));
     }
 
+    if (err?.status && err?.code && err?.category) {
+        return res.status(err.status).json(buildApiErrorBody({
+            code: err.code,
+            category: err.category,
+            message: err.message || fallbackMessage,
+            retryable: err.retryable ?? true,
+            details: err.details,
+        }));
+    }
+
     const status = Number(err?.status || 0);
     if (status === 404) {
         return res.status(404).json(buildApiErrorBody({
@@ -111,6 +122,18 @@ function sendTcaInfraError(res, err, fallbackCode, fallbackMessage) {
         message: err?.message || fallbackMessage,
         retryable: true,
     }));
+}
+
+async function runAdmittedTcaRead(res, descriptor, task) {
+    const weight = Math.max(1, classifyTcaReadWeight(descriptor));
+    return runTcaReadTask({ ...descriptor, weight }, async (admission) => {
+        if (res && !res.headersSent) {
+            res.setHeader('X-TCA-Read-Weight', String(weight));
+            res.setHeader('X-TCA-Queue-Wait-Ms', String(Math.max(0, Number(admission?.queueWaitMs || 0))));
+            res.setHeader('X-TCA-Gate-Capacity', String(Math.max(1, Number(admission?.gateCapacity || 1))));
+        }
+        return task(admission);
+    });
 }
 
 router.get('/tca/lifecycles/:subAccountId', requireOwnership(), async (req, res) => {
@@ -333,14 +356,18 @@ router.get('/tca/strategy-sessions-page/:subAccountId', requireOwnership(), asyn
         const query = buildStrategySessionPageQuery(req.params.subAccountId, req.query);
         const executionScope = String(req.query.executionScope || 'SUB_ACCOUNT').toUpperCase();
         const ownershipConfidence = String(req.query.ownershipConfidence || 'HARD').toUpperCase();
-        const pageData = await fetchStrategySessionPage({
+        const pageData = await runAdmittedTcaRead(res, {
+            route: 'strategy-page',
+        }, async () => fetchStrategySessionPage({
             subAccountId: req.params.subAccountId,
             query,
             executionScope,
             ownershipConfidence,
-        });
+        }));
         const sessionIds = pageData.items.map((row) => String(row.strategySessionId || '')).filter(Boolean);
-        const anomalyCounts = await loadStrategySessionAnomalyCounts(req.params.subAccountId, sessionIds);
+        const anomalyCounts = await runAdmittedTcaRead(res, {
+            route: 'strategy-page',
+        }, async () => loadStrategySessionAnomalyCounts(req.params.subAccountId, sessionIds));
         const items = pageData.items.map((row) => {
             const anomaly = anomalyCounts.get(String(row.strategySessionId || '')) || {};
             return serializeStrategySessionPageItem({
@@ -365,24 +392,28 @@ router.get('/tca/strategy-sessions-page/:subAccountId', requireOwnership(), asyn
             sortDir: query.sortDir,
         });
     } catch (err) {
-        res.status(500).json(buildApiErrorBody({
-            code: 'TCA_STRATEGY_SESSION_PAGE_READ_FAILED',
-            category: 'INFRA',
-            message: err.message || 'Failed to read strategy session page',
-            retryable: true,
-        }));
+        sendTcaInfraError(
+            res,
+            err,
+            'TCA_STRATEGY_SESSION_PAGE_READ_FAILED',
+            'Failed to read strategy session page',
+        );
     }
 });
 
 router.get('/tca/strategy-session/:subAccountId/:strategySessionId', requireOwnership(), async (req, res) => {
     try {
-        const detail = await loadStrategySessionDetailSnapshot({
+        const includeLineage = String(req.query.includeLineage ?? '1') !== '0';
+        const detail = await runAdmittedTcaRead(res, {
+            route: 'strategy-detail',
+            includeLineage,
+        }, async () => loadStrategySessionDetailSnapshot({
             subAccountId: req.params.subAccountId,
             strategySessionId: req.params.strategySessionId,
             executionScope: normalizeExecutionScope(req.query.executionScope),
             ownershipConfidence: normalizeOwnershipConfidence(req.query.ownershipConfidence),
-            includeLineage: String(req.query.includeLineage ?? '1') !== '0',
-        });
+            includeLineage,
+        }));
         if (!detail) {
             return res.status(404).json(buildApiErrorBody({
                 code: 'TCA_STRATEGY_SESSION_NOT_FOUND',
@@ -404,11 +435,17 @@ router.get('/tca/strategy-session/:subAccountId/:strategySessionId', requireOwne
 router.get('/tca/strategy-session-timeseries/:subAccountId/:strategySessionId', requireOwnership(), async (req, res) => {
     try {
         const query = buildStrategyTimeseriesQuery(req.query);
-        const payload = await loadStrategySessionTimeseriesWindow({
+        const payload = await runAdmittedTcaRead(res, {
+            route: 'strategy-timeseries',
+            series: Array.from(query.series || []),
+            includeEvents: query.includeEvents,
+            rangeMs: query.rangeMs,
+            maxPoints: query.maxPoints,
+        }, async () => loadStrategySessionTimeseriesWindow({
             subAccountId: req.params.subAccountId,
             strategySessionId: req.params.strategySessionId,
             query,
-        });
+        }));
         res.json(payload);
     } catch (err) {
         sendTcaInfraError(
@@ -422,11 +459,13 @@ router.get('/tca/strategy-session-timeseries/:subAccountId/:strategySessionId', 
 
 router.get('/tca/strategy-session-lot-ledger/:subAccountId/:strategySessionId', requireOwnership(), async (req, res) => {
     try {
-        const payload = await loadStrategySessionLedger({
+        const payload = await runAdmittedTcaRead(res, {
+            route: 'strategy-ledger',
+        }, async () => loadStrategySessionLedger({
             subAccountId: req.params.subAccountId,
             strategySessionId: req.params.strategySessionId,
             limits: req.query,
-        });
+        }));
         res.json(payload);
     } catch (err) {
         sendTcaInfraError(
@@ -454,7 +493,9 @@ router.get('/tca/embed-summary/:subAccountId', requireOwnership(), async (req, r
             sections: ['summary'],
         });
 
-        const embedPayload = await embedCache.getOrCreate(embedCacheKey, async () => {
+        const embedPayload = await runAdmittedTcaRead(res, {
+            route: 'embed-summary',
+        }, async () => embedCache.getOrCreate(embedCacheKey, async () => {
             const scoreCardRollup = await prisma.subAccountTcaRollup.findFirst({
                 where: {
                     subAccountId: req.params.subAccountId,
@@ -557,15 +598,15 @@ router.get('/tca/embed-summary/:subAccountId', requireOwnership(), async (req, r
                 } : null,
                 sparkline,
             };
-        });
+        }));
         res.json(embedPayload);
     } catch (err) {
-        res.status(500).json(buildApiErrorBody({
-            code: 'TCA_EMBED_SUMMARY_READ_FAILED',
-            category: 'INFRA',
-            message: err.message || 'Failed to read TCA embed summary',
-            retryable: true,
-        }));
+        sendTcaInfraError(
+            res,
+            err,
+            'TCA_EMBED_SUMMARY_READ_FAILED',
+            'Failed to read TCA embed summary',
+        );
     }
 });
 
@@ -632,7 +673,14 @@ router.get('/tca/strategy-modal-payload/:subAccountId/:strategySessionId', requi
             eventsPageSize: includeTimeseries ? timeseriesQuery.eventsPageSize : '',
         });
 
-        const payload = await modalCache.getOrCreate(cacheKey, async () => {
+        const payload = await runAdmittedTcaRead(res, {
+            route: 'strategy-modal',
+            sections,
+            series: Array.from(timeseriesQuery.series || []),
+            includeEvents: timeseriesQuery.includeEvents,
+            rangeMs: timeseriesQuery.rangeMs,
+            maxPoints: timeseriesQuery.maxPoints,
+        }, async () => modalCache.getOrCreate(cacheKey, async () => {
             const result = {};
 
             if (sections.includes('detail')) {
@@ -665,7 +713,7 @@ router.get('/tca/strategy-modal-payload/:subAccountId/:strategySessionId', requi
             }
 
             return result;
-        });
+        }));
 
         res.json(payload);
     } catch (err) {

@@ -639,7 +639,8 @@ function renderTimeseriesSections(state) {
     const error = state.timeseriesError || null;
     const selectedRange = state.timeseriesRange || DEFAULT_RANGE_KEY;
     const isActiveSession = Boolean(state.isActiveSession);
-    const useLivePnl = Boolean(isActiveSession && livePnlPoints.length && (!pnlPoints.length || error?.code === 'TCA_MEMORY_GUARD_ACTIVE' || !state.historyRequested));
+    const historyLimited = error?.code === 'TCA_MEMORY_GUARD_ACTIVE' || error?.code === 'TCA_READ_QUEUE_SATURATED';
+    const useLivePnl = Boolean(isActiveSession && livePnlPoints.length && (!pnlPoints.length || historyLimited || !state.historyRequested));
     const rangeLabel = selectedRange === 'full'
         ? 'Full session window'
         : (selectedRange === '1h' ? 'Last 1 hour window' : 'Last 15 minute window');
@@ -659,7 +660,7 @@ function renderTimeseriesSections(state) {
             ['unrealizedPnl', 'Unrealized', '#f97316'],
         ], { yAxisLabel: 'USD' });
     } else if (error) {
-        const retryButton = error.code === 'TCA_MEMORY_GUARD_ACTIVE' && selectedRange !== DEFAULT_RANGE_KEY
+        const retryButton = historyLimited && selectedRange !== DEFAULT_RANGE_KEY
             ? `
                 <button type="button" class="tca-meta-pill" data-action="retry-timeseries-15m" style="cursor:pointer;">
                     Retry 15m
@@ -698,7 +699,7 @@ function renderTimeseriesSections(state) {
         qualityBody = renderQualitySummary(state.detail, {
             loading: state.qualityHistoryRequested && isLoading,
             canLoadHistory: true,
-            historyLimited: error?.code === 'TCA_MEMORY_GUARD_ACTIVE',
+            historyLimited,
         });
     }
 
@@ -706,7 +707,7 @@ function renderTimeseriesSections(state) {
         ? `${rangeLabel} · refreshing`
         : (useLivePnl ? `${rangeLabel} · live sample buffer` : rangeLabel);
     const controls = renderTimeseriesRangeControls(selectedRange, isLoading);
-    const pnlCaption = useLivePnl && error?.code === 'TCA_MEMORY_GUARD_ACTIVE'
+    const pnlCaption = useLivePnl && historyLimited
         ? `${loadingCaption} · Live only`
         : loadingCaption;
 

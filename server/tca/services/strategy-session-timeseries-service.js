@@ -289,17 +289,15 @@ async function queryFallbackQualityRows(subAccountId, strategySessionId, query) 
 
 async function loadBucketedSeries(subAccountId, strategySessionId, query) {
     if (!isPostgresConfigured()) {
-        const [pnlPoints, paramPoints, qualityPoints] = await Promise.all([
-            query.series.has('pnl') || query.series.has('exposure')
-                ? queryFallbackPnlRows(strategySessionId, query)
-                : [],
-            query.series.has('params')
-                ? queryFallbackParamRows(strategySessionId, query)
-                : [],
-            query.series.has('quality')
-                ? queryFallbackQualityRows(subAccountId, strategySessionId, query)
-                : [],
-        ]);
+        const pnlPoints = query.series.has('pnl') || query.series.has('exposure')
+            ? await queryFallbackPnlRows(strategySessionId, query)
+            : [];
+        const paramPoints = query.series.has('params')
+            ? await queryFallbackParamRows(strategySessionId, query)
+            : [];
+        const qualityPoints = query.series.has('quality')
+            ? await queryFallbackQualityRows(subAccountId, strategySessionId, query)
+            : [];
         return {
             pnlPoints: bucketTimeSeries(pnlPoints, query.bucketMs),
             paramPoints: bucketTimeSeries(paramPoints, query.bucketMs),
@@ -307,17 +305,15 @@ async function loadBucketedSeries(subAccountId, strategySessionId, query) {
         };
     }
 
-    const [pnlPoints, paramPoints, qualityPoints] = await Promise.all([
-        query.series.has('pnl') || query.series.has('exposure')
-            ? queryBucketedPnlRows(strategySessionId, query)
-            : [],
-        query.series.has('params')
-            ? queryBucketedParamRows(strategySessionId, query)
-            : [],
-        query.series.has('quality')
-            ? queryBucketedQualityRows(subAccountId, strategySessionId, query)
-            : [],
-    ]);
+    const pnlPoints = query.series.has('pnl') || query.series.has('exposure')
+        ? await queryBucketedPnlRows(strategySessionId, query)
+        : [];
+    const paramPoints = query.series.has('params')
+        ? await queryBucketedParamRows(strategySessionId, query)
+        : [];
+    const qualityPoints = query.series.has('quality')
+        ? await queryBucketedQualityRows(subAccountId, strategySessionId, query)
+        : [];
 
     return {
         pnlPoints,
@@ -421,10 +417,12 @@ export async function loadStrategySessionTimeseriesWindow({
 } = {}) {
     await assertTcaWindowAllowed(query);
 
-    const [{ checkpointTotal, checkpointRows }, { pnlPoints, paramPoints, qualityPoints }] = await Promise.all([
-        loadCheckpointWindow(strategySessionId, query),
-        loadBucketedSeries(subAccountId, strategySessionId, query),
-    ]);
+    const { pnlPoints, paramPoints, qualityPoints } = await loadBucketedSeries(
+        subAccountId,
+        strategySessionId,
+        query,
+    );
+    const { checkpointTotal, checkpointRows } = await loadCheckpointWindow(strategySessionId, query);
 
     const seriesPayload = {
         pnl: pnlPoints || [],

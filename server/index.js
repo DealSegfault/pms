@@ -249,6 +249,16 @@ async function gracefulShutdown(signal) {
     process.exit(0);
 }
 
+// ── Crash recovery handlers (exit so systemd restarts) ───────
+process.on('uncaughtException', (err) => {
+    console.error('[FATAL] Uncaught exception — exiting for auto-restart:', err);
+    process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('[FATAL] Unhandled rejection — exiting for auto-restart:', reason);
+    process.exit(1);
+});
+
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.once('SIGUSR2', () => gracefulShutdown('SIGUSR2'));

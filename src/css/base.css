@@ -322,7 +322,7 @@ body {
 .pos-sym-link {
     /* position symbol links     */
     cursor: pointer;
-    transition: background 0.15s, border-left-color 0.15s, transform 0.1s;
+    transition: background 0.15s, border-left-color 0.15s;
     border-left: 2px solid rgba(99, 102, 241, 0.2);
 }
 
@@ -342,20 +342,7 @@ body {
     border-left-color: var(--accent);
 }
 
-.clickable:active,
-.compact-pos-row:active,
-.hist-dense-row:active,
-.pos-hist-row:active,
-.pos-symbol-card:active,
-.idx-card:active,
-.tca-leader-row-button:active,
-.tca-strategy-card:active,
-.tca-row-button:active,
-.hist-lifecycle-btn:active,
-.hist-filter-toggle:active,
-.pos-sym-link:active {
-    transform: scale(0.98);
-}
+
 
 /* Bulk cancel buttons per algo type */
 .btn-cancel-all-type {

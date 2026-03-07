@@ -319,14 +319,15 @@ router.get('/margin/:subAccountId', requireOwnership(), async (req, res) => {
 // GET /api/trade/history/:subAccountId — Trade history (read from DB)
 router.get('/history/:subAccountId', requireOwnership(), async (req, res) => {
     try {
-        const { page = 1, limit = 50 } = req.query;
-        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const { page = 1, limit: rawLimit = 50 } = req.query;
+        const limit = Math.min(parseInt(rawLimit) || 50, 50);
+        const skip = (parseInt(page) - 1) * limit;
 
         const [trades, total] = await Promise.all([
             prisma.tradeExecution.findMany({
                 where: { subAccountId: req.params.subAccountId },
                 orderBy: { timestamp: 'desc' },
-                take: parseInt(limit),
+                take: limit,
                 skip,
             }),
             prisma.tradeExecution.count({
@@ -334,7 +335,7 @@ router.get('/history/:subAccountId', requireOwnership(), async (req, res) => {
             }),
         ]);
 
-        res.json({ trades, total, page: parseInt(page), limit: parseInt(limit) });
+        res.json({ trades, total, page: parseInt(page), limit });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -344,7 +345,7 @@ router.get('/history/:subAccountId', requireOwnership(), async (req, res) => {
 router.get('/position-history/:subAccountId', requireOwnership(), async (req, res) => {
     try {
         const subAccountId = req.params.subAccountId;
-        const { symbol, period, status: statusFilter, limit = 200, offset = 0 } = req.query;
+        const { symbol, period, status: statusFilter, limit: rawLimit = 50, offset = 0 } = req.query;
 
         // Build time filter
         let fromDate = null;
@@ -371,11 +372,12 @@ router.get('/position-history/:subAccountId', requireOwnership(), async (req, re
             where.closedAt = { gte: fromDate };
         }
 
-        // Query closed positions
+        // Query closed positions — cap at 100 to prevent memory spikes
+        const limit = Math.min(parseInt(rawLimit) || 50, 100);
         const closedPositions = await prisma.virtualPosition.findMany({
             where,
             orderBy: { closedAt: 'desc' },
-            take: parseInt(limit),
+            take: limit,
             skip: parseInt(offset),
         });
 
@@ -596,66 +598,107 @@ router.get('/chart-data/:subAccountId', requireOwnership(), async (req, res) => 
 });
 
 // GET /api/trade/stats/:subAccountId — Account stats for My Account page
+// Uses DB aggregation to avoid loading all rows into memory (500MB VPS safe)
 router.get('/stats/:subAccountId', requireOwnership(), async (req, res) => {
     try {
         const subAccountId = req.params.subAccountId;
         const account = await prisma.subAccount.findUnique({ where: { id: subAccountId } });
         if (!account) return res.status(404).json({ error: 'Account not found' });
 
-        // All close trades (actions that realize PnL)
-        const closeTrades = await prisma.tradeExecution.findMany({
-            where: { subAccountId, action: { notIn: ['OPEN', 'ADD'] } },
-            orderBy: { timestamp: 'asc' },
-        });
-
-        const allTrades = await prisma.tradeExecution.findMany({
-            where: { subAccountId },
-            orderBy: { timestamp: 'asc' },
-        });
-
         const now = new Date();
         const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
         const week = new Date(now - 7 * 86400000);
         const month = new Date(now - 30 * 86400000);
 
-        function pnlForPeriod(trades, from) {
-            const filtered = from ? trades.filter(t => new Date(t.timestamp) >= from) : trades;
-            const rpnl = filtered.reduce((s, t) => s + (t.realizedPnl || 0), 0);
-            const wins = filtered.filter(t => (t.realizedPnl || 0) > 0).length;
-            const losses = filtered.filter(t => (t.realizedPnl || 0) < 0).length;
-            const totalFees = filtered.reduce((s, t) => s + (t.fee || 0), 0);
-            return { rpnl, count: filtered.length, wins, losses, totalFees };
+        const closeWhere = { subAccountId, action: { notIn: ['OPEN', 'ADD'] } };
+
+        // Helper: aggregate stats for a period using DB queries (not in-memory)
+        async function pnlForPeriod(from) {
+            const where = { ...closeWhere };
+            if (from) where.timestamp = { gte: from };
+            const [agg, winCount, lossCount] = await Promise.all([
+                prisma.tradeExecution.aggregate({
+                    where,
+                    _sum: { realizedPnl: true, fee: true },
+                    _count: true,
+                }),
+                prisma.tradeExecution.count({
+                    where: { ...where, realizedPnl: { gt: 0 } },
+                }),
+                prisma.tradeExecution.count({
+                    where: { ...where, realizedPnl: { lt: 0 } },
+                }),
+            ]);
+            return {
+                rpnl: agg._sum.realizedPnl || 0,
+                count: agg._count || 0,
+                wins: winCount,
+                losses: lossCount,
+                totalFees: agg._sum.fee || 0,
+            };
         }
 
+        // Run period aggregations sequentially to reduce peak memory
+        const periodAll = await pnlForPeriod(null);
+        const periodToday = await pnlForPeriod(todayStart);
+        const periodWeek = await pnlForPeriod(week);
+        const periodMonth = await pnlForPeriod(month);
+
         const periods = {
-            today: pnlForPeriod(closeTrades, todayStart),
-            week: pnlForPeriod(closeTrades, week),
-            month: pnlForPeriod(closeTrades, month),
-            all: pnlForPeriod(closeTrades, null),
+            today: periodToday,
+            week: periodWeek,
+            month: periodMonth,
+            all: periodAll,
         };
 
-        // Activity stats
-        const totalTrades = allTrades.length;
-        const totalFees = allTrades.reduce((s, t) => s + (t.fee || 0), 0);
-        const avgPnl = periods.all.count > 0 ? periods.all.rpnl / periods.all.count : 0;
-        const pnls = closeTrades.map(t => t.realizedPnl || 0);
-        const bestTrade = pnls.length > 0 ? Math.max(...pnls) : 0;
-        const worstTrade = pnls.length > 0 ? Math.min(...pnls) : 0;
-        const grossProfit = pnls.filter(p => p > 0).reduce((s, p) => s + p, 0);
-        const grossLoss = Math.abs(pnls.filter(p => p < 0).reduce((s, p) => s + p, 0));
+        // Activity stats via aggregation (no unbounded findMany)
+        const [totalTradesCount, allFeesAgg, bestWorst] = await Promise.all([
+            prisma.tradeExecution.count({ where: { subAccountId } }),
+            prisma.tradeExecution.aggregate({
+                where: { subAccountId },
+                _sum: { fee: true },
+            }),
+            prisma.tradeExecution.aggregate({
+                where: closeWhere,
+                _max: { realizedPnl: true },
+                _min: { realizedPnl: true },
+                _sum: { realizedPnl: true },
+            }),
+        ]);
+
+        const totalFees = allFeesAgg._sum.fee || 0;
+        const avgPnl = periodAll.count > 0 ? periodAll.rpnl / periodAll.count : 0;
+        const bestTrade = bestWorst._max.realizedPnl || 0;
+        const worstTrade = bestWorst._min.realizedPnl || 0;
+
+        // Gross profit/loss via conditional aggregation
+        const [grossProfitAgg, grossLossAgg] = await Promise.all([
+            prisma.tradeExecution.aggregate({
+                where: { ...closeWhere, realizedPnl: { gt: 0 } },
+                _sum: { realizedPnl: true },
+            }),
+            prisma.tradeExecution.aggregate({
+                where: { ...closeWhere, realizedPnl: { lt: 0 } },
+                _sum: { realizedPnl: true },
+            }),
+        ]);
+        const grossProfit = grossProfitAgg._sum.realizedPnl || 0;
+        const grossLoss = Math.abs(grossLossAgg._sum.realizedPnl || 0);
         const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? Infinity : 0;
 
-        // Equity curve from balance logs
+        // Equity curve — cap to 500 most recent entries to avoid memory spike
         const balanceLogs = await prisma.balanceLog.findMany({
             where: { subAccountId },
-            orderBy: { timestamp: 'asc' },
+            orderBy: { timestamp: 'desc' },
+            take: 500,
             select: { timestamp: true, balanceAfter: true },
         });
+        balanceLogs.reverse(); // restore chronological order
 
         res.json({
             account: { id: account.id, name: account.name, balance: account.currentBalance },
             periods,
-            activity: { totalTrades, totalFees, avgPnl, bestTrade, worstTrade, profitFactor },
+            activity: { totalTrades: totalTradesCount, totalFees, avgPnl, bestTrade, worstTrade, profitFactor },
             equityCurve: balanceLogs.map(l => ({ time: l.timestamp, value: l.balanceAfter })),
         });
     } catch (err) {
