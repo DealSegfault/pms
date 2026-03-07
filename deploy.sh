@@ -41,17 +41,35 @@ echo -e "${BOLD}${CYAN}║       MinimalTE — Deploy to VPS              ║${N
 echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${NC}"
 echo ""
 
+normalize_choice() {
+    case "${1:-}" in
+        1|full) echo "1" ;;
+        2|update|frontend|frontend-only) echo "2" ;;
+        3|backend) echo "3" ;;
+        4|engine) echo "4" ;;
+        5|logs) echo "5" ;;
+        6|setup|init) echo "6" ;;
+        *) echo "${1:-}" ;;
+    esac
+}
+
 # ─── Menu ───
 echo -e "${BOLD}What would you like to deploy?${NC}"
 echo ""
 echo -e "  ${CYAN}1)${NC} Full deploy        — Build frontend + upload dist + git pull + restart all"
-echo -e "  ${CYAN}2)${NC} Frontend only      — Build frontend + upload dist + reload nginx"
+echo -e "  ${CYAN}2)${NC} Update frontend    — Build frontend + upload dist + reload nginx"
 echo -e "  ${CYAN}3)${NC} Backend only       — git pull + restart backend + restart engine"
 echo -e "  ${CYAN}4)${NC} Engine only        — Restart Python engine (pm2)"
 echo -e "  ${CYAN}5)${NC} View logs          — SSH + pm2 logs"
 echo -e "  ${CYAN}6)${NC} First-time setup   — Run vps-setup.sh on VPS"
 echo ""
-read -rp "Choose [1-6]: " choice
+if [[ $# -gt 0 ]]; then
+    choice="$(normalize_choice "$1")"
+    echo -e "${CYAN}Selected:${NC} $choice (from CLI argument: $1)"
+else
+    read -rp "Choose [1-6 or update]: " raw_choice
+    choice="$(normalize_choice "$raw_choice")"
+fi
 echo ""
 
 # ─── Establish SSH connection (password entered ONCE here) ───
