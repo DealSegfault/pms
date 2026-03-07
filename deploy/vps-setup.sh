@@ -24,7 +24,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ─── 1. Install prerequisites ───
 step "Installing prerequisites..."
-apt-get update -qq
+apt-get update -qq 2>/dev/null || true
 apt-get install -y -qq nginx screen python3 python3-pip python3-venv 2>/dev/null || true
 ok "Prerequisites installed"
 
