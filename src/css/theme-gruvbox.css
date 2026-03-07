@@ -43,15 +43,15 @@
     --radius-sm: 5px;
     --radius-lg: 12px;
 
-    --shadow: 0 2px 16px rgba(0, 0, 0, 0.5);
-    --shadow-lg: 0 6px 32px rgba(0, 0, 0, 0.65);
+    --shadow: 0 2px 16px rgba(30, 22, 10, 0.6);
+    --shadow-lg: 0 6px 32px rgba(30, 22, 10, 0.75);
 
     --gradient-accent: linear-gradient(135deg, #fe8019, #fabd2f);
     --gradient-card: linear-gradient(180deg, rgba(50, 48, 47, 0.9), rgba(40, 40, 40, 0.95));
     --gradient-nav: linear-gradient(180deg, rgba(29, 32, 33, 0.97), rgba(29, 32, 33, 0.99));
     --theme-color: #1d2021;
 
-    --font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
     --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
 }
 

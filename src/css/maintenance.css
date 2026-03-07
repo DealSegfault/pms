@@ -12,7 +12,7 @@
     align-items: center;
     justify-content: center;
     overflow: hidden;
-    font-family: var(--font, 'Inter', sans-serif);
+    font-family: var(--font, 'Geist', sans-serif);
     transition: opacity 0.6s ease;
 }
 
