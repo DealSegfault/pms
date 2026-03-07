@@ -179,7 +179,6 @@
 
 [data-theme="girly"] .btn-primary:hover {
     box-shadow: 0 4px 24px rgba(236, 72, 153, 0.45);
-    transform: translateY(-1px);
 }
 
 [data-theme="girly"] .btn-outline {
@@ -465,13 +464,11 @@
 [data-theme="girly"] .btn-submit-long:hover {
     box-shadow: 0 0 24px rgba(52, 211, 153, 0.35),
         0 4px 16px rgba(52, 211, 153, 0.2);
-    transform: translateY(-1px);
 }
 
 [data-theme="girly"] .btn-submit-short:hover {
     box-shadow: 0 0 24px rgba(251, 113, 133, 0.35),
         0 4px 16px rgba(251, 113, 133, 0.2);
-    transform: translateY(-1px);
 }
 
 /* ── Range input styling ──────────────────────────────────────── */
@@ -721,33 +718,7 @@
     }
 }
 
-/* ── 💖 Heartbeat Hover on Cards ──────────────────────────────── */
-[data-theme="girly"] .card:hover,
-[data-theme="girly"] .glass-card:hover {
-    animation: girlyHeartbeatHover 0.8s ease-in-out;
-}
-
-@keyframes girlyHeartbeatHover {
-    0% {
-        transform: scale(1);
-    }
-
-    15% {
-        transform: scale(1.012);
-    }
-
-    30% {
-        transform: scale(1);
-    }
-
-    45% {
-        transform: scale(1.008);
-    }
-
-    60% {
-        transform: scale(1);
-    }
-}
+/* ── 💖 Card Hover (no jump) ──────────────────────────────────── */
 
 /* ── 🎵 Nav Item Bounce on Click ──────────────────────────────── */
 [data-theme="girly"] .nav-item:active {

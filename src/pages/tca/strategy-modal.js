@@ -475,7 +475,8 @@ function renderLotLedger(ledger = {}, { omitWrapper = false } = {}) {
                         <span>${lot.openFee ? `fee ${formatUsd(lot.openFee, 4)}` : ''}</span>
                     </div>
                 </div>
-            `;}).join('')}
+            `;
+    }).join('')}
             </div>
         ` : ''}
         ${realizations.length ? `
@@ -498,7 +499,8 @@ function renderLotLedger(ledger = {}, { omitWrapper = false } = {}) {
                             <span>${totalFees > 0 ? `−${formatUsd(totalFees, 4)} fees` : ''}</span>
                         </div>
                     </div>
-                `;}).join('')}
+                `;
+    }).join('')}
             </div>
         ` : ''}
         ${anomalies.length ? `
@@ -533,7 +535,7 @@ function renderTimeseriesRangeControls(selectedRange, loading = false) {
                     data-action="set-timeseries-range"
                     data-range="${key}"
                     ${loading ? 'aria-busy="true"' : ''}
-                    style="cursor:pointer;background:${selectedRange === key ? 'rgba(14,165,233,0.18)' : 'rgba(15,23,42,0.56)'};"
+                    style="cursor:pointer;background:${selectedRange === key ? 'rgba(14,165,233,0.22)' : 'rgba(148,163,184,0.12)'};border:1px solid ${selectedRange === key ? 'rgba(14,165,233,0.35)' : 'rgba(148,163,184,0.18)'};color:${selectedRange === key ? '#7dd3fc' : 'var(--text-secondary, #94a3b8)'};"
                 >${escapeHtml(label)}</button>
             `).join('')}
         </div>
