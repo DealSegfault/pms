@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently --kill-others-on-fail \"nodemon --signal SIGTERM --delay 1 --watch server --watch trading_engine_python server/index.js\" \"sleep 4 && vite --host\"",
+    "build": "vite build",
     "server": "node --max-old-space-size=384 server/index.js",
     "server:prod": "NODE_ENV=production node --max-old-space-size=384 server/index.js",
     "client": "vite",
