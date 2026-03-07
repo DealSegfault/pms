@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────
 # MinimalTE — One-time VPS Setup
-# Run ON the VPS:  sudo bash deploy/vps-setup.sh
+# Run ON the VPS:  bash deploy/vps-setup.sh
 #
 # Sets up:
 #   1. nginx with production config (static dist/ + API proxy)
-#   2. systemd backend service (pms-backend)
-#   3. Python engine in a named screen session (ENGINE)
-#   4. Creates dist directory
+#   2. pm2 for backend + python engine
+#   3. Python venv + pip deps
 # ─────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -17,15 +16,13 @@ ok()    { echo -e "  ${GREEN}✔ $1${NC}"; }
 warn()  { echo -e "  ${YELLOW}⚠ $1${NC}"; }
 fail()  { echo -e "  ${RED}✖ $1${NC}"; exit 1; }
 
-[[ $EUID -ne 0 ]] && fail "Run as root: sudo bash deploy/vps-setup.sh"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ─── 1. Install prerequisites ───
 step "Installing prerequisites..."
 apt-get update -qq 2>/dev/null || true
-apt-get install -y -qq nginx screen python3 python3-pip python3-venv 2>/dev/null || true
+apt-get install -y -qq nginx python3 python3-pip python3-venv 2>/dev/null || true
 ok "Prerequisites installed"
 
 # ─── 2. Create dist directory ───
@@ -35,23 +32,13 @@ ok "dist/ directory ready"
 
 # ─── 3. Install nginx config ───
 step "Installing nginx config..."
-bash "$SCRIPT_DIR/nginx/install.sh"
+cp "$SCRIPT_DIR/nginx/nginx.conf" /etc/nginx/nginx.conf
+nginx -t 2>&1
+systemctl reload nginx 2>/dev/null || systemctl start nginx
+systemctl enable nginx 2>/dev/null || true
 ok "nginx configured"
 
-# ─── 4. Install pm2 + start backend ───
-step "Installing pm2 and starting backend..."
-npm install -g pm2 2>/dev/null || true
-cd "$PROJECT_DIR"
-npm install --omit=dev --ignore-scripts 2>&1 | tail -3
-npx prisma generate 2>&1 | tail -2
-pm2 stop pms-backend 2>/dev/null || true
-pm2 delete pms-backend 2>/dev/null || true
-pm2 start ecosystem.config.cjs
-pm2 save
-pm2 startup 2>/dev/null || true
-ok "pm2 backend running"
-
-# ─── 5. Python virtual environment ───
+# ─── 4. Python virtual environment ───
 step "Setting up Python virtual environment..."
 if [ ! -d "$PROJECT_DIR/trading_engine_python/.venv" ]; then
     python3 -m venv "$PROJECT_DIR/trading_engine_python/.venv"
@@ -63,20 +50,25 @@ source "$PROJECT_DIR/trading_engine_python/.venv/bin/activate"
 pip install -q -r "$PROJECT_DIR/trading_engine_python/requirements.txt"
 ok "Python dependencies installed"
 
-# ─── 6. Kill old PMS dev screen (keep PG!) ───
-step "Cleaning up old PMS dev screen..."
+# ─── 5. Kill old dev screens (keep PG!) ───
+step "Cleaning up old dev screens..."
 screen -S PMS -X quit 2>/dev/null && ok "Killed old PMS screen" || ok "No old PMS screen found"
+screen -S ENGINE -X quit 2>/dev/null && ok "Killed old ENGINE screen" || ok "No old ENGINE screen found"
 
-# ─── 7. Start ENGINE screen ───
-step "Starting Python engine in screen session 'ENGINE'..."
-screen -dmS ENGINE bash -c "
-    cd $PROJECT_DIR
-    source trading_engine_python/.venv/bin/activate
-    source .env 2>/dev/null || true
-    export \$(grep -v '^#' .env | xargs) 2>/dev/null || true
-    python -m trading_engine_python.main
-"
-ok "ENGINE screen started"
+# ─── 6. Install pm2 + start all services ───
+step "Setting up pm2 (backend + engine)..."
+npm install -g pm2 2>/dev/null || true
+cd "$PROJECT_DIR"
+npm install --omit=dev --ignore-scripts 2>&1 | tail -3
+npx prisma generate 2>&1 | tail -2
+pm2 stop all 2>/dev/null || true
+pm2 delete all 2>/dev/null || true
+pm2 start ecosystem.config.cjs
+pm2 save
+pm2 startup 2>/dev/null || true
+sleep 3
+pm2 list
+ok "pm2 services running (backend + engine)"
 
 # ─── Done ───
 echo ""
@@ -84,13 +76,13 @@ echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━
 echo -e "${GREEN}  ✔ VPS Setup Complete!${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-echo -e "  ${CYAN}Services:${NC}"
-echo -e "    Backend:  pm2 status / pm2 logs pms-backend"
-echo -e "    Engine:   screen -rd ENGINE"
-echo -e "    Nginx:    sudo systemctl status nginx"
+echo -e "  ${CYAN}Services (all pm2):${NC}"
+echo -e "    pm2 status              — see all services"
+echo -e "    pm2 logs pms-backend    — backend logs"
+echo -e "    pm2 logs pms-engine     — engine logs"
+echo -e "    pm2 logs                — all logs"
 echo ""
-echo -e "  ${CYAN}Useful:${NC}"
-echo -e "    Attach engine:  screen -rd ENGINE"
-echo -e "    Detach:         Ctrl+A, D"
-echo -e "    Restart engine: screen -S ENGINE -X quit; (re-run setup or deploy)"
+echo -e "  ${CYAN}Restart:${NC}"
+echo -e "    pm2 restart all         — restart everything"
+echo -e "    pm2 restart pms-engine  — restart engine only"
 echo ""

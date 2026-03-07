@@ -3,18 +3,8 @@
 # MinimalTE — Interactive Deploy Script
 # Run from your LOCAL machine (Mac):  bash deploy.sh
 #
-# What it does:
-#   1. Builds the frontend locally (vite build)
-#   2. Tars the dist/ folder
-#   3. SCPs it to VPS (will prompt for password)
-#   4. SSHs to VPS to:
-#      a. Unpack dist → /root/pms/dist/
-#      b. git pull latest backend/engine code
-#      c. Restart Python ENGINE screen
-#      d. Restart backend service
-#      e. Reload nginx
-#
-# SSH will prompt for your password — this is interactive!
+# Uses SSH ControlMaster — password is entered ONCE, then
+# all subsequent SSH/SCP commands reuse that connection.
 # ─────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -23,13 +13,23 @@ VPS_USER="root"
 VPS_HOST="89.187.28.51"
 VPS_KEY="$HOME/.ssh/server_rsa"
 VPS_PROJECT="/root/pms"
-SSH_CMD="ssh ${VPS_USER}@${VPS_HOST} -i ${VPS_KEY}"
+
+# ── SSH Multiplexing (one password for the whole deploy) ──
+CONTROL_PATH="/tmp/pms-deploy-ssh-$$"
+SSH_OPTS="-i ${VPS_KEY} -o ControlPath=${CONTROL_PATH} -o ControlMaster=auto -o ControlPersist=300"
+SSH_CMD="ssh ${SSH_OPTS} ${VPS_USER}@${VPS_HOST}"
+SCP_CMD="scp ${SSH_OPTS}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 step()  { echo -e "\n${CYAN}━━━ $1 ━━━${NC}"; }
 ok()    { echo -e "  ${GREEN}✔ $1${NC}"; }
 warn()  { echo -e "  ${YELLOW}⚠ $1${NC}"; }
 fail()  { echo -e "  ${RED}✖ $1${NC}"; exit 1; }
+
+cleanup_ssh() {
+    ssh -O exit ${SSH_OPTS} ${VPS_USER}@${VPS_HOST} 2>/dev/null || true
+}
+trap cleanup_ssh EXIT
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -46,12 +46,19 @@ echo ""
 echo -e "  ${CYAN}1)${NC} Full deploy        — Build frontend + upload dist + git pull + restart all"
 echo -e "  ${CYAN}2)${NC} Frontend only      — Build frontend + upload dist + reload nginx"
 echo -e "  ${CYAN}3)${NC} Backend only       — git pull + restart backend + restart engine"
-echo -e "  ${CYAN}4)${NC} Engine only        — Restart Python ENGINE screen"
-echo -e "  ${CYAN}5)${NC} Attach engine      — SSH + screen -rd ENGINE"
+echo -e "  ${CYAN}4)${NC} Engine only        — Restart Python engine (pm2)"
+echo -e "  ${CYAN}5)${NC} View logs          — SSH + pm2 logs"
 echo -e "  ${CYAN}6)${NC} First-time setup   — Run vps-setup.sh on VPS"
 echo ""
 read -rp "Choose [1-6]: " choice
 echo ""
+
+# ─── Establish SSH connection (password entered ONCE here) ───
+if [[ "$choice" != "5" ]]; then
+    step "Connecting to VPS... (enter password once)"
+    $SSH_CMD "echo '  Connected to VPS successfully'"
+    ok "SSH session established (reused for all commands)"
+fi
 
 # ─── Step 1: Build frontend ───
 build_frontend() {
@@ -68,15 +75,15 @@ upload_dist() {
     size=$(du -sh /tmp/pms-dist.tar.gz | cut -f1)
     ok "Packaged dist ($size)"
 
-    step "Uploading to VPS... (password required)"
-    scp -i "${VPS_KEY}" /tmp/pms-dist.tar.gz "${VPS_USER}@${VPS_HOST}:/tmp/pms-dist.tar.gz"
+    step "Uploading to VPS..."
+    $SCP_CMD /tmp/pms-dist.tar.gz "${VPS_USER}@${VPS_HOST}:/tmp/pms-dist.tar.gz"
     ok "Upload complete"
     rm -f /tmp/pms-dist.tar.gz
 
     step "Unpacking dist on VPS..."
     $SSH_CMD "
-        rm -rf ${VPS_PROJECT}/dist/*
         mkdir -p ${VPS_PROJECT}/dist
+        rm -rf ${VPS_PROJECT}/dist/* 2>/dev/null || true
         tar xzf /tmp/pms-dist.tar.gz -C ${VPS_PROJECT}/dist/
         rm -f /tmp/pms-dist.tar.gz
         echo '  ✔ dist/ replaced on VPS'
@@ -95,50 +102,45 @@ git_pull() {
     ok "Code updated"
 }
 
-# ─── Step 4: Restart backend (pm2) ───
+# ─── Step 4: Restart all services (pm2) ───
 restart_backend() {
-    step "Restarting backend via pm2 on VPS..."
+    step "Restarting all services via pm2 on VPS..."
     $SSH_CMD "
         cd ${VPS_PROJECT}
         npm install --omit=dev --ignore-scripts 2>&1 | tail -3
         npx prisma generate 2>&1 | tail -2
+        # Kill old PMS/ENGINE screens if any
+        screen -S PMS -X quit 2>/dev/null || true
+        screen -S ENGINE -X quit 2>/dev/null || true
+        # Restart or start all pm2 services (backend + engine)
         pm2 restart ecosystem.config.cjs --update-env 2>/dev/null || pm2 start ecosystem.config.cjs
         sleep 3
         pm2 list
     "
-    ok "Backend restarted (pm2)"
+    ok "All services restarted (pm2)"
 }
 
-# ─── Step 5: Restart ENGINE screen ───
+# ─── Step 5: Restart engine only (pm2) ───
 restart_engine() {
-    step "Restarting Python engine on VPS..."
+    step "Restarting Python engine via pm2 on VPS..."
     $SSH_CMD "
-        # Kill existing ENGINE screen
-        screen -S ENGINE -X quit 2>/dev/null || true
-        sleep 1
-
-        # Start fresh ENGINE screen
         cd ${VPS_PROJECT}
-        screen -dmS ENGINE bash -c '
-            cd ${VPS_PROJECT}
-            source trading_engine_python/.venv/bin/activate 2>/dev/null || true
-            set -a; source .env 2>/dev/null; set +a
-            python -m trading_engine_python.main 2>&1 | tee /tmp/engine.log
-        '
-        sleep 2
-
-        if screen -ls | grep -q ENGINE; then
-            echo '  ✔ ENGINE screen running'
-        else
-            echo '  ✖ ENGINE screen failed to start!'
-            echo '  Check: screen -ls and /tmp/engine.log'
-        fi
+        pm2 restart pms-engine 2>/dev/null || pm2 start ecosystem.config.cjs --only pms-engine
+        sleep 3
+        pm2 list
+        echo ''
+        echo '  --- engine log (last 10 lines) ---'
+        pm2 logs pms-engine --nostream --lines 10 2>/dev/null || true
     "
-    ok "Python engine restarted"
+    ok "Python engine restarted (pm2)"
 }
 
-# ─── Step 6: Reload nginx ───
+# ─── Step 6: Deploy nginx config + reload ───
 reload_nginx() {
+    step "Deploying nginx config to VPS..."
+    $SCP_CMD deploy/nginx/nginx.conf "${VPS_USER}@${VPS_HOST}:/etc/nginx/nginx.conf"
+    ok "nginx.conf copied"
+
     step "Reloading nginx on VPS..."
     $SSH_CMD "
         nginx -t 2>&1 && systemctl reload nginx && echo '  ✔ nginx reloaded' || echo '  ✖ nginx config error!'
@@ -161,89 +163,89 @@ install_pip_deps() {
 # ─── Verify all services ───
 verify_services() {
     step "Verifying all services on VPS..."
-    $SSH_CMD "
+    $SSH_CMD bash <<'VERIFY_EOF'
         PASS=0
         FAIL=0
         RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
         # 1. nginx
         if systemctl is-active --quiet nginx; then
-            echo -e \"  \${GREEN}✔ nginx:       running\${NC}\"
+            echo -e "  ${GREEN}✔ nginx:       running${NC}"
             ((PASS++))
         else
-            echo -e \"  \${RED}✖ nginx:       NOT running\${NC}\"
+            echo -e "  ${RED}✖ nginx:       NOT running${NC}"
             ((FAIL++))
         fi
 
         # 2. pms-backend (pm2)
-        if pm2 pid pms-backend > /dev/null 2>&1 && [ \"\$(pm2 pid pms-backend)\" != \"\" ]; then
-            echo -e \"  \${GREEN}✔ pms-backend: running (pm2)\${NC}\"
+        if pm2 pid pms-backend > /dev/null 2>&1 && [ "$(pm2 pid pms-backend)" != "" ]; then
+            echo -e "  ${GREEN}✔ pms-backend: running (pm2)${NC}"
             ((PASS++))
         else
-            echo -e \"  \${RED}✖ pms-backend: NOT running (pm2)\${NC}\"
+            echo -e "  ${RED}✖ pms-backend: NOT running (pm2)${NC}"
             ((FAIL++))
         fi
 
-        # 3. ENGINE screen
-        if screen -ls 2>/dev/null | grep -q ENGINE; then
-            echo -e \"  \${GREEN}✔ ENGINE:      screen running\${NC}\"
+        # 3. pms-engine (pm2)
+        if pm2 pid pms-engine > /dev/null 2>&1 && [ "$(pm2 pid pms-engine)" != "" ]; then
+            echo -e "  ${GREEN}✔ pms-engine:  running (pm2)${NC}"
             ((PASS++))
         else
-            echo -e \"  \${RED}✖ ENGINE:      screen NOT found\${NC}\"
+            echo -e "  ${RED}✖ pms-engine:  NOT running (pm2)${NC}"
             ((FAIL++))
         fi
 
         # 4. Port checks
         if ss -tlnp | grep -q ':443 '; then
-            echo -e \"  \${GREEN}✔ Port 443:    listening\${NC}\"
+            echo -e "  ${GREEN}✔ Port 443:    listening${NC}"
             ((PASS++))
         else
-            echo -e \"  \${RED}✖ Port 443:    NOT listening\${NC}\"
+            echo -e "  ${RED}✖ Port 443:    NOT listening${NC}"
             ((FAIL++))
         fi
 
         if ss -tlnp | grep -q ':3900 '; then
-            echo -e \"  \${GREEN}✔ Port 3900:   listening (backend)\${NC}\"
+            echo -e "  ${GREEN}✔ Port 3900:   listening (backend)${NC}"
             ((PASS++))
         else
-            echo -e \"  \${YELLOW}⚠ Port 3900:   not yet listening (backend may still be starting)\${NC}\"
+            echo -e "  ${YELLOW}⚠ Port 3900:   not yet listening (backend may still be starting)${NC}"
         fi
 
         # 5. HTTPS health check
-        HTTP_CODE=\$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1/ 2>/dev/null || echo 'fail')
-        if [ \"\$HTTP_CODE\" = \"200\" ]; then
-            echo -e \"  \${GREEN}✔ HTTPS:       200 OK\${NC}\"
+        HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1/ 2>/dev/null || echo 'fail')
+        if [ "$HTTP_CODE" = "200" ]; then
+            echo -e "  ${GREEN}✔ HTTPS:       200 OK${NC}"
             ((PASS++))
         else
-            echo -e \"  \${YELLOW}⚠ HTTPS:       returned \$HTTP_CODE\${NC}\"
+            echo -e "  ${YELLOW}⚠ HTTPS:       returned $HTTP_CODE${NC}"
         fi
 
         # 6. API health check
-        API_CODE=\$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1/api/health 2>/dev/null || echo 'fail')
-        if [ \"\$API_CODE\" = \"200\" ]; then
-            echo -e \"  \${GREEN}✔ API /health: 200 OK\${NC}\"
+        API_CODE=$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1/api/health 2>/dev/null || echo 'fail')
+        if [ "$API_CODE" = "200" ]; then
+            echo -e "  ${GREEN}✔ API /health: 200 OK${NC}"
             ((PASS++))
         else
-            echo -e \"  \${YELLOW}⚠ API /health: returned \$API_CODE (backend may still be starting)\${NC}\"
+            echo -e "  ${YELLOW}⚠ API /health: returned $API_CODE (backend may still be starting)${NC}"
         fi
 
         # 7. dist/ check
-        if [ -f ${VPS_PROJECT}/dist/index.html ]; then
-            FCOUNT=\$(find ${VPS_PROJECT}/dist -type f | wc -l)
-            echo -e \"  \${GREEN}✔ dist/:       \${FCOUNT} files deployed\${NC}\"
+        if [ -f /root/pms/dist/index.html ]; then
+            FCOUNT=$(find /root/pms/dist -type f | wc -l)
+            echo -e "  ${GREEN}✔ dist/:       ${FCOUNT} files deployed${NC}"
             ((PASS++))
         else
-            echo -e \"  \${RED}✖ dist/:       index.html MISSING\${NC}\"
+            echo -e "  ${RED}✖ dist/:       index.html MISSING${NC}"
             ((FAIL++))
         fi
 
         echo ''
-        if [ \$FAIL -eq 0 ]; then
-            echo -e \"  \${GREEN}━━━ All \$PASS checks passed ━━━\${NC}\"
+        if [ $FAIL -eq 0 ]; then
+            echo -e "  ${GREEN}━━━ All $PASS checks passed ━━━${NC}"
         else
-            echo -e \"  \${RED}━━━ \$FAIL check(s) FAILED, \$PASS passed ━━━\${NC}\"
+            echo -e "  ${RED}━━━ $FAIL check(s) FAILED, $PASS passed ━━━${NC}"
         fi
-    "
+VERIFY_EOF
 }
 
 # ─── Execute chosen option ───
@@ -251,12 +253,8 @@ case "$choice" in
     1)
         build_frontend
         upload_dist
-        echo ""
-        echo -e "${YELLOW}The next SSH commands will each prompt for your password.${NC}"
-        echo ""
         git_pull
         install_pip_deps
-        restart_engine
         restart_backend
         reload_nginx
         verify_services
@@ -279,8 +277,8 @@ case "$choice" in
         verify_services
         ;;
     5)
-        echo -e "${CYAN}Attaching to ENGINE screen... (Ctrl+A, D to detach)${NC}"
-        $SSH_CMD -t "screen -rd ENGINE"
+        echo -e "${CYAN}Viewing pm2 logs... (Ctrl+C to stop)${NC}"
+        ssh -i "${VPS_KEY}" -t "${VPS_USER}@${VPS_HOST}" "pm2 logs"
         exit 0
         ;;
     6)
@@ -301,7 +299,7 @@ echo -e "${GREEN}  ✔ Deploy complete!${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo -e "  ${CYAN}Frontend:${NC}  https://89.187.28.51"
-echo -e "  ${CYAN}Engine:${NC}    ${BOLD}screen -rd ENGINE${NC} (via SSH)"
-echo -e "  ${CYAN}Backend:${NC}   pm2 status / pm2 logs pms-backend"
-echo -e "  ${CYAN}Logs:${NC}      pm2 logs pms-backend --lines 50"
+echo -e "  ${CYAN}Backend:${NC}   pm2 logs pms-backend"
+echo -e "  ${CYAN}Engine:${NC}    pm2 logs pms-engine"
+echo -e "  ${CYAN}All logs:${NC}  bash deploy.sh → option 5"
 echo ""
