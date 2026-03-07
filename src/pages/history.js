@@ -1,5 +1,6 @@
 import { state, api, formatUsd, formatPrice, formatPnlClass } from '../core/index.js';
 import { cuteSpinner, cuteKey, cuteBunnyHistory, cuteSadFace } from '../lib/cute-empty.js';
+import { openLifecycleDrawer } from './tca/lifecycle-drawer.js';
 
 let historyOffset = 0;
 let historyTotal = 0;
@@ -155,17 +156,15 @@ export function renderHistoryPage(container) {
   });
   document.getElementById('hist-export')?.addEventListener('click', exportCSV);
 
-  // History → TCA lifecycle navigation
+  // History → TCA lifecycle: open detail drawer directly on this page
   container.addEventListener('click', (e) => {
     const lcBtn = e.target.closest('[data-hist-lifecycle]');
     if (!lcBtn) return;
     const clientOrderId = lcBtn.dataset.histLifecycle;
-    if (!clientOrderId) return;
+    if (!clientOrderId || !state.currentAccount) return;
     e.preventDefault();
-    location.hash = '#/tca';
-    setTimeout(() => {
-      window.dispatchEvent(new CustomEvent('open_lifecycle_by_order', { detail: { clientOrderId } }));
-    }, 350);
+    e.stopPropagation();
+    openLifecycleDrawer({ subAccountId: state.currentAccount, clientOrderId });
   });
 
   // Collapsible filter toggle
@@ -317,7 +316,7 @@ function renderTradesList(trades, reset) {
       const pnlHtml = trade.realizedPnl != null
         ? `<span class="${formatPnlClass(trade.realizedPnl)}" style="font-family:var(--font-mono); font-weight:600;">${formatUsd(trade.realizedPnl, 4)}</span>`
         : '<span style="color:var(--text-muted);">\u2014</span>';
-      return `<div class="hist-dense-row">
+      return `<div class="hist-dense-row" ${trade.clientOrderId ? `data-hist-lifecycle="${trade.clientOrderId}" style="cursor:pointer;"` : ''}>
         <span style="font-weight:600; display:flex; align-items:center; gap:4px;">
           ${trade.symbol.split('/')[0]}
           <span class="badge badge-${trade.side === 'BUY' ? 'long' : 'short'}" style="font-size:8px;">${trade.side}</span>
@@ -325,10 +324,7 @@ function renderTradesList(trades, reset) {
         </span>
         <span style="text-align:right; font-family:var(--font-mono); font-size:11px;">$${formatPrice(trade.price)}</span>
         <span style="text-align:right;">${pnlHtml}</span>
-        <span style="text-align:right; display:flex; align-items:center; justify-content:flex-end; gap:4px;">
-          <span style="font-size:10px; color:var(--text-muted);">${time}</span>
-          ${trade.clientOrderId ? `<button class="hist-lifecycle-btn" data-hist-lifecycle="${trade.clientOrderId}" title="View in TCA">🔍</button>` : ''}
-        </span>
+        <span style="text-align:right; font-size:10px; color:var(--text-muted);">${time}</span>
       </div>`;
     }).join('');
 
@@ -355,7 +351,7 @@ function renderTradesList(trades, reset) {
     const notionalUsd = (trade.notional || trade.price * trade.quantity).toFixed(2);
 
     return `
-      <div class="card" style="padding: 12px; margin-bottom: 6px;">
+      <div class="card" style="padding: 12px; margin-bottom: 6px;${trade.clientOrderId ? ' cursor:pointer;' : ''}" ${trade.clientOrderId ? `data-hist-lifecycle="${trade.clientOrderId}"` : ''}>
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
           <div style="display: flex; align-items: center; gap: 6px;">
             <span style="font-weight: 700; font-size: 14px;">${trade.symbol.split('/')[0]}</span>
@@ -371,10 +367,7 @@ function renderTradesList(trades, reset) {
         </div>
         <div style="display: flex; justify-content: space-between; font-size: 10px; color: var(--text-muted);">
           <span>Fee: $${(trade.fee || 0).toFixed(4)}</span>
-          <span style="display:flex; align-items:center; gap:4px;">
-            ${time}
-            ${trade.clientOrderId ? `<button class="hist-lifecycle-btn" data-hist-lifecycle="${trade.clientOrderId}" title="View in TCA">🔍</button>` : ''}
-          </span>
+          <span>${time}</span>
         </div>
         ${trade.exchangeOrderId ? `<div style="font-size: 9px; color: var(--text-muted); margin-top: 2px; font-family: var(--font-mono); opacity: 0.4;">Order: ${trade.exchangeOrderId}</div>` : ''}
       </div>`;

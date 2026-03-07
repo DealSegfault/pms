@@ -724,6 +724,7 @@ class OrderManager:
         client_order_id: str,
         new_price: float,
         new_quantity: Optional[float] = None,
+        context: Optional[dict] = None,
     ) -> Optional[OrderState]:
         """
         Cancel-and-replace pattern (from market_maker update_quotes).
@@ -772,7 +773,33 @@ class OrderManager:
             reduce_only=old.reduce_only,
         )
         latency_ms = (time.perf_counter() - t0) * 1000
-        logger.info("Replace order in %.1fms: %s %s @ %.8f", latency_ms, old.symbol, old.side, new_price)
+        old_price = float(old.price or 0)
+        new_order_id = getattr(result, "client_order_id", "") if result else ""
+        ctx = context or {}
+        chase_id = str(ctx.get("chase_id") or "")
+        parent_scalper_id = str(ctx.get("parent_scalper_id") or "")
+        reprice_flavor = str(ctx.get("reprice_flavor") or "")
+        delta_ticks = ctx.get("delta_ticks")
+        delta_ticks_label = (
+            f"{float(delta_ticks):.2f}"
+            if isinstance(delta_ticks, (int, float))
+            else ""
+        )
+        logger.info(
+            "Replace order in %.1fms: %s %s %.8f -> %.8f (old=%s new=%s parent=%s chase=%s scalper=%s flavor=%s ticks=%s)",
+            latency_ms,
+            old.symbol,
+            old.side,
+            old_price,
+            new_price,
+            old.client_order_id,
+            new_order_id,
+            old.parent_id or "",
+            chase_id,
+            parent_scalper_id,
+            reprice_flavor,
+            delta_ticks_label,
+        )
         return result
 
     # ── Feed Event Handler (called by UserStreamService) ──

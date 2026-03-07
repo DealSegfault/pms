@@ -2758,18 +2758,24 @@ body {
 }
 
 .oor-cancel {
-    width: 28px;
+    width: 36px;
+    height: 36px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     text-align: center;
     color: var(--red);
     cursor: pointer;
-    font-size: 16px;
-    opacity: 0.6;
-    transition: opacity 0.15s;
+    font-size: 20px;
+    opacity: 0.7;
+    transition: opacity 0.15s, background 0.15s;
     padding: 4px;
+    border-radius: 6px;
 }
 
 .oor-cancel:hover {
     opacity: 1;
+    background: rgba(239, 68, 68, 0.12);
 }
 
 /* ── Compact Positions Panel ────────── */
@@ -2989,19 +2995,24 @@ body {
 }
 
 .cpr-close {
-    width: 20px;
+    width: 32px;
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     text-align: center;
     cursor: pointer;
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: 16px;
+    font-weight: 600;
     line-height: 1;
-    border-radius: 3px;
+    border-radius: 6px;
     transition: color 0.15s, background 0.15s;
 }
 
 .cpr-close:hover {
     color: var(--red);
-    background: rgba(239, 68, 68, 0.1);
+    background: rgba(239, 68, 68, 0.12);
 }
 
 /* ── Mobile Overrides ───────────────── */
@@ -6826,4 +6837,695 @@ body {
         flex-direction: column;
         align-items: flex-start;
     }
+}
+
+
+/* ═══════════════════════════════════════════════════════════
+   CREATIVE REDESIGN — Phase 2
+   Deep visual overhaul for premium feel
+   ═══════════════════════════════════════════════════════════ */
+
+/* ── 1. SUBMIT BUTTON — Gradient Sweep + Glow Pulse ────── */
+
+@keyframes submit-shimmer {
+    0% {
+        background-position: -200% center;
+    }
+
+    100% {
+        background-position: 200% center;
+    }
+}
+
+@keyframes submit-glow-pulse {
+
+    0%,
+    100% {
+        box-shadow: 0 2px 16px var(--submit-glow);
+    }
+
+    50% {
+        box-shadow: 0 4px 28px var(--submit-glow), 0 0 60px var(--submit-glow-soft);
+    }
+}
+
+.btn-submit {
+    position: relative;
+    width: 100%;
+    padding: 14px;
+    border: none;
+    border-radius: 10px;
+    font-family: var(--font);
+    font-size: 15px;
+    font-weight: 800;
+    cursor: pointer;
+    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    margin: 8px 0;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    z-index: 1;
+}
+
+.btn-submit::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg,
+            transparent 0%,
+            rgba(255, 255, 255, 0.12) 50%,
+            transparent 100%);
+    background-size: 200% 100%;
+    opacity: 0;
+    transition: opacity 0.3s;
+    z-index: -1;
+}
+
+.btn-submit:hover::before {
+    opacity: 1;
+    animation: submit-shimmer 1.5s ease-in-out infinite;
+}
+
+.btn-submit:hover {
+    transform: translateY(-2px);
+    filter: brightness(1.1);
+}
+
+.btn-submit:active {
+    transform: scale(0.97) translateY(1px);
+    filter: brightness(0.95);
+    transition-duration: 0.08s;
+}
+
+.btn-submit-long {
+    --submit-glow: rgba(34, 197, 94, 0.35);
+    --submit-glow-soft: rgba(34, 197, 94, 0.12);
+    background: linear-gradient(135deg, #15803d 0%, #22c55e 50%, #16a34a 100%);
+    color: white;
+    animation: submit-glow-pulse 3s ease-in-out infinite;
+}
+
+.btn-submit-short {
+    --submit-glow: rgba(239, 68, 68, 0.35);
+    --submit-glow-soft: rgba(239, 68, 68, 0.12);
+    background: linear-gradient(135deg, #b91c1c 0%, #ef4444 50%, #dc2626 100%);
+    color: white;
+    animation: submit-glow-pulse 3s ease-in-out infinite;
+}
+
+.btn-submit:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+    animation: none;
+    filter: none;
+    transform: none;
+}
+
+
+/* ── 2. BOTTOM NAVIGATION — Active Pill + Icon Glow ────── */
+
+#bottom-nav {
+    background: linear-gradient(180deg,
+            rgba(17, 24, 39, 0.92),
+            rgba(10, 14, 23, 0.98));
+    border-top: 1px solid rgba(255, 255, 255, 0.04);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+}
+
+.nav-item {
+    position: relative;
+    transition: color 0.25s, transform 0.2s;
+}
+
+.nav-item.active {
+    color: var(--accent);
+    transform: translateY(-1px);
+}
+
+.nav-item.active::after {
+    content: '';
+    position: absolute;
+    bottom: 2px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 20px;
+    height: 3px;
+    background: var(--accent);
+    border-radius: 3px;
+    box-shadow: 0 0 10px var(--accent-glow), 0 0 20px var(--accent-glow);
+}
+
+.nav-item.active svg {
+    filter: drop-shadow(0 0 8px var(--accent-glow)) drop-shadow(0 0 16px var(--accent-glow));
+    transform: scale(1.08);
+    transition: transform 0.25s, filter 0.25s;
+}
+
+.nav-item svg {
+    transition: transform 0.2s ease, filter 0.2s;
+}
+
+
+/* ── 3. STAT ITEMS — Glass Elevation ──────────────────── */
+
+.stat-item {
+    background: linear-gradient(135deg,
+            rgba(255, 255, 255, 0.03),
+            rgba(255, 255, 255, 0.01));
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 10px;
+    padding: 14px;
+    position: relative;
+    transition: border-color 0.2s, background 0.2s;
+}
+
+.stat-item::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 20%;
+    bottom: 20%;
+    width: 2px;
+    background: var(--accent);
+    border-radius: 2px;
+    opacity: 0.4;
+}
+
+.stat-item:hover {
+    border-color: rgba(255, 255, 255, 0.08);
+    background: linear-gradient(135deg,
+            rgba(255, 255, 255, 0.05),
+            rgba(255, 255, 255, 0.02));
+}
+
+.stat-label {
+    font-size: 10px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 6px;
+    font-weight: 500;
+}
+
+.stat-value {
+    font-family: var(--font-mono);
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+}
+
+
+/* ── 4. TOAST — Progress Timer Bar ────────────────────── */
+
+@keyframes toast-timer {
+    from {
+        width: 100%;
+    }
+
+    to {
+        width: 0%;
+    }
+}
+
+.toast {
+    position: fixed;
+    top: calc(var(--header-height) + var(--safe-top) + 8px);
+    right: 12px;
+    background: rgba(12, 14, 20, 0.95);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 10px 14px 12px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.5;
+    color: var(--text-primary);
+    z-index: 300;
+    box-shadow:
+        0 8px 32px rgba(0, 0, 0, 0.5),
+        0 0 0 1px rgba(255, 255, 255, 0.03);
+    animation: toastSlideIn 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+        fadeOut 0.3s ease 1.7s forwards;
+    max-width: 360px;
+    letter-spacing: 0.2px;
+    cursor: pointer;
+    overflow: hidden;
+}
+
+.toast::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    height: 2px;
+    background: var(--accent);
+    border-radius: 0 0 0 8px;
+    animation: toast-timer 2s linear forwards;
+    opacity: 0.6;
+}
+
+.toast.success {
+    border-left-color: var(--green);
+}
+
+.toast.success::after {
+    background: var(--green);
+}
+
+.toast.error {
+    border-left-color: var(--red);
+    animation: toastSlideIn 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+        fadeOut 0.3s ease 3.7s forwards;
+}
+
+.toast.error::after {
+    background: var(--red);
+    animation: toast-timer 4s linear forwards;
+}
+
+.toast.warning {
+    border-left-color: var(--yellow);
+}
+
+.toast.warning::after {
+    background: var(--yellow);
+}
+
+.toast.info {
+    border-left-color: var(--accent);
+}
+
+
+/* ── 5. SIDE TOGGLE — Pill Enhancement ───────────────── */
+
+.side-toggle-mini {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 8px;
+    padding: 3px;
+    gap: 3px;
+}
+
+.side-toggle-mini button {
+    position: relative;
+    border-radius: 6px;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    font-weight: 800;
+    letter-spacing: 0.02em;
+}
+
+.side-toggle-mini button.active-long {
+    box-shadow: 0 2px 12px var(--green-glow),
+        inset 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+
+.side-toggle-mini button.active-short {
+    box-shadow: 0 2px 12px var(--red-glow),
+        inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+
+/* ── 6. SECTION HEADERS — Hero Treatment ─────────────── */
+
+.section-header {
+    padding: 0 0 16px;
+}
+
+.section-title {
+    font-size: 24px;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    background: linear-gradient(135deg, var(--text-primary) 0%, var(--text-secondary) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+
+
+/* ── 7. BALANCE CARD — Hero Gradient ─────────────────── */
+
+#acct-balance-card {
+    background:
+        radial-gradient(ellipse at 30% 50%, rgba(99, 102, 241, 0.08) 0%, transparent 70%),
+        radial-gradient(ellipse at 70% 50%, rgba(168, 85, 247, 0.06) 0%, transparent 70%),
+        var(--bg-glass);
+    border: 1px solid rgba(99, 102, 241, 0.12);
+    padding: 28px 20px;
+    text-align: center;
+}
+
+#acct-balance-card .price-big {
+    font-size: 36px !important;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    background: linear-gradient(135deg, var(--text-primary) 30%, var(--accent) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+
+#acct-balance-card .price-label {
+    font-size: 12px;
+    letter-spacing: 0.1em;
+    margin-bottom: 8px;
+}
+
+
+/* ── 8. ORDER TYPE DROPDOWN — Spotlight Hover ────────── */
+
+.ot-option {
+    transition: all 0.15s ease;
+    border-radius: 8px;
+    margin: 1px 0;
+}
+
+.ot-option:hover {
+    background: rgba(99, 102, 241, 0.08) !important;
+    transform: translateX(4px);
+}
+
+.ot-option.active {
+    background: rgba(99, 102, 241, 0.12) !important;
+    border-left: 2px solid var(--accent);
+}
+
+.ot-trigger {
+    transition: all 0.2s ease;
+    border-radius: 8px !important;
+}
+
+.ot-trigger:hover {
+    border-color: rgba(99, 102, 241, 0.3) !important;
+    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.08);
+}
+
+
+/* ── 9. ACCOUNT SETTINGS — Snappier Accordion ────────── */
+
+.acct-section-toggle {
+    transition: all 0.2s ease;
+    border-radius: 0;
+    padding: 14px 16px;
+}
+
+.acct-section-toggle:hover {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.acct-section-toggle.open .acct-chevron {
+    transform: rotate(0deg);
+    transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.acct-chevron {
+    transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    transform: rotate(-90deg);
+    font-size: 14px;
+    opacity: 0.5;
+}
+
+.acct-section-body {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+        padding 0.3s ease,
+        opacity 0.25s ease;
+    opacity: 0;
+    padding: 0 16px;
+}
+
+.acct-section-body.open {
+    max-height: 800px;
+    opacity: 1;
+    padding: 0 16px 16px;
+}
+
+
+/* ── 10. ORDER PREVIEW — Elevated Treatment ──────────── */
+
+.order-preview {
+    background: linear-gradient(135deg,
+            rgba(99, 102, 241, 0.05),
+            rgba(168, 85, 247, 0.03));
+    border: 1px solid rgba(99, 102, 241, 0.1);
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+}
+
+.prev-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 0;
+    font-size: 11px;
+}
+
+.prev-row span:first-child {
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+.prev-row span:last-child {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+
+/* ── 11. PRICE DISPLAY — Ambient Glow ────────────────── */
+
+.price-big {
+    position: relative;
+}
+
+
+/* ── 12. TAB BAR — Premium Segmented Control ─────────── */
+
+.tab-bar {
+    display: flex;
+    gap: 2px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 10px;
+    padding: 3px;
+}
+
+.tab-bar button {
+    flex: 1;
+    padding: 8px 12px;
+    border: none;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--text-muted);
+    font-family: var(--font);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.tab-bar button:hover {
+    color: var(--text-secondary);
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.tab-bar button.active {
+    background: rgba(99, 102, 241, 0.12);
+    color: var(--accent);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+}
+
+
+/* ── 13. BOTTOM PANELS TABS — Cleaner Look ───────────── */
+
+.bp-tab {
+    position: relative;
+    transition: color 0.2s, background 0.2s;
+}
+
+.bp-tab.active::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 20%;
+    right: 20%;
+    height: 2px;
+    background: var(--accent);
+    border-radius: 2px;
+}
+
+
+/* ── 14. EQUITY UPNL PANEL — Refined ─────────────────── */
+
+.equity-upnl-panel {
+    background: linear-gradient(135deg,
+            rgba(255, 255, 255, 0.02),
+            rgba(255, 255, 255, 0.01)) !important;
+    border: 1px solid rgba(255, 255, 255, 0.04) !important;
+    border-radius: 10px !important;
+}
+
+
+/* ── 15. INPUT ENHANCED GLOW ─────────────────────────── */
+
+.input-group-mini input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow),
+        0 0 16px rgba(99, 102, 241, 0.08);
+}
+
+
+/* ── 16. SYMBOL BAR — Polished ───────────────────────── */
+
+.symbol-bar {
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.symbol-bar-name {
+    letter-spacing: -0.01em;
+}
+
+.symbol-bar-price {
+    letter-spacing: -0.02em;
+}
+
+
+/* ── 17. PANEL HEADERS — Subtle Upgrade ──────────────── */
+
+.panel-header {
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.panel-header span:first-child {
+    font-weight: 600;
+    letter-spacing: -0.01em;
+}
+
+
+/* ── 18. FORM BALANCE — Premium ──────────────────────── */
+
+.form-balance {
+    padding: 8px 0 12px;
+    border-top: 1px solid rgba(255, 255, 255, 0.04);
+    margin-top: 4px;
+}
+
+
+/* ── 19. GLASS CARD — Page Entrance Stagger ──────────── */
+
+#account-page .glass-card {
+    animation: stagger-in 0.4s ease-out both;
+}
+
+#account-page .glass-card:nth-child(1) {
+    animation-delay: 0ms;
+}
+
+#account-page .glass-card:nth-child(2) {
+    animation-delay: 60ms;
+}
+
+#account-page .glass-card:nth-child(3) {
+    animation-delay: 120ms;
+}
+
+#account-page .glass-card:nth-child(4) {
+    animation-delay: 180ms;
+}
+
+
+/* ── 20. THEME SWATCH — Interactive Lift ─────────────── */
+
+.theme-swatch {
+    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+}
+
+.theme-swatch:hover {
+    transform: translateY(-3px) !important;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4) !important;
+}
+
+.theme-swatch-active {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3) !important;
+}
+
+
+/* ── 21. LEVERAGE BUTTON — Refined ───────────────────── */
+
+.lev-btn-enhanced {
+    font-size: 11px !important;
+    padding: 3px 8px !important;
+    transition: all 0.2s ease !important;
+    border-radius: 6px !important;
+}
+
+.lev-btn-enhanced:hover {
+    background: rgba(99, 102, 241, 0.12) !important;
+    border-color: rgba(99, 102, 241, 0.3) !important;
+    transform: translateY(-1px);
+}
+
+
+/* ── 22. SCROLLBAR — Refined ─────────────────────────── */
+
+.order-form-panel::-webkit-scrollbar {
+    width: 3px;
+}
+
+.order-form-panel::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 3px;
+}
+
+.order-form-panel::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.15);
+}
+
+
+/* ── 23. SIZE SLIDER — Enhanced Diamond Markers ──────── */
+
+.size-slider-fill {
+    background: linear-gradient(90deg, var(--accent), #a855f7);
+}
+
+.slider-diamond.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    box-shadow: 0 0 6px var(--accent-glow);
+}
+
+.size-slider-input::-webkit-slider-thumb {
+    box-shadow: 0 0 8px var(--accent-glow), 0 2px 4px rgba(0, 0, 0, 0.3);
+    transition: box-shadow 0.2s;
+}
+
+.size-slider-input:active::-webkit-slider-thumb {
+    box-shadow: 0 0 16px var(--accent-glow), 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+
+
+/* ── 24. HEADER — Refined Gradient ───────────────────── */
+
+#top-bar {
+    background: linear-gradient(180deg,
+            var(--bg-secondary) 0%,
+            rgba(17, 24, 39, 0.95) 100%);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+
+/* ── 25. CARD HOVER — Subtle Scale ───────────────────── */
+
+.position-card {
+    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.position-card:hover {
+    border-color: var(--border-active);
+    box-shadow: var(--shadow);
+    transform: translateY(-1px);
 }

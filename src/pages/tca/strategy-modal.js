@@ -263,10 +263,6 @@ function renderSummaryCards(detail = {}) {
                 <div class="stat-label">5s Markout</div>
                 <div class="stat-value ${formatPnlClass(rollup.avgMarkout5sBps || 0)}">${formatBps(rollup.avgMarkout5sBps)}</div>
             </div>
-            <div class="stat-item tca-signal-card tca-signal-card-anomaly">
-                <div class="stat-label">Anomalies</div>
-                <div class="stat-value">${anomalyCount}</div>
-            </div>
         </div>
     `;
 }
@@ -336,7 +332,6 @@ function renderActiveLayers(activeLayers = {}, { omitWrapper = false } = {}) {
         <div class="tca-panel-head">
             <div>
                 <div class="card-title">Active Layers</div>
-                <div class="tca-panel-caption">Live working child chases for this scalper. This is the closest view to the actual open-order stack.</div>
             </div>
             ${scalper ? `<div class="tca-detail-badges"><span class="tca-meta-pill">${escapeHtml(String(scalper.status || 'ACTIVE').toUpperCase())}</span><span class="tca-meta-pill">${Number(scalper.childCount || 0)} layers/side</span></div>` : ''}
         </div>
@@ -410,29 +405,32 @@ function renderRuntimeConfig(detail = {}) {
 function renderRoleQuality(detail = {}) {
     const qualityByRole = detail.qualityByRole || {};
     const entries = Object.entries(qualityByRole || {});
-    if (!entries.length) {
-        return '<div class="glass-card tca-detail-card"><div class="card-title">Role Quality</div><div class="tca-chart-empty">No role-quality data yet.</div></div>';
-    }
+    if (!entries.length) return '';
 
     return `
         <div class="glass-card tca-detail-card">
-            <div class="card-title">Role Quality</div>
+            <div class="card-title">Execution Quality</div>
             <div class="tca-fill-list">
-                ${entries.map(([role, row]) => `
+                ${entries.map(([role, row]) => {
+        const tox = Number(row.toxicityScore || toxicityScore(
+            row.avgArrivalSlippageBps,
+            row.avgMarkout1sBps,
+            row.avgMarkout5sBps,
+        ) || 0);
+        return `
                     <div class="tca-fill-row">
                         <div class="tca-leader-title">
                             <span>${escapeHtml(role)}</span>
-                            <span class="tca-meta-pill">${Number(row.fillCount || 0)} fills</span>
-                            <span class="tca-meta-pill">${Number(row.lifecycleCount || 0)} lc</span>
+                            <span style="font-family:var(--font-mono);font-weight:700;font-size:14px;">${tox.toFixed(1)}</span>
                         </div>
-                        <div class="tca-leader-metrics">
-                            <span class="${formatPnlClass(-(row.avgArrivalSlippageBps || 0))}">Arrival ${formatBps(row.avgArrivalSlippageBps)}</span>
+                        <div class="tca-leader-metrics" style="font-size:11px;opacity:0.7;">
+                            <span class="${formatPnlClass(-(row.avgArrivalSlippageBps || 0))}">Arr ${formatBps(row.avgArrivalSlippageBps)}</span>
                             <span class="${formatPnlClass(row.avgMarkout1sBps || 0)}">1s ${formatBps(row.avgMarkout1sBps)}</span>
                             <span class="${formatPnlClass(row.avgMarkout5sBps || 0)}">5s ${formatBps(row.avgMarkout5sBps)}</span>
-                            <span>Tox ${Number(row.toxicityScore || 0).toFixed(2)}</span>
                         </div>
                     </div>
-                `).join('')}
+                `;
+    }).join('')}
             </div>
         </div>
     `;
@@ -448,7 +446,6 @@ function renderLotLedger(ledger = {}, { omitWrapper = false } = {}) {
         <div class="tca-panel-head">
             <div>
                 <div class="card-title">Inventory</div>
-                <div class="tca-panel-caption">Open lots and realized closes from the position ledger.</div>
             </div>
             <div class="tca-detail-badges">
                 ${openLots.length ? `<span class="tca-meta-pill">${openLots.length} open</span>` : ''}
@@ -566,14 +563,14 @@ function renderQualitySummary(detail = {}, { loading = false, canLoadHistory = f
                     <span>Arrival</span>
                     <span class="${formatPnlClass(-(rollup.avgArrivalSlippageBps || 0))}">${formatBps(rollup.avgArrivalSlippageBps)}</span>
                 </div>
-                <div class="tca-leader-subtitle">Summary rollup from the root session.</div>
+                <div class="tca-leader-subtitle"></div>
             </div>
             <div class="tca-fill-row">
                 <div class="tca-leader-title">
                     <span>1s / 5s Markout</span>
                     <span class="${formatPnlClass(rollup.avgMarkout5sBps || 0)}">${formatBps(rollup.avgMarkout1sBps)} / ${formatBps(rollup.avgMarkout5sBps)}</span>
                 </div>
-                <div class="tca-leader-subtitle">Historical quality is opt-in while the scalper is active.</div>
+                <div class="tca-leader-subtitle"></div>
             </div>
             <div class="tca-fill-row">
                 <div class="tca-leader-title">
@@ -584,7 +581,7 @@ function renderQualitySummary(detail = {}, { loading = false, canLoadHistory = f
         rollup.avgMarkout5sBps,
     ) || 0).toFixed(2)}</span>
                 </div>
-                <div class="tca-leader-subtitle">${historyLimited ? 'History temporarily limited under memory pressure.' : 'Use history only when you need the exact curve.'}</div>
+                <div class="tca-leader-subtitle">${historyLimited ? 'Limited under memory pressure.' : ''}</div>
             </div>
         </div>
     `;

@@ -2514,13 +2514,7 @@ function renderSampleStatusLine(ts, label = 'Last sample') {
 }
 
 function renderExecutionQualityGuide(anomalyCounts = {}) {
-    const unknownRoleCount = Number(anomalyCounts?.unknownRoleCount || 0);
-    return `
-        <div class="tca-info-note">
-            <strong>How to read it:</strong> Arrival slippage measures fill versus decision mid. Positive post-fill markout means price moved in your favor after the fill; negative means adverse selection. Toxicity rises when short-horizon markouts are negative or arrival slippage is wide.
-        </div>
-        ${unknownRoleCount > 0 ? `<div class="tca-anomaly-banner">UNKNOWN role count: ${unknownRoleCount}. These orders were persisted without explicit intent metadata, so their execution quality is visible but attribution is less precise.</div>` : ''}
-    `;
+    return '';
 }
 
 function renderStrategySessionList(items) {
@@ -3288,66 +3282,34 @@ function renderDetailContent(view, detail) {
                 ` : '<div class="tca-chart-empty">No fills recorded for this lifecycle.</div>'}
             </div>
 
-            <div class="glass-card tca-detail-card">
-                <div class="card-title">Timeline</div>
-                ${eventRows.length ? `
-                    <div class="tca-timeline" style="gap:8px;">
-                        ${eventRows.map((event) => {
-        const evtClass = getEventTypeClass(event.eventType);
-        const fields = parseEventPayload(event);
-        return `
-                                <div class="tca-evt-card">
-                                    <div class="tca-evt-header">
-                                        <span class="tca-evt-type ${evtClass}">${escapeHtml(event.eventType)}</span>
-                                        <span class="tca-evt-time">${formatAbsoluteTime(event.sourceTs || event.createdAt)}</span>
-                                    </div>
-                                    ${fields.length ? `
-                                        <div class="tca-evt-fields">
-                                            ${fields.map((f) => `
-                                                <div class="tca-evt-field">
-                                                    <span class="tca-evt-field-label">${escapeHtml(f.label)}</span>
-                                                    <span class="tca-evt-field-value">${escapeHtml(f.value)}</span>
-                                                </div>
-                                            `).join('')}
-                                        </div>
-                                    ` : ''}
-                                    <details class="tca-evt-raw">
-                                        <summary>Raw payload</summary>
-                                        <pre>${escapeHtml(JSON.stringify(event.payload || {}, null, 2))}</pre>
-                                    </details>
-                                </div>
-                            `;
-    }).join('')}
-                    </div>
-                ` : '<div class="tca-chart-empty">No lifecycle events persisted.</div>'}
-            </div>
         </div>
     `;
 }
 
 function renderRoleQuality(detail) {
     const rows = Object.entries(detail.qualityByRole || {});
-    if (!rows.length) return '<div class="tca-chart-empty">No role-level metrics available.</div>';
+    if (!rows.length) return '';
     return `
         <div class="tca-fill-list">
-            ${rows.map(([role, metrics]) => `
+            ${rows.map(([role, metrics]) => {
+        const tox = Number(metrics?.toxicityScore || 0);
+        return `
                 <div class="tca-fill-row">
                     <div>
-                        <div class="tca-leader-title">${escapeHtml(role)}</div>
-                        <div class="tca-muted-line">${escapeHtml(roleDescription(role))}</div>
-                        <div class="tca-leader-subtitle">
-                            Arrival ${formatBps(metrics?.avgArrivalSlippageBps)} ·
+                        <div class="tca-leader-title">
+                            <span>${escapeHtml(role)}</span>
+                            <span style="font-family:var(--font-mono);font-weight:700;font-size:14px;">${tox.toFixed(1)}</span>
+                        </div>
+                        <div class="tca-leader-subtitle" style="font-size:11px;opacity:0.7;">
+                            Arr ${formatBps(metrics?.avgArrivalSlippageBps)} ·
                             1s ${formatBps(metrics?.avgMarkout1sBps)} ·
                             5s ${formatBps(metrics?.avgMarkout5sBps)} ·
                             30s ${formatBps(metrics?.avgMarkout30sBps)}
                         </div>
-                        <div class="tca-muted-line">${metrics?.lifecycleCount ?? 0} lifecycle(s) · ${metrics?.fillCount ?? 0} fill sample(s)</div>
-                    </div>
-                    <div class="tca-fill-mkbadge ${formatPnlClass(-(metrics?.toxicityScore || 0))}">
-                        Toxicity ${Number.isFinite(metrics?.toxicityScore) ? metrics.toxicityScore.toFixed(2) : '—'}
                     </div>
                 </div>
-            `).join('')}
+            `;
+    }).join('')}
         </div>
     `;
 }

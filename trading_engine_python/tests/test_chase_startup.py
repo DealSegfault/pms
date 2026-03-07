@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -29,6 +30,17 @@ class _ImmediateSeedMarketData:
 
     def get_l1(self, symbol):
         return self._l1
+
+
+class _StaticSymbolInfo:
+    def __init__(self, tick_size=1.0):
+        self._tick_size = tick_size
+
+    def get(self, symbol):
+        return SimpleNamespace(tick_size=self._tick_size)
+
+    def round_price(self, symbol, price):
+        return price
 
 
 def test_start_chase_does_not_double_place_during_startup_seed_tick():
@@ -72,6 +84,227 @@ def test_start_chase_does_not_double_place_during_startup_seed_tick():
 
         await asyncio.sleep(0.05)
         assert len(calls) == 1
+
+    asyncio.run(run())
+
+
+def test_chase_delays_one_tick_aggressive_reprice():
+    async def run():
+        old_order = OrderState(
+            client_order_id="coid_old",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=1.0,
+            price=100.0,
+            state="active",
+        )
+        new_order = OrderState(
+            client_order_id="coid_new",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=1.0,
+            price=101.0,
+            state="placing",
+        )
+        replace_order = AsyncMock(return_value=new_order)
+        om = SimpleNamespace(
+            replace_order=replace_order,
+            get_order=lambda client_order_id: old_order if client_order_id == "coid_old" else None,
+            _symbol_info=_StaticSymbolInfo(),
+        )
+        engine = ChaseEngine(om, None, redis_client=None)
+        state = ChaseState(
+            id="chase_delay_1",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity=1.0,
+            current_order_id="coid_old",
+            current_order_price=100.0,
+            status="ACTIVE",
+        )
+        state._initializing = False
+        engine._active[state.id] = state
+
+        await engine._on_tick(state, "BTCUSDT", 101.0, 102.0, 101.5)
+        assert replace_order.await_count == 0
+        assert state._pending_aggressive_reprice_price == 101.0
+
+        state._pending_aggressive_reprice_since = time.time() - 0.2
+        await engine._on_tick(state, "BTCUSDT", 101.0, 102.0, 101.5)
+
+        assert replace_order.await_count == 1
+        assert state.current_order_id == "coid_new"
+        assert state.current_order_price == 101.0
+        assert state.reprice_count == 1
+        assert state._pending_aggressive_reprice_price is None
+
+    asyncio.run(run())
+
+
+def test_chase_reprices_protective_move_immediately():
+    async def run():
+        old_order = OrderState(
+            client_order_id="coid_old",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=1.0,
+            price=100.0,
+            state="active",
+        )
+        new_order = OrderState(
+            client_order_id="coid_new",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=1.0,
+            price=99.0,
+            state="placing",
+        )
+        replace_order = AsyncMock(return_value=new_order)
+        om = SimpleNamespace(
+            replace_order=replace_order,
+            get_order=lambda client_order_id: old_order if client_order_id == "coid_old" else None,
+            _symbol_info=_StaticSymbolInfo(),
+        )
+        engine = ChaseEngine(om, None, redis_client=None)
+        state = ChaseState(
+            id="chase_protective_1",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity=1.0,
+            current_order_id="coid_old",
+            current_order_price=100.0,
+            status="ACTIVE",
+        )
+        state._initializing = False
+        engine._active[state.id] = state
+
+        await engine._on_tick(state, "BTCUSDT", 99.0, 100.0, 99.5)
+
+        assert replace_order.await_count == 1
+        assert state.current_order_id == "coid_new"
+        assert state.current_order_price == 99.0
+        assert state.reprice_count == 1
+        assert state._pending_aggressive_reprice_price is None
+
+    asyncio.run(run())
+
+
+def test_chase_reprices_two_tick_aggressive_move_immediately():
+    async def run():
+        old_order = OrderState(
+            client_order_id="coid_old",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=1.0,
+            price=100.0,
+            state="active",
+        )
+        new_order = OrderState(
+            client_order_id="coid_new",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=1.0,
+            price=102.0,
+            state="placing",
+        )
+        replace_order = AsyncMock(return_value=new_order)
+        om = SimpleNamespace(
+            replace_order=replace_order,
+            get_order=lambda client_order_id: old_order if client_order_id == "coid_old" else None,
+            _symbol_info=_StaticSymbolInfo(),
+        )
+        engine = ChaseEngine(om, None, redis_client=None)
+        state = ChaseState(
+            id="chase_aggressive_fast_1",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity=1.0,
+            current_order_id="coid_old",
+            current_order_price=100.0,
+            status="ACTIVE",
+        )
+        state._initializing = False
+        engine._active[state.id] = state
+
+        await engine._on_tick(state, "BTCUSDT", 102.0, 103.0, 102.5)
+
+        assert replace_order.await_count == 1
+        assert state.current_order_id == "coid_new"
+        assert state.current_order_price == 102.0
+        assert state.reprice_count == 1
+        assert state._pending_aggressive_reprice_price is None
+
+    asyncio.run(run())
+
+
+def test_chase_does_not_aggressively_reprice_while_order_is_still_placing():
+    async def run():
+        old_order = OrderState(
+            client_order_id="coid_old",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=1.0,
+            price=100.0,
+            state="placing",
+        )
+        new_order = OrderState(
+            client_order_id="coid_new",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=1.0,
+            price=101.0,
+            state="placing",
+        )
+        replace_order = AsyncMock(return_value=new_order)
+        om = SimpleNamespace(
+            replace_order=replace_order,
+            get_order=lambda client_order_id: old_order if client_order_id == "coid_old" else None,
+            _symbol_info=_StaticSymbolInfo(),
+        )
+        engine = ChaseEngine(om, None, redis_client=None)
+        state = ChaseState(
+            id="chase_placing_hold_1",
+            sub_account_id="s1",
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity=1.0,
+            current_order_id="coid_old",
+            current_order_price=100.0,
+            status="ACTIVE",
+        )
+        state._initializing = False
+        engine._active[state.id] = state
+
+        await engine._on_tick(state, "BTCUSDT", 101.0, 102.0, 101.5)
+        state._pending_aggressive_reprice_since = time.time() - 0.3
+        await engine._on_tick(state, "BTCUSDT", 101.0, 102.0, 101.5)
+        assert replace_order.await_count == 0
+
+        old_order.state = "active"
+        await engine._on_tick(state, "BTCUSDT", 101.0, 102.0, 101.5)
+
+        assert replace_order.await_count == 1
+        assert state.current_order_id == "coid_new"
+        assert state.reprice_count == 1
 
     asyncio.run(run())
 

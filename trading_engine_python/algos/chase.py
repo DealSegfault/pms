@@ -33,6 +33,8 @@ from contracts.pure_logic import chase_should_reprice, chase_is_max_distance_bre
 logger = logging.getLogger(__name__)
 
 REPRICE_THROTTLE_MS = 10  # Minimum ms between reprices
+AGGRESSIVE_REPRICE_HOLD_MS = 150  # Debounce one-tick price worsening reprices
+AGGRESSIVE_REPRICE_IMMEDIATE_TICKS = 2  # Reprice immediately once drift is meaningful
 CHASE_REDIS_TTL = 86400     # 24h
 ACTIVE_CHASE_HASH_TTL = 90
 ACTIVE_CHASE_SWEEP_INTERVAL_S = 30.0
@@ -74,6 +76,10 @@ class ChaseState:
     # Bootstrap guard — blocks deferred first-order placement until startup/resume
     # has either placed the initial order or decided to wait for a future tick.
     _initializing: bool = field(default=True, repr=False)
+    # Debounce state for low-value aggressive reprices.
+    _pending_aggressive_reprice_price: Optional[float] = field(default=None, repr=False)
+    _pending_aggressive_reprice_since: float = field(default=0.0, repr=False)
+    _pending_aggressive_reprice_order_id: Optional[str] = field(default=None, repr=False)
 
 
 class ChaseEngine:
@@ -120,6 +126,75 @@ class ChaseEngine:
         if state.order_role and str(state.order_role).strip():
             return str(state.order_role).strip().upper()
         return "UNWIND" if state.reduce_only else "ENTRY"
+
+    @staticmethod
+    def _classify_reprice(side: str, current_price: float, new_price: float) -> str:
+        if current_price <= 0 or new_price <= 0 or abs(new_price - current_price) <= 1e-12:
+            return "none"
+        side_upper = str(side or "").upper()
+        if side_upper in ("BUY", "LONG"):
+            return "aggressive" if new_price > current_price else "protective"
+        return "aggressive" if new_price < current_price else "protective"
+
+    @staticmethod
+    def _price_delta_ticks(current_price: float, new_price: float, tick_size: float) -> float:
+        if tick_size <= 0:
+            return 0.0
+        return abs(new_price - current_price) / tick_size
+
+    @staticmethod
+    def _clear_pending_aggressive_reprice(state: ChaseState) -> None:
+        state._pending_aggressive_reprice_price = None
+        state._pending_aggressive_reprice_since = 0.0
+        state._pending_aggressive_reprice_order_id = None
+
+    def _should_delay_aggressive_reprice(
+        self,
+        state: ChaseState,
+        current_order: Optional[Any],
+        current_price: float,
+        new_price: float,
+        now: float,
+    ) -> tuple[bool, str, float]:
+        reprice_flavor = self._classify_reprice(state.side, current_price, new_price)
+        tick_size = self._tick_size_for_symbol(state.symbol)
+        delta_ticks = self._price_delta_ticks(current_price, new_price, tick_size)
+
+        if reprice_flavor != "aggressive":
+            self._clear_pending_aggressive_reprice(state)
+            return False, reprice_flavor, delta_ticks
+
+        current_order_id = getattr(current_order, "client_order_id", None) or state.current_order_id
+        if (
+            state._pending_aggressive_reprice_order_id
+            and current_order_id
+            and state._pending_aggressive_reprice_order_id != current_order_id
+        ):
+            self._clear_pending_aggressive_reprice(state)
+
+        if delta_ticks >= AGGRESSIVE_REPRICE_IMMEDIATE_TICKS:
+            self._clear_pending_aggressive_reprice(state)
+            return False, reprice_flavor, delta_ticks
+
+        if (
+            state._pending_aggressive_reprice_order_id != current_order_id
+            or state._pending_aggressive_reprice_price is None
+            or abs(state._pending_aggressive_reprice_price - new_price) > 1e-12
+        ):
+            state._pending_aggressive_reprice_order_id = current_order_id
+            state._pending_aggressive_reprice_price = new_price
+            state._pending_aggressive_reprice_since = now
+            return True, reprice_flavor, delta_ticks
+
+        order_state = str(getattr(current_order, "state", "") or "").lower()
+        if order_state in ("placing", "cancelling"):
+            return True, reprice_flavor, delta_ticks
+
+        if ((now - state._pending_aggressive_reprice_since) * 1000) < AGGRESSIVE_REPRICE_HOLD_MS:
+            return True, reprice_flavor, delta_ticks
+
+        self._clear_pending_aggressive_reprice(state)
+        return False, reprice_flavor, delta_ticks
 
     @staticmethod
     def _lineage_sessions(state: ChaseState) -> tuple[str, Optional[str], Optional[str]]:
@@ -695,6 +770,7 @@ class ChaseEngine:
                             return
                         state.current_order_id = order.client_order_id
                         state.current_order_price = price
+                        self._clear_pending_aggressive_reprice(state)
                         logger.debug("Chase %s: deferred initial order placed at %.8f", state.id, price)
                         await self._save_state(state)
                         await self._publish_event("chase_progress", state, currentOrderPrice=price)
@@ -735,10 +811,32 @@ class ChaseEngine:
             if getattr(self._om, "_symbol_info", None) and current_price:
                 current_price = self._om._symbol_info.round_price(state.symbol, current_price)
             if not chase_should_reprice(state.stalk_mode, state.side, current_price, new_price):
+                self._clear_pending_aggressive_reprice(state)
                 return  # Pure function says no reprice needed
 
+            should_delay, reprice_flavor, delta_ticks = self._should_delay_aggressive_reprice(
+                state,
+                current_order,
+                current_price,
+                new_price,
+                now,
+            )
+            if should_delay:
+                return
+
             # Reprice via cancel+replace
-            new_order = await self._om.replace_order(state.current_order_id, new_price)
+            new_order = await self._om.replace_order(
+                state.current_order_id,
+                new_price,
+                context={
+                    "chase_id": state.id,
+                    "parent_scalper_id": state.parent_scalper_id,
+                    "current_price": current_price,
+                    "new_price": new_price,
+                    "reprice_flavor": reprice_flavor,
+                    "delta_ticks": delta_ticks,
+                },
+            )
 
             # ── Post-await orphan guard (JS pattern L249-253) ──
             # Chase may have been cancelled/filled while we awaited replace_order.
@@ -759,6 +857,7 @@ class ChaseEngine:
                 new_order.on_cancel = lambda o, r: self._on_cancel(state, o, r)
                 state.reprice_count += 1
                 state.last_reprice_time = now
+                self._clear_pending_aggressive_reprice(state)
 
                 await self._save_state(state)
                 await self._publish_event("chase_progress", state, currentOrderPrice=new_price)
@@ -775,6 +874,7 @@ class ChaseEngine:
                     state.current_order_id = None
                     state.current_order_price = 0
                     state.last_reprice_time = now
+                    self._clear_pending_aggressive_reprice(state)
                     await self._save_state(state)
             elif new_order is None:
                 # replace_order returned None — old order may have filled during cancel

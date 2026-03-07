@@ -401,7 +401,7 @@ export function buildTradingHTML() {
                 <label style="font-size:11px; color:var(--cyan,#06b6d4); margin:0;">Long Offset %</label>
                 <span id="scalper-long-off-val" style="font-size:13px; font-weight:600; color:var(--cyan,#06b6d4); font-family:var(--font-mono);">0.300%</span>
               </div>
-              <input type="range" id="scalper-long-offset" min="0" max="5" value="0.3" step="0.01" style="width:100%;" />
+              <input type="range" id="scalper-long-offset" min="0.01" max="3" value="0.3" step="0.01" style="width:100%;" />
               <div style="font-size:9px; color:var(--text-muted); margin-top:3px; opacity:0.7;">BUY chase placed this far below best bid</div>
             </div>
             <!-- Short offset -->
@@ -410,10 +410,15 @@ export function buildTradingHTML() {
                 <label style="font-size:11px; color:var(--orange,#f97316); margin:0;">Short Offset %</label>
                 <span id="scalper-short-off-val" style="font-size:13px; font-weight:600; color:var(--orange,#f97316); font-family:var(--font-mono);">0.300%</span>
               </div>
-              <input type="range" id="scalper-short-offset" min="0" max="5" value="0.3" step="0.01" style="width:100%;" />
+              <input type="range" id="scalper-short-offset" min="0.01" max="3" value="0.3" step="0.01" style="width:100%;" />
               <div style="font-size:9px; color:var(--text-muted); margin-top:3px; opacity:0.7;">SELL chase placed this far above best ask</div>
             </div>
-            <!-- Child count -->
+            <!-- Advanced section toggle -->
+            <button class="ux-advanced-toggle" id="scalper-adv-toggle">
+              <span class="ux-adv-chevron">▶</span> Advanced Settings
+            </button>
+            <div class="ux-advanced-content" id="scalper-adv-content">
+            <!-- Layers / side -->
             <div style="margin-bottom:8px;">
               <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
                 <label style="font-size:11px; color:var(--text-muted); margin:0;">Layers / side</label>
@@ -435,11 +440,6 @@ export function buildTradingHTML() {
                 <span>Heavy far ▶</span>
               </div>
             </div>
-            <!-- Advanced section toggle -->
-            <button class="ux-advanced-toggle" id="scalper-adv-toggle">
-              <span class="ux-adv-chevron">▶</span> Advanced Settings
-            </button>
-            <div class="ux-advanced-content" id="scalper-adv-content">
             <!-- Price Filter -->
             <div style="margin-bottom:8px;">
               <div class="label-sm" style="margin-bottom:6px; letter-spacing:0.03em;">Price Filters <span style="opacity:0.5; font-style:italic;">(optional)</span></div>
