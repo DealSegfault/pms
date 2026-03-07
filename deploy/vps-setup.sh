@@ -18,6 +18,7 @@ fail()  { echo -e "  ${RED}✖ $1${NC}"; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+WEB_ROOT="/var/www/pms"
 
 # ─── 1. Install prerequisites ───
 step "Installing prerequisites..."
@@ -25,10 +26,10 @@ apt-get update -qq 2>/dev/null || true
 apt-get install -y -qq nginx python3 python3-pip python3-venv 2>/dev/null || true
 ok "Prerequisites installed"
 
-# ─── 2. Create dist directory ───
-step "Creating dist directory..."
-mkdir -p "$PROJECT_DIR/dist"
-ok "dist/ directory ready"
+# ─── 2. Create web root directory ───
+step "Creating web root directory..."
+install -d -m 755 "$WEB_ROOT/dist"
+ok "web root directory ready"
 
 # ─── 3. Install nginx config ───
 step "Installing nginx config..."

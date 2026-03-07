@@ -13,6 +13,7 @@ VPS_USER="root"
 VPS_HOST="89.187.28.51"
 VPS_KEY="$HOME/.ssh/server_rsa"
 VPS_PROJECT="/root/pms"
+VPS_WEB_ROOT="/var/www/pms"
 
 # ── SSH Multiplexing (one password for the whole deploy) ──
 CONTROL_PATH="/tmp/pms-deploy-ssh-$$"
@@ -70,7 +71,7 @@ build_frontend() {
 # ─── Step 2: Upload dist ───
 upload_dist() {
     step "Packaging dist/..."
-    tar czf /tmp/pms-dist.tar.gz -C dist .
+    COPYFILE_DISABLE=1 tar czf /tmp/pms-dist.tar.gz --exclude='._*' -C dist .
     local size
     size=$(du -sh /tmp/pms-dist.tar.gz | cut -f1)
     ok "Packaged dist ($size)"
@@ -82,9 +83,13 @@ upload_dist() {
 
     step "Unpacking dist on VPS..."
     $SSH_CMD "
-        mkdir -p ${VPS_PROJECT}/dist
-        rm -rf ${VPS_PROJECT}/dist/* 2>/dev/null || true
-        tar xzf /tmp/pms-dist.tar.gz -C ${VPS_PROJECT}/dist/
+        install -d -m 755 ${VPS_WEB_ROOT}/dist
+        find ${VPS_WEB_ROOT}/dist -mindepth 1 -depth -delete 2>/dev/null || true
+        tar xzf /tmp/pms-dist.tar.gz --no-same-owner --no-same-permissions -C ${VPS_WEB_ROOT}/dist/
+        find ${VPS_WEB_ROOT}/dist -name '._*' -delete 2>/dev/null || true
+        find ${VPS_WEB_ROOT}/dist -type d -exec chmod 755 {} +
+        find ${VPS_WEB_ROOT}/dist -type f -exec chmod 644 {} +
+        chown -R root:root ${VPS_WEB_ROOT}/dist
         rm -f /tmp/pms-dist.tar.gz
         echo '  ✔ dist/ replaced on VPS'
     "
@@ -230,8 +235,8 @@ verify_services() {
         fi
 
         # 7. dist/ check
-        if [ -f /root/pms/dist/index.html ]; then
-            FCOUNT=$(find /root/pms/dist -type f | wc -l)
+        if [ -f /var/www/pms/dist/index.html ]; then
+            FCOUNT=$(find /var/www/pms/dist -type f | wc -l)
             echo -e "  ${GREEN}✔ dist/:       ${FCOUNT} files deployed${NC}"
             ((PASS++))
         else
