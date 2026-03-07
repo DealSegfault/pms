@@ -2,8 +2,9 @@ module.exports = {
     apps: [
         {
             name: 'pms-backend',
-            script: 'server/index.js',
-            node_args: '--max-old-space-size=384',
+            script: 'bash',
+            args: '-c "set -a; source .env; set +a; exec node --max-old-space-size=384 server/index.js"',
+            interpreter: 'none',
             cwd: '/root/pms',
             env: {
                 NODE_ENV: 'production',

@@ -1,0 +1,429 @@
+/* ═══════════════════════════════════════════
+   SERVER MAINTENANCE OVERLAY
+   Hearthstone-inspired waiting experience
+   ═══════════════════════════════════════════ */
+
+.maintenance-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    font-family: var(--font, 'Inter', sans-serif);
+    transition: opacity 0.6s ease;
+}
+
+.maintenance-overlay.fade-out {
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* ── Animated background ────────────────── */
+.maintenance-bg {
+    position: absolute;
+    inset: 0;
+    background:
+        radial-gradient(ellipse at 30% 70%, rgba(251, 191, 36, 0.06) 0%, transparent 55%),
+        radial-gradient(ellipse at 70% 30%, rgba(168, 85, 247, 0.05) 0%, transparent 55%),
+        radial-gradient(ellipse at 50% 50%, rgba(15, 10, 30, 0.95) 0%, transparent 100%),
+        linear-gradient(170deg, #07060f 0%, #12091e 30%, #0a0815 60%, #060510 100%);
+    animation: bgPulse 8s ease-in-out infinite alternate;
+}
+
+@keyframes bgPulse {
+    0% {
+        filter: brightness(1);
+    }
+
+    50% {
+        filter: brightness(1.08);
+    }
+
+    100% {
+        filter: brightness(0.95);
+    }
+}
+
+/* ── Floating ambient particles ─────────── */
+.maint-particle {
+    position: absolute;
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: #fbbf24;
+    opacity: 0;
+    animation: particleDrift linear infinite;
+}
+
+@keyframes particleDrift {
+    0% {
+        transform: translateY(0) translateX(0) scale(0);
+        opacity: 0;
+    }
+
+    15% {
+        opacity: 0.6;
+        transform: scale(1);
+    }
+
+    85% {
+        opacity: 0.4;
+    }
+
+    100% {
+        transform: translateY(-100vh) translateX(var(--drift-x, 30px)) scale(0.3);
+        opacity: 0;
+    }
+}
+
+/* ── Main content container ─────────────── */
+.maint-content {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+    animation: contentFadeIn 1s ease forwards;
+}
+
+@keyframes contentFadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(20px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* ── Mascot container with pulse ring ───── */
+.maint-mascot-wrap {
+    position: relative;
+    width: 160px;
+    height: 160px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 24px;
+}
+
+/* Heartbeat pulse rings */
+.maint-pulse-ring {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    border: 1.5px solid rgba(251, 191, 36, 0.2);
+    animation: heartbeatPulse 3s ease-in-out infinite;
+}
+
+.maint-pulse-ring:nth-child(2) {
+    animation-delay: 1s;
+}
+
+.maint-pulse-ring:nth-child(3) {
+    animation-delay: 2s;
+}
+
+@keyframes heartbeatPulse {
+    0% {
+        transform: scale(1);
+        opacity: 0.5;
+        border-color: rgba(251, 191, 36, 0.25);
+    }
+
+    50% {
+        transform: scale(1.35);
+        opacity: 0;
+        border-color: rgba(168, 85, 247, 0.15);
+    }
+
+    100% {
+        transform: scale(1.35);
+        opacity: 0;
+    }
+}
+
+/* Orbiting particles around mascot */
+.maint-orbit {
+    position: absolute;
+    inset: -10px;
+    animation: orbitSpin 12s linear infinite;
+}
+
+.maint-orbit:nth-child(5) {
+    animation-duration: 8s;
+    animation-direction: reverse;
+    inset: -20px;
+}
+
+.maint-orbit-dot {
+    position: absolute;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: #fbbf24;
+    box-shadow: 0 0 8px #fbbf2488, 0 0 16px #fbbf2444;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+}
+
+.maint-orbit:nth-child(5) .maint-orbit-dot {
+    width: 3px;
+    height: 3px;
+    background: #a855f7;
+    box-shadow: 0 0 8px #a855f788, 0 0 16px #a855f744;
+}
+
+@keyframes orbitSpin {
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+/* Duck mascot wobble */
+.maint-duck {
+    animation: duckWobble 4s ease-in-out infinite;
+    filter: drop-shadow(0 0 20px rgba(251, 191, 36, 0.3));
+}
+
+@keyframes duckWobble {
+
+    0%,
+    100% {
+        transform: translateY(0) rotate(-2deg) scale(1);
+    }
+
+    25% {
+        transform: translateY(-6px) rotate(1deg) scale(1.02);
+    }
+
+    50% {
+        transform: translateY(-3px) rotate(-1deg) scale(1);
+    }
+
+    75% {
+        transform: translateY(-8px) rotate(2deg) scale(1.01);
+    }
+}
+
+/* ── Status text ────────────────────────── */
+.maint-title {
+    font-size: 24px;
+    font-weight: 800;
+    color: #fbbf24;
+    letter-spacing: 1px;
+    text-align: center;
+    margin-bottom: 8px;
+    animation: titleGlow 3s ease-in-out infinite alternate;
+}
+
+@keyframes titleGlow {
+    0% {
+        text-shadow: 0 0 8px #fbbf2444, 0 0 20px #fbbf2422;
+    }
+
+    100% {
+        text-shadow: 0 0 12px #fbbf24aa, 0 0 30px #fbbf2444, 0 0 60px #f59e0b22;
+    }
+}
+
+.maint-subtitle {
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.45);
+    text-align: center;
+    margin-bottom: 28px;
+    max-width: 300px;
+    line-height: 1.5;
+}
+
+/* ── Three-dot bouncing loader ──────────── */
+.maint-dots {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 32px;
+}
+
+.maint-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #fbbf24, #f59e0b);
+    animation: dotBounce 1.4s ease-in-out infinite;
+    box-shadow: 0 0 8px #fbbf2466;
+}
+
+.maint-dot:nth-child(2) {
+    animation-delay: 0.16s;
+}
+
+.maint-dot:nth-child(3) {
+    animation-delay: 0.32s;
+}
+
+@keyframes dotBounce {
+
+    0%,
+    80%,
+    100% {
+        transform: scale(0.6);
+        opacity: 0.4;
+    }
+
+    40% {
+        transform: scale(1.1);
+        opacity: 1;
+    }
+}
+
+/* ── Rotating tips ──────────────────────── */
+.maint-tips {
+    position: relative;
+    height: 20px;
+    overflow: hidden;
+    min-width: 260px;
+    text-align: center;
+}
+
+.maint-tip {
+    position: absolute;
+    width: 100%;
+    font-size: 12px;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.3);
+    letter-spacing: 0.5px;
+    text-align: center;
+    opacity: 0;
+    transform: translateY(10px);
+    animation: tipCycle var(--tip-duration) ease-in-out infinite;
+    animation-delay: var(--tip-delay);
+    font-family: var(--font-mono, 'JetBrains Mono', monospace);
+}
+
+@keyframes tipCycle {
+    0% {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+
+    5% {
+        opacity: 1;
+        transform: translateY(0);
+    }
+
+    20% {
+        opacity: 1;
+        transform: translateY(0);
+    }
+
+    25% {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+
+    100% {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+}
+
+/* ── Connection status bar ──────────────── */
+.maint-status-bar {
+    position: absolute;
+    bottom: 40px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 20px;
+    backdrop-filter: blur(8px);
+}
+
+.maint-status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #f59e0b;
+    animation: statusBlink 1.5s ease-in-out infinite;
+}
+
+@keyframes statusBlink {
+
+    0%,
+    100% {
+        opacity: 1;
+        box-shadow: 0 0 4px #f59e0b;
+    }
+
+    50% {
+        opacity: 0.3;
+        box-shadow: 0 0 0px #f59e0b;
+    }
+}
+
+.maint-status-text {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.35);
+    font-family: var(--font-mono, 'JetBrains Mono', monospace);
+}
+
+.maint-attempt-count {
+    font-variant-numeric: tabular-nums;
+    color: rgba(251, 191, 36, 0.5);
+}
+
+/* ── Recovery success animation ─────────── */
+.maint-overlay-success .maint-duck {
+    animation: duckCelebrate 0.6s ease forwards;
+}
+
+.maint-overlay-success .maint-title {
+    animation: none;
+    color: #22c55e;
+    text-shadow: 0 0 12px rgba(34, 197, 94, 0.4);
+}
+
+.maint-overlay-success .maint-status-dot {
+    background: #22c55e;
+    animation: none;
+    box-shadow: 0 0 8px #22c55e;
+}
+
+.maint-overlay-success .maint-dot {
+    background: linear-gradient(135deg, #22c55e, #16a34a);
+    box-shadow: 0 0 8px rgba(34, 197, 94, 0.5);
+    animation: none;
+    transform: scale(1);
+    opacity: 1;
+}
+
+@keyframes duckCelebrate {
+    0% {
+        transform: scale(1) rotate(0deg);
+    }
+
+    30% {
+        transform: scale(1.15) rotate(-5deg);
+    }
+
+    60% {
+        transform: scale(1.1) rotate(5deg);
+    }
+
+    100% {
+        transform: scale(1.05) rotate(0deg);
+        filter: drop-shadow(0 0 30px rgba(34, 197, 94, 0.5));
+    }
+}
