@@ -137,6 +137,7 @@ async function renderAccountsTab(container) {
         ? `<button class="btn btn-danger btn-sm" style="flex: 1;" onclick="window._freezeAccount('${a.id}')">Freeze</button>`
         : `<button class="btn btn-primary btn-sm" style="flex: 1;" onclick="window._unfreezeAccount('${a.id}')">Unfreeze</button>`
       }
+          <button class="btn btn-sm" style="background:rgba(255,165,0,0.12); color:orange; border:1px solid rgba(255,165,0,0.3);" onclick="window._cancelAllOrders('${a.id}')">⛔ Cancel All</button>
           <button class="btn btn-sm" style="background:rgba(255,60,60,0.1); color:var(--red); border:1px solid rgba(255,60,60,0.25);" onclick="window._deleteAccount('${a.id}')">🗑</button>
         </div>
       </div>
@@ -314,6 +315,31 @@ window._unfreezeAccount = async (id) => {
     await api(`/admin/unfreeze/${id}`, { method: 'POST' });
     showToast('Account unfrozen', 'success');
     renderTabContent();
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+};
+
+window._cancelAllOrders = async (id) => {
+  const name = state.accounts?.find(a => a.id === id)?.name || 'this account';
+  if (!(await cuteConfirm({
+    title: '⛔ Cancel All Orders?',
+    message: `Cancel every open order on "${name}":\n• Limit orders\n• Chase limits\n• Scalpers (positions kept)\n• TWAPs & TWAP baskets\n• Trail stops`,
+    confirmText: 'Cancel Everything',
+    danger: true,
+  }))) return;
+
+  try {
+    const r = await api(`/admin/cancel-all-orders/${id}`, { method: 'POST' });
+    const parts = [];
+    if (r.limits) parts.push(`${r.limits} limit`);
+    if (r.chases) parts.push(`${r.chases} chase`);
+    if (r.scalpers) parts.push(`${r.scalpers} scalper`);
+    if (r.twaps) parts.push(`${r.twaps} twap`);
+    if (r.twapBaskets) parts.push(`${r.twapBaskets} basket`);
+    if (r.trailStops) parts.push(`${r.trailStops} trail`);
+    const msg = parts.length > 0 ? `Cancelled: ${parts.join(', ')}` : 'No active orders found';
+    showToast(msg, parts.length > 0 ? 'success' : 'info');
   } catch (err) {
     showToast(err.message, 'error');
   }

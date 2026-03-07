@@ -4,12 +4,24 @@ import { getRiskSnapshot } from '../redis.js';
 import { pushAndWait } from '../redis-proxy.js';
 import { sanitize } from '../sanitize.js';
 import { validate } from '../middleware/validate.js';
+import { getRuntimeMemorySnapshot } from '../runtime-metrics.js';
 import {
     SetBalanceBody, LiquidationModeBody, PositionIdParam,
     SubAccountIdParam, BalanceLogQuery,
 } from '../contracts/admin.contracts.js';
 
 const router = Router();
+
+router.get('/runtime/memory', async (req, res) => {
+    try {
+        const snapshot = await getRuntimeMemorySnapshot({
+            includeQueries: String(req.query.includeQueries || '0') === '1',
+        });
+        res.json(snapshot);
+    } catch (err) {
+        res.status(500).json({ error: err.message || 'Failed to read runtime memory snapshot' });
+    }
+});
 
 // GET /api/admin/dashboard - Overview of all sub-accounts
 router.get('/dashboard', async (req, res) => {
@@ -39,6 +51,80 @@ router.get('/dashboard', async (req, res) => {
         }
 
         res.json({ accounts: dashboard, mainAccountBalance: null });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/admin/cancel-all-orders/:subAccountId - Cancel ALL orders (complex + limit) for account
+router.post('/cancel-all-orders/:subAccountId', validate(SubAccountIdParam, 'params'), async (req, res) => {
+    try {
+        const { subAccountId } = req.params;
+        const { getRedis } = await import('../redis.js');
+        const redis = getRedis();
+
+        // Helper: read active items from a Redis hash
+        const readActive = async (prefix) => {
+            const raw = await redis.hgetall(`${prefix}:${subAccountId}`);
+            return Object.values(raw || {}).map(v => {
+                try { return JSON.parse(v); } catch { return null; }
+            }).filter(Boolean);
+        };
+
+        const summary = { limits: 0, chases: 0, scalpers: 0, twaps: 0, twapBaskets: 0, trailStops: 0, errors: [] };
+
+        // 1) Cancel all regular limit orders
+        try {
+            const r = await pushAndWait('pms:cmd:cancel_all', { subAccountId });
+            summary.limits = r.cancelledCount || 0;
+        } catch (e) { summary.errors.push(`limits: ${e.message}`); }
+
+        // 2) Cancel all active chases
+        try {
+            const chases = await readActive('pms:active_chase');
+            for (const c of chases) {
+                try { await pushAndWait('pms:cmd:chase_cancel', { chaseId: c.chaseId || c.id }); summary.chases++; }
+                catch { summary.chases++; /* already gone */ }
+            }
+        } catch (e) { summary.errors.push(`chases: ${e.message}`); }
+
+        // 3) Cancel all active scalpers (without closing positions)
+        try {
+            const scalpers = await readActive('pms:active_scalper');
+            for (const s of scalpers) {
+                try { await pushAndWait('pms:cmd:scalper_cancel', { scalperId: s.scalperId || s.id, closePositions: false }); summary.scalpers++; }
+                catch { summary.scalpers++; }
+            }
+        } catch (e) { summary.errors.push(`scalpers: ${e.message}`); }
+
+        // 4) Cancel all active TWAPs
+        try {
+            const twaps = await readActive('pms:active_twap');
+            for (const t of twaps) {
+                try { await pushAndWait('pms:cmd:twap_cancel', { twapId: t.twapId || t.id }); summary.twaps++; }
+                catch { summary.twaps++; }
+            }
+        } catch (e) { summary.errors.push(`twaps: ${e.message}`); }
+
+        // 5) Cancel all active TWAP baskets
+        try {
+            const baskets = await readActive('pms:active_twap_basket');
+            for (const b of baskets) {
+                try { await pushAndWait('pms:cmd:twap_basket_cancel', { twapBasketId: b.twapBasketId || b.id }); summary.twapBaskets++; }
+                catch { summary.twapBaskets++; }
+            }
+        } catch (e) { summary.errors.push(`twapBaskets: ${e.message}`); }
+
+        // 6) Cancel all active trail stops
+        try {
+            const stops = await readActive('pms:active_trail_stop');
+            for (const ts of stops) {
+                try { await pushAndWait('pms:cmd:trail_stop_cancel', { trailStopId: ts.trailStopId || ts.id }); summary.trailStops++; }
+                catch { summary.trailStops++; }
+            }
+        } catch (e) { summary.errors.push(`trailStops: ${e.message}`); }
+
+        res.json({ success: true, ...summary });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

@@ -226,6 +226,7 @@ model OrderLifecycle {
   @@unique([venue, venueAccountKey, clientOrderId])
   @@unique([venue, venueAccountKey, exchangeOrderId])
   @@index([subAccountId, createdAt])
+  @@index([subAccountId, rootStrategySessionId, createdAt])
   @@index([clientOrderId])
   @@index([exchangeOrderId])
   @@index([symbol, createdAt])
@@ -488,6 +489,7 @@ model TcaAnomaly {
   updatedAt             DateTime @updatedAt @map("updated_at")
 
   @@index([subAccountId, status, anomalyType])
+  @@index([subAccountId, rootStrategySessionId, anomalyType, status, lastSeenAt])
   @@index([rootStrategySessionId, status, anomalyType])
   @@index([strategySessionId, status, anomalyType])
   @@index([lifecycleId, anomalyType])
@@ -536,6 +538,7 @@ model AlgoRuntimeCheckpoint {
   @@unique([strategySessionId, checkpointSeq])
   @@index([subAccountId, checkpointTs])
   @@index([strategySessionId, checkpointTs])
+  @@index([strategySessionId, checkpointTs, checkpointSeq])
   @@map("algo_runtime_checkpoints")
 }
 
@@ -563,6 +566,7 @@ model StrategyPositionLot {
   realizations    StrategyLotRealization[]
 
   @@index([subAccountId, openedTs])
+  @@index([subAccountId, rootStrategySessionId, openedTs])
   @@index([rootStrategySessionId, symbol, positionSide, status])
   @@index([sourceFillFactId])
   @@map("strategy_position_lots")
@@ -591,6 +595,7 @@ model StrategyLotRealization {
   strategySession StrategySession @relation(fields: [rootStrategySessionId], references: [id])
 
   @@index([subAccountId, realizedTs])
+  @@index([subAccountId, rootStrategySessionId, realizedTs])
   @@index([rootStrategySessionId, realizedTs])
   @@index([closeFillFactId])
   @@map("strategy_lot_realizations")

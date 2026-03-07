@@ -1,12 +1,20 @@
 import { api, formatPnlClass, formatUsd, showToast } from '../../core/index.js';
 
 const MODAL_ID = 'tca-strategy-modal-overlay';
-const DEFAULT_MAX_POINTS = 180;
+const DEFAULT_MAX_POINTS = 120;
 const DEFAULT_EVENTS_PAGE_SIZE = 8;
+const DEFAULT_WINDOW_MS = 15 * 60 * 1000;
+const DEFAULT_RANGE_KEY = '15m';
+const RANGE_WINDOWS = {
+    '15m': 15 * 60 * 1000,
+    '1h': 60 * 60 * 1000,
+};
 
 let activeOverlay = null;
 let activeKeyHandler = null;
 let activeRequestSeq = 0;
+let activeModalState = null;
+const activeControllers = new Set();
 
 function escapeHtml(value) {
     return String(value ?? '')
@@ -247,7 +255,7 @@ function renderSummaryCards(detail = {}) {
     `;
 }
 
-function renderActiveLayers(activeLayers = {}) {
+function renderActiveLayers(activeLayers = {}, { omitWrapper = false } = {}) {
     const scalper = activeLayers.scalper || null;
     const chases = Array.isArray(activeLayers.chases) ? activeLayers.chases : [];
     if (!scalper && !chases.length) return '';
@@ -308,19 +316,25 @@ function renderActiveLayers(activeLayers = {}) {
         `;
     };
 
+    const content = `
+        <div class="tca-panel-head">
+            <div>
+                <div class="card-title">Active Layers</div>
+                <div class="tca-panel-caption">Live working child chases for this scalper. This is the closest view to the actual open-order stack.</div>
+            </div>
+            ${scalper ? `<div class="tca-detail-badges"><span class="tca-meta-pill">${escapeHtml(String(scalper.status || 'ACTIVE').toUpperCase())}</span><span class="tca-meta-pill">${Number(scalper.childCount || 0)} layers/side</span></div>` : ''}
+        </div>
+        <div class="tca-live-layer-grid">
+            ${renderColumn('Long Ladder', buys, 'is-long')}
+            ${renderColumn('Short Ladder', sells, 'is-short')}
+        </div>
+    `;
+
+    if (omitWrapper) return content;
+
     return `
         <div class="glass-card tca-detail-card">
-            <div class="tca-panel-head">
-                <div>
-                    <div class="card-title">Active Layers</div>
-                    <div class="tca-panel-caption">Live working child chases for this scalper. This is the closest view to the actual open-order stack.</div>
-                </div>
-                ${scalper ? `<div class="tca-detail-badges"><span class="tca-meta-pill">${escapeHtml(String(scalper.status || 'ACTIVE').toUpperCase())}</span><span class="tca-meta-pill">${Number(scalper.childCount || 0)} layers/side</span></div>` : ''}
-            </div>
-            <div class="tca-live-layer-grid">
-                ${renderColumn('Long Ladder', buys, 'is-long')}
-                ${renderColumn('Short Ladder', sells, 'is-short')}
-            </div>
+            ${content}
         </div>
     `;
 }
@@ -444,89 +458,272 @@ function renderCheckpointTimeline(timeseries = {}) {
     `;
 }
 
-function renderLotLedger(ledger = {}) {
+function renderLotLedger(ledger = {}, { omitWrapper = false } = {}) {
     const openLots = Array.isArray(ledger.openLots) ? ledger.openLots : [];
     const realizations = Array.isArray(ledger.realizations) ? ledger.realizations : [];
     const anomalies = Array.isArray(ledger.anomalies) ? ledger.anomalies : [];
     if (!openLots.length && !realizations.length && !anomalies.length) return '';
 
-    return `
-        <div class="glass-card tca-detail-card">
-            <div class="tca-panel-head">
-                <div>
-                    <div class="card-title">Inventory</div>
-                    <div class="tca-panel-caption">Open lots and realized closes from the position ledger.</div>
-                </div>
-                <div class="tca-detail-badges">
-                    ${openLots.length ? `<span class="tca-meta-pill">${openLots.length} open</span>` : ''}
-                    ${realizations.length ? `<span class="tca-meta-pill">${realizations.length} closed</span>` : ''}
-                </div>
+    const content = `
+        <div class="tca-panel-head">
+            <div>
+                <div class="card-title">Inventory</div>
+                <div class="tca-panel-caption">Open lots and realized closes from the position ledger.</div>
             </div>
-            ${openLots.length ? `
-                <div class="tca-lot-section-label">Open Lots</div>
-                <div class="tca-live-layer-list">
-                ${openLots.slice(0, 4).map((lot) => {
+            <div class="tca-detail-badges">
+                ${openLots.length ? `<span class="tca-meta-pill">${openLots.length} open</span>` : ''}
+                ${realizations.length ? `<span class="tca-meta-pill">${realizations.length} closed</span>` : ''}
+            </div>
+        </div>
+        ${openLots.length ? `
+            <div class="tca-lot-section-label">Open Lots</div>
+            <div class="tca-live-layer-list">
+            ${openLots.slice(0, 4).map((lot) => {
         const sideUpper = String(lot.positionSide || '').toUpperCase();
         const isLong = sideUpper === 'LONG' || sideUpper === 'BUY';
+        return `
+                <div class="tca-live-layer-row">
+                    <div>
+                        <div class="tca-leader-title tca-live-layer-title">
+                            <span class="tca-meta-pill" style="background:${isLong ? 'rgba(34,197,94,0.14)' : 'rgba(249,115,22,0.14)'};color:${isLong ? '#4ade80' : '#fb923c'};border:1px solid ${isLong ? 'rgba(34,197,94,0.22)' : 'rgba(249,115,22,0.22)'};">${isLong ? 'LONG' : 'SHORT'}</span>
+                            <span style="font-family:var(--font-mono);font-size:12px;">${formatQty(lot.remainingQty)} <span style="color:var(--text-muted);font-size:10px;">/ ${formatQty(lot.openQty)} qty</span></span>
+                        </div>
+                        <div class="tca-leader-subtitle">Entry ${formatCompactPrice(lot.openPrice)} · opened ${escapeHtml(formatRelativeTime(lot.openedTs))}</div>
+                    </div>
+                    <div class="tca-live-layer-price">
+                        <strong style="color:${lot.status === 'OPEN' ? '#4ade80' : 'var(--text-muted)'}">${lot.status || 'OPEN'}</strong>
+                        <span>${lot.openFee ? `fee ${formatUsd(lot.openFee, 4)}` : ''}</span>
+                    </div>
+                </div>
+            `;}).join('')}
+            </div>
+        ` : ''}
+        ${realizations.length ? `
+            <div class="tca-lot-section-label" style="margin-top:14px;">Realized Closes</div>
+            <div class="tca-live-layer-list">
+                ${realizations.slice(0, 4).map((row) => {
+        const pnl = row.netRealizedPnl || 0;
+        const totalFees = (row.openFeeAllocated || 0) + (row.closeFeeAllocated || 0);
         return `
                     <div class="tca-live-layer-row">
                         <div>
                             <div class="tca-leader-title tca-live-layer-title">
-                                <span class="tca-meta-pill" style="background:${isLong ? 'rgba(34,197,94,0.14)' : 'rgba(249,115,22,0.14)'};color:${isLong ? '#4ade80' : '#fb923c'};border:1px solid ${isLong ? 'rgba(34,197,94,0.22)' : 'rgba(249,115,22,0.22)'};">${isLong ? 'LONG' : 'SHORT'}</span>
-                                <span style="font-family:var(--font-mono);font-size:12px;">${formatQty(lot.remainingQty)} <span style="color:var(--text-muted);font-size:10px;">/ ${formatQty(lot.openQty)} qty</span></span>
+                                <span style="font-family:var(--font-mono);font-size:12px;">${formatQty(row.allocatedQty)} qty</span>
+                                <span class="${formatPnlClass(pnl)}" style="font-weight:700;font-size:13px;">${pnl >= 0 ? '+' : ''}${formatUsd(pnl, 2)}</span>
                             </div>
-                            <div class="tca-leader-subtitle">Entry ${formatCompactPrice(lot.openPrice)} · opened ${escapeHtml(formatRelativeTime(lot.openedTs))}</div>
+                            <div class="tca-leader-subtitle">${formatCompactPrice(row.openPrice)} → ${formatCompactPrice(row.closePrice)} · ${escapeHtml(formatRelativeTime(row.realizedTs))}</div>
                         </div>
                         <div class="tca-live-layer-price">
-                            <strong style="color:${lot.status === 'OPEN' ? '#4ade80' : 'var(--text-muted)'}">${lot.status || 'OPEN'}</strong>
-                            <span>${lot.openFee ? `fee ${formatUsd(lot.openFee, 4)}` : ''}</span>
+                            <strong>${formatUsd(row.grossRealizedPnl || 0, 2)} gross</strong>
+                            <span>${totalFees > 0 ? `−${formatUsd(totalFees, 4)} fees` : ''}</span>
                         </div>
                     </div>
-                `}).join('')}
-                </div>
-            ` : ''}
-            ${realizations.length ? `
-                <div class="tca-lot-section-label" style="margin-top:14px;">Realized Closes</div>
-                <div class="tca-live-layer-list">
-                    ${realizations.slice(0, 4).map((row) => {
-            const pnl = row.netRealizedPnl || 0;
-            const totalFees = (row.openFeeAllocated || 0) + (row.closeFeeAllocated || 0);
-            return `
-                        <div class="tca-live-layer-row">
-                            <div>
-                                <div class="tca-leader-title tca-live-layer-title">
-                                    <span style="font-family:var(--font-mono);font-size:12px;">${formatQty(row.allocatedQty)} qty</span>
-                                    <span class="${formatPnlClass(pnl)}" style="font-weight:700;font-size:13px;">${pnl >= 0 ? '+' : ''}${formatUsd(pnl, 2)}</span>
-                                </div>
-                                <div class="tca-leader-subtitle">${formatCompactPrice(row.openPrice)} → ${formatCompactPrice(row.closePrice)} · ${escapeHtml(formatRelativeTime(row.realizedTs))}</div>
-                            </div>
-                            <div class="tca-live-layer-price">
-                                <strong>${formatUsd(row.grossRealizedPnl || 0, 2)} gross</strong>
-                                <span>${totalFees > 0 ? `−${formatUsd(totalFees, 4)} fees` : ''}</span>
-                            </div>
-                        </div>
-                    `}).join('')}
-                </div>
-            ` : ''}
-            ${anomalies.length ? `
-                <div class="tca-session-strip" style="margin-top:12px;border-color:rgba(255,127,80,.35);color:#ffd9c9;">
-                    <span>⚠ Ledger anomaly</span>
-                    <span>${escapeHtml(String(anomalies[0]?.payload?.reason || anomalies[0]?.anomalyType || 'UNKNOWN'))}</span>
-                </div>
-            ` : ''}
+                `;}).join('')}
+            </div>
+        ` : ''}
+        ${anomalies.length ? `
+            <div class="tca-session-strip" style="margin-top:12px;border-color:rgba(255,127,80,.35);color:#ffd9c9;">
+                <span>⚠ Ledger anomaly</span>
+                <span>${escapeHtml(String(anomalies[0]?.payload?.reason || anomalies[0]?.anomalyType || 'UNKNOWN'))}</span>
+            </div>
+        ` : ''}
+    `;
+
+    if (omitWrapper) return content;
+
+    return `
+        <div class="glass-card tca-detail-card">
+            ${content}
         </div>
     `;
 }
 
-function renderModalBody({ detail, timeseries, ledger, activeLayers }) {
+function renderTimeseriesRangeControls(selectedRange, loading = false) {
+    const buttons = [
+        ['15m', '15m'],
+        ['1h', '1h'],
+        ['full', 'Full session'],
+    ];
+    return `
+        <div class="tca-detail-badges">
+            ${buttons.map(([key, label]) => `
+                <button
+                    type="button"
+                    class="tca-meta-pill ${selectedRange === key ? 'is-active' : ''}"
+                    data-action="set-timeseries-range"
+                    data-range="${key}"
+                    ${loading ? 'aria-busy="true"' : ''}
+                    style="cursor:pointer;background:${selectedRange === key ? 'rgba(14,165,233,0.18)' : 'rgba(15,23,42,0.56)'};"
+                >${escapeHtml(label)}</button>
+            `).join('')}
+        </div>
+    `;
+}
+
+function renderChartCard(title, body, { caption = '', controls = '' } = {}) {
+    return `
+        <div class="glass-card tca-detail-card">
+            <div class="tca-panel-head">
+                <div>
+                    <div class="card-title">${escapeHtml(title)}</div>
+                    ${caption ? `<div class="tca-panel-caption">${escapeHtml(caption)}</div>` : ''}
+                </div>
+                ${controls}
+            </div>
+            ${body}
+        </div>
+    `;
+}
+
+function renderDeferredDrawer({
+    role,
+    title,
+    caption,
+    open = false,
+    badges = '',
+    body = '',
+}) {
+    return `
+        <details class="glass-card tca-detail-card tca-checkpoint-drawer" data-role="${escapeHtml(role)}" ${open ? 'open' : ''}>
+            <summary class="tca-checkpoint-drawer-summary">
+                <div class="tca-checkpoint-drawer-head">
+                    <span class="card-title">${escapeHtml(title)}</span>
+                    ${caption ? `<span style="color:var(--text-muted);font-size:11px;">${escapeHtml(caption)}</span>` : ''}
+                    ${badges}
+                </div>
+                <span class="tca-checkpoint-drawer-arrow">▸</span>
+            </summary>
+            <div style="padding:12px 16px 16px;">
+                ${body}
+            </div>
+        </details>
+    `;
+}
+
+function renderTimeseriesSections(state) {
+    const timeseries = state.timeseries || null;
+    const pnlPoints = Array.isArray(timeseries?.series?.pnl) ? timeseries.series.pnl : [];
+    const qualityPoints = Array.isArray(timeseries?.series?.quality) ? timeseries.series.quality : [];
+    const isLoading = Boolean(state.loadingTimeseries);
+    const error = state.timeseriesError || null;
+    const selectedRange = state.timeseriesRange || DEFAULT_RANGE_KEY;
+    const rangeLabel = selectedRange === 'full'
+        ? 'Full session window'
+        : (selectedRange === '1h' ? 'Last 1 hour window' : 'Last 15 minute window');
+    let body = '';
+    let qualityBody = '';
+
+    if (timeseries) {
+        body = buildSeriesChart(pnlPoints, [
+            ['netPnl', 'Net', '#16a34a'],
+            ['realizedPnl', 'Realized', '#0ea5e9'],
+            ['unrealizedPnl', 'Unrealized', '#f97316'],
+        ], { yAxisLabel: 'USD' });
+        qualityBody = buildSeriesChart(qualityPoints, [
+            ['avgMarkout1sBps', '1s Markout', '#38bdf8'],
+            ['avgMarkout5sBps', '5s Markout', '#818cf8'],
+            ['avgArrivalSlippageBps', 'Arrival', '#fb7185'],
+        ], { yAxisLabel: 'bps', isBps: true });
+    } else if (error) {
+        const retryButton = error.code === 'TCA_MEMORY_GUARD_ACTIVE' && selectedRange !== DEFAULT_RANGE_KEY
+            ? `
+                <button type="button" class="tca-meta-pill" data-action="retry-timeseries-15m" style="cursor:pointer;">
+                    Retry 15m
+                </button>
+            `
+            : '';
+        body = `
+            <div class="tca-inline-error">
+                ${escapeHtml(error.message || 'Failed to load chart window.')}
+                ${retryButton}
+            </div>
+        `;
+        qualityBody = body;
+    } else if (isLoading) {
+        body = '<div class="tca-chart-empty">Loading timeseries window…</div>';
+        qualityBody = '<div class="tca-chart-empty">Loading execution-quality window…</div>';
+    } else {
+        body = '<div class="tca-chart-empty">Timeseries not loaded yet.</div>';
+        qualityBody = '<div class="tca-chart-empty">Execution-quality series not loaded yet.</div>';
+    }
+
+    const loadingCaption = isLoading && (pnlPoints.length || qualityPoints.length)
+        ? `${rangeLabel} · refreshing`
+        : rangeLabel;
+    const controls = renderTimeseriesRangeControls(selectedRange, isLoading);
+
+    return `
+        ${renderChartCard('PnL Curve', body, {
+        caption: loadingCaption,
+        controls,
+    })}
+        ${renderChartCard('Execution Quality', qualityBody, {
+        caption: loadingCaption,
+    })}
+    `;
+}
+
+function renderInventorySection(state) {
+    const badges = state.ledger
+        ? `
+            <span class="tca-meta-pill">${Number(state.ledger?.openLots?.length || 0)} open</span>
+            <span class="tca-meta-pill">${Number(state.ledger?.realizations?.length || 0)} realized</span>
+        `
+        : '';
+    let body = '<div class="tca-chart-empty">Expand to load the lot ledger.</div>';
+    if (state.loadingLedger) {
+        body = '<div class="tca-chart-empty">Loading lot ledger…</div>';
+    } else if (state.ledgerError) {
+        body = `<div class="tca-inline-error">${escapeHtml(state.ledgerError)}</div>`;
+    } else if (state.ledger) {
+        body = renderLotLedger(state.ledger, { omitWrapper: true });
+    }
+    return renderDeferredDrawer({
+        role: 'inventory-details',
+        title: 'Inventory',
+        caption: 'Open lots and realized closes load on demand.',
+        open: Boolean(state.inventoryOpen),
+        badges,
+        body,
+    });
+}
+
+function renderActiveLayersSection(state) {
+    const chases = Array.isArray(state.activeLayers?.chases) ? state.activeLayers.chases : [];
+    const scalper = state.activeLayers?.scalper || null;
+    const badges = state.activeLayers
+        ? `
+            ${scalper ? `<span class="tca-meta-pill">${escapeHtml(String(scalper.status || 'ACTIVE').toUpperCase())}</span>` : ''}
+            <span class="tca-meta-pill">${chases.length} chases</span>
+        `
+        : '';
+    let body = '<div class="tca-chart-empty">Expand to load live Redis layer state.</div>';
+    if (state.loadingActiveLayers) {
+        body = '<div class="tca-chart-empty">Loading live layer state…</div>';
+    } else if (state.activeLayersError) {
+        body = `<div class="tca-inline-error">${escapeHtml(state.activeLayersError)}</div>`;
+    } else if (state.activeLayers) {
+        body = renderActiveLayers(state.activeLayers, { omitWrapper: true }) || '<div class="tca-chart-empty">No working layers.</div>';
+    }
+    return renderDeferredDrawer({
+        role: 'active-layers-details',
+        title: 'Active Layers',
+        caption: 'Live chase ladders load only when this drawer is opened.',
+        open: Boolean(state.activeLayersOpen),
+        badges,
+        body,
+    });
+}
+
+function renderModalBody(state) {
+    const detail = state.detail || {};
     const strategySession = detail?.strategySession || {};
     const runtime = detail?.runtime || {};
     const rollup = detail?.rollup || {};
-    const pnlPoints = Array.isArray(timeseries?.series?.pnl) ? timeseries.series.pnl : [];
-    const qualityPoints = Array.isArray(timeseries?.series?.quality) ? timeseries.series.quality : [];
+    const timeseries = state.timeseries || null;
     const symbol = strategySession.symbol || 'Unknown';
     const strategyType = strategySession.strategyType || runtime.strategyType || rollup.strategyType || 'Strategy';
-    const status = runtime.status || 'UNKNOWN';
+    const status = runtime.status || strategySession.status || 'UNKNOWN';
     const side = strategySession.side || '—';
 
     return `
@@ -546,24 +743,9 @@ function renderModalBody({ detail, timeseries, ledger, activeLayers }) {
         ${renderRuntimeConfig(detail)}
         ${renderSummaryCards(detail)}
         <div class="tca-modal-body">
-            <div class="glass-card tca-detail-card">
-                <div class="card-title">PnL Curve</div>
-                ${buildSeriesChart(pnlPoints, [
-        ['netPnl', 'Net', '#16a34a'],
-        ['realizedPnl', 'Realized', '#0ea5e9'],
-        ['unrealizedPnl', 'Unrealized', '#f97316'],
-    ], { yAxisLabel: 'USD' })}
-            </div>
-            <div class="glass-card tca-detail-card">
-                <div class="card-title">Execution Quality</div>
-                ${buildSeriesChart(qualityPoints, [
-        ['avgMarkout1sBps', '1s Markout', '#38bdf8'],
-        ['avgMarkout5sBps', '5s Markout', '#818cf8'],
-        ['avgArrivalSlippageBps', 'Arrival', '#fb7185'],
-    ], { yAxisLabel: 'bps', isBps: true })}
-            </div>
-            ${renderActiveLayers(activeLayers)}
-            ${renderLotLedger(ledger)}
+            ${renderTimeseriesSections(state)}
+            ${renderActiveLayersSection(state)}
+            ${renderInventorySection(state)}
             ${renderRoleQuality(detail)}
             ${renderCheckpointTimeline(timeseries)}
         </div>
@@ -596,11 +778,259 @@ function buildErrorMarkup(message, strategySessionId) {
     `;
 }
 
+function isAbortError(err) {
+    return err?.name === 'AbortError' || err?.code === 20;
+}
+
+function createSectionController(state, key) {
+    if (state.controllers[key]) {
+        activeControllers.delete(state.controllers[key]);
+        state.controllers[key].abort();
+    }
+    const controller = new AbortController();
+    state.controllers[key] = controller;
+    activeControllers.add(controller);
+    return controller;
+}
+
+function clearSectionController(state, key, controller) {
+    if (state.controllers[key] === controller) {
+        delete state.controllers[key];
+    }
+    activeControllers.delete(controller);
+}
+
+function buildModalRequestPath(subAccountId, strategySessionId, params) {
+    return `/trade/tca/strategy-modal-payload/${subAccountId}/${strategySessionId}?${params.toString()}`;
+}
+
+function buildTimeseriesParams(detail, rangeKey) {
+    const params = new URLSearchParams({
+        sections: 'timeseries',
+        maxPoints: String(DEFAULT_MAX_POINTS),
+        eventsPageSize: String(DEFAULT_EVENTS_PAGE_SIZE),
+    });
+    const now = new Date();
+    let from = null;
+    if (rangeKey === 'full') {
+        const startedAt = detail?.strategySession?.startedAt ? new Date(detail.strategySession.startedAt) : null;
+        if (startedAt && !Number.isNaN(startedAt.getTime())) {
+            from = startedAt;
+        }
+    } else {
+        const windowMs = RANGE_WINDOWS[rangeKey] || DEFAULT_WINDOW_MS;
+        from = new Date(now.getTime() - windowMs);
+    }
+    if (from) params.set('from', from.toISOString());
+    params.set('to', now.toISOString());
+    return params;
+}
+
+function renderActiveModal() {
+    if (!activeOverlay || !activeModalState) return;
+    const body = activeOverlay.querySelector('[data-role="strategy-modal-body"]');
+    if (!body) return;
+
+    if (activeModalState.loadingDetail && !activeModalState.detail) {
+        body.innerHTML = buildLoadingMarkup(activeModalState.strategySessionId);
+    } else if (activeModalState.detailError && !activeModalState.detail) {
+        body.innerHTML = buildErrorMarkup(activeModalState.detailError, activeModalState.strategySessionId);
+    } else {
+        body.innerHTML = renderModalBody(activeModalState);
+        const inventory = activeOverlay.querySelector('[data-role="inventory-details"]');
+        if (inventory) {
+            inventory.addEventListener('toggle', () => {
+                activeModalState.inventoryOpen = inventory.open;
+                if (inventory.open && !activeModalState.ledger && !activeModalState.loadingLedger) {
+                    void loadLedgerSection(activeModalState);
+                }
+            });
+        }
+        const activeLayers = activeOverlay.querySelector('[data-role="active-layers-details"]');
+        if (activeLayers) {
+            activeLayers.addEventListener('toggle', () => {
+                activeModalState.activeLayersOpen = activeLayers.open;
+                if (activeLayers.open && !activeModalState.activeLayers && !activeModalState.loadingActiveLayers) {
+                    void loadActiveLayersSection(activeModalState);
+                }
+            });
+        }
+    }
+}
+
+function buildInitialModalState(subAccountId, strategySessionId, requestSeq) {
+    return {
+        subAccountId,
+        strategySessionId,
+        requestSeq,
+        detail: null,
+        timeseries: null,
+        ledger: null,
+        activeLayers: null,
+        loadingDetail: true,
+        loadingTimeseries: false,
+        loadingLedger: false,
+        loadingActiveLayers: false,
+        detailError: '',
+        timeseriesError: null,
+        ledgerError: '',
+        activeLayersError: '',
+        inventoryOpen: false,
+        activeLayersOpen: false,
+        timeseriesRange: DEFAULT_RANGE_KEY,
+        controllers: {},
+    };
+}
+
+function isStateActive(state) {
+    return activeModalState === state && activeRequestSeq === state.requestSeq && activeOverlay?.isConnected;
+}
+
+async function fetchModalPayload(state, key, params) {
+    const controller = createSectionController(state, key);
+    try {
+        return await api(buildModalRequestPath(state.subAccountId, state.strategySessionId, params), {
+            signal: controller.signal,
+        });
+    } finally {
+        clearSectionController(state, key, controller);
+    }
+}
+
+async function loadDetailSection(state) {
+    try {
+        const params = new URLSearchParams({ sections: 'detail' });
+        const payload = await fetchModalPayload(state, 'detail', params);
+        if (!isStateActive(state)) return;
+        state.detail = payload?.detail || null;
+        state.loadingDetail = false;
+        state.detailError = state.detail ? '' : 'Strategy session not found';
+        renderActiveModal();
+        if (state.detail) {
+            window.requestAnimationFrame(() => {
+                if (isStateActive(state) && !state.loadingTimeseries && !state.timeseries) {
+                    void loadTimeseriesSection(state, DEFAULT_RANGE_KEY, { force: true });
+                }
+            });
+        }
+    } catch (err) {
+        if (isAbortError(err)) return;
+        if (!isStateActive(state)) return;
+        state.loadingDetail = false;
+        state.detailError = err?.message || 'Failed to load strategy TCA.';
+        renderActiveModal();
+        showToast(state.detailError, 'error');
+    }
+}
+
+async function loadTimeseriesSection(state, rangeKey, { force = false } = {}) {
+    if (!state.detail) return;
+    if (!force && state.loadingTimeseries && state.timeseriesRange === rangeKey) return;
+
+    state.loadingTimeseries = true;
+    state.timeseriesError = null;
+    state.timeseriesRange = rangeKey;
+    renderActiveModal();
+
+    try {
+        const payload = await fetchModalPayload(state, 'timeseries', buildTimeseriesParams(state.detail, rangeKey));
+        if (!isStateActive(state)) return;
+        state.timeseries = payload?.timeseries || null;
+        state.loadingTimeseries = false;
+        state.timeseriesError = null;
+        renderActiveModal();
+    } catch (err) {
+        if (isAbortError(err)) return;
+        if (!isStateActive(state)) return;
+        state.loadingTimeseries = false;
+        state.timeseriesError = {
+            message: err?.message || 'Failed to load chart window.',
+            code: err?.errorCode || err?.payload?.errorCode || err?.payload?.error?.code || null,
+        };
+        renderActiveModal();
+    }
+}
+
+async function loadLedgerSection(state) {
+    if (state.loadingLedger || state.ledger) return;
+
+    state.loadingLedger = true;
+    state.ledgerError = '';
+    renderActiveModal();
+
+    try {
+        const payload = await fetchModalPayload(state, 'ledger', new URLSearchParams({ sections: 'ledger' }));
+        if (!isStateActive(state)) return;
+        state.ledger = payload?.ledger || null;
+        state.loadingLedger = false;
+        state.ledgerError = '';
+        renderActiveModal();
+    } catch (err) {
+        if (isAbortError(err)) return;
+        if (!isStateActive(state)) return;
+        state.loadingLedger = false;
+        state.ledgerError = err?.message || 'Failed to load lot ledger.';
+        renderActiveModal();
+    }
+}
+
+async function loadActiveLayersSection(state) {
+    if (state.loadingActiveLayers || state.activeLayers) return;
+
+    state.loadingActiveLayers = true;
+    state.activeLayersError = '';
+    renderActiveModal();
+
+    const controller = createSectionController(state, 'activeLayers');
+    try {
+        const [scalpersResult, chasesResult] = await Promise.allSettled([
+            api(`/trade/scalper/active/${state.subAccountId}`, { signal: controller.signal }),
+            api(`/trade/chase-limit/active/${state.subAccountId}`, { signal: controller.signal }),
+        ]);
+        if (!isStateActive(state)) return;
+        const scalpers = scalpersResult.status === 'fulfilled' && Array.isArray(scalpersResult.value)
+            ? scalpersResult.value
+            : [];
+        const chases = chasesResult.status === 'fulfilled' && Array.isArray(chasesResult.value)
+            ? chasesResult.value
+            : [];
+        state.activeLayers = {
+            scalper: scalpers.find((row) => String(row.scalperId || '') === String(state.strategySessionId || '')) || null,
+            chases: chases.filter((row) => String(row.parentScalperId || '') === String(state.strategySessionId || '')),
+        };
+        state.loadingActiveLayers = false;
+        state.activeLayersError = '';
+        renderActiveModal();
+    } catch (err) {
+        if (isAbortError(err)) return;
+        if (!isStateActive(state)) return;
+        state.loadingActiveLayers = false;
+        state.activeLayersError = err?.message || 'Failed to load live layer state.';
+        renderActiveModal();
+    } finally {
+        clearSectionController(state, 'activeLayers', controller);
+    }
+}
+
 function bindOverlayEvents(overlay) {
     overlay.addEventListener('click', (event) => {
         const target = event.target;
         if (target === overlay || target?.closest?.('[data-action="close-strategy-modal"]')) {
             closeTcaStrategyModal();
+            return;
+        }
+
+        const rangeButton = target?.closest?.('[data-action="set-timeseries-range"]');
+        if (rangeButton && activeModalState) {
+            event.preventDefault();
+            void loadTimeseriesSection(activeModalState, String(rangeButton.dataset.range || DEFAULT_RANGE_KEY), { force: true });
+            return;
+        }
+
+        const retryButton = target?.closest?.('[data-action="retry-timeseries-15m"]');
+        if (retryButton && activeModalState) {
+            event.preventDefault();
+            void loadTimeseriesSection(activeModalState, DEFAULT_RANGE_KEY, { force: true });
         }
     });
 }
@@ -612,40 +1042,19 @@ function detachKeyHandler() {
     }
 }
 
-export function closeTcaStrategyModal() {
-    if (activeOverlay?.isConnected) activeOverlay.remove();
-    activeOverlay = null;
-    detachKeyHandler();
+function abortActiveRequests() {
+    for (const controller of activeControllers) {
+        controller.abort();
+    }
+    activeControllers.clear();
 }
 
-async function loadStrategyPayload(subAccountId, strategySessionId) {
-    // Combined endpoint: 1 HTTP call for detail + timeseries + ledger (was 3 separate calls)
-    // Plus 2 lightweight Redis calls for live layer state
-    const params = new URLSearchParams({
-        maxPoints: String(DEFAULT_MAX_POINTS),
-        eventsPageSize: String(DEFAULT_EVENTS_PAGE_SIZE),
-    });
-
-    const [combinedResult, scalperResult, chaseResult] = await Promise.allSettled([
-        api(`/trade/tca/strategy-modal-payload/${subAccountId}/${strategySessionId}?${params.toString()}`),
-        api(`/trade/scalper/active/${subAccountId}`),
-        api(`/trade/chase-limit/active/${subAccountId}`),
-    ]);
-
-    if (combinedResult.status !== 'fulfilled') throw combinedResult.reason;
-    const combined = combinedResult.value;
-    const scalpers = scalperResult.status === 'fulfilled' && Array.isArray(scalperResult.value) ? scalperResult.value : [];
-    const chases = chaseResult.status === 'fulfilled' && Array.isArray(chaseResult.value) ? chaseResult.value : [];
-
-    return {
-        detail: combined.detail,
-        timeseries: combined.timeseries || null,
-        ledger: combined.ledger || null,
-        activeLayers: {
-            scalper: scalpers.find((row) => String(row.scalperId || '') === String(strategySessionId || '')) || null,
-            chases: chases.filter((row) => String(row.parentScalperId || '') === String(strategySessionId || '')),
-        },
-    };
+export function closeTcaStrategyModal() {
+    abortActiveRequests();
+    if (activeOverlay?.isConnected) activeOverlay.remove();
+    activeOverlay = null;
+    activeModalState = null;
+    detachKeyHandler();
 }
 
 export async function openTcaStrategyModal({ subAccountId, strategySessionId } = {}) {
@@ -667,21 +1076,11 @@ export async function openTcaStrategyModal({ subAccountId, strategySessionId } =
     bindOverlayEvents(overlay);
     document.body.appendChild(overlay);
     activeOverlay = overlay;
+    activeModalState = buildInitialModalState(subAccountId, strategySessionId, requestSeq);
     activeKeyHandler = (event) => {
         if (event.key === 'Escape') closeTcaStrategyModal();
     };
     window.addEventListener('keydown', activeKeyHandler);
-
-    try {
-        const payload = await loadStrategyPayload(subAccountId, strategySessionId);
-        if (activeOverlay !== overlay || requestSeq !== activeRequestSeq) return;
-        const body = overlay.querySelector('[data-role="strategy-modal-body"]');
-        if (body) body.innerHTML = renderModalBody(payload);
-    } catch (err) {
-        if (activeOverlay !== overlay || requestSeq !== activeRequestSeq) return;
-        const message = err?.message || 'Failed to load strategy TCA.';
-        const body = overlay.querySelector('[data-role="strategy-modal-body"]');
-        if (body) body.innerHTML = buildErrorMarkup(message, strategySessionId);
-        showToast(message, 'error');
-    }
+    renderActiveModal();
+    void loadDetailSection(activeModalState);
 }

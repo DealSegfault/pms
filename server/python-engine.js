@@ -252,3 +252,11 @@ function _scheduleRestart() {
 export function isPythonEngineRunning() {
     return pythonProcess !== null && !pythonProcess.killed;
 }
+
+export function getPythonEngineStatus() {
+    return {
+        pid: pythonProcess?.pid || null,
+        running: isPythonEngineRunning(),
+        restartAttempt,
+    };
+}

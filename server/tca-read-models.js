@@ -416,8 +416,10 @@ export function buildStrategyRollupQuery(subAccountId, query = {}) {
 }
 
 export function buildStrategyTimeseriesQuery(query = {}) {
-    const from = parseDate(query.from);
+    const providedFrom = parseDate(query.from);
     const to = parseDate(query.to) || new Date();
+    const defaultWindowMs = Math.max(60_000, Number.parseInt(query.defaultWindowMs, 10) || 15 * 60 * 1000);
+    const from = providedFrom || new Date(to.getTime() - defaultWindowMs);
     const series = new Set(
         String(query.series || 'pnl,params,quality,exposure')
             .split(',')
@@ -441,6 +443,9 @@ export function buildStrategyTimeseriesQuery(query = {}) {
         from,
         to,
         series,
+        defaultedWindow: !providedFrom,
+        defaultWindowMs,
+        rangeMs,
         requestedBucketMs: bucketMs,
         bucketMs: effectiveBucketMs,
         maxPoints,

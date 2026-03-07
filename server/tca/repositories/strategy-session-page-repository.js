@@ -80,26 +80,6 @@ function buildStrategySessionPageRowsQuery({
         : Prisma.sql`NULL AS "qualityByRoleJson",`;
 
     return Prisma.sql`
-        WITH latest_pnl AS (
-            SELECT *
-            FROM (
-                SELECT
-                    p.*,
-                    ROW_NUMBER() OVER (PARTITION BY p.strategy_session_id ORDER BY p.sampled_at DESC) AS rn
-                FROM strategy_session_pnl_samples p
-            ) ranked
-            WHERE ranked.rn = 1
-        ),
-        latest_param AS (
-            SELECT *
-            FROM (
-                SELECT
-                    p.*,
-                    ROW_NUMBER() OVER (PARTITION BY p.strategy_session_id ORDER BY p.sampled_at DESC, p.created_at DESC) AS rn
-                FROM strategy_session_param_samples p
-            ) ranked
-            WHERE ranked.rn = 1
-        )
         SELECT
             s.id AS "strategySessionId",
             s.sub_account_id AS "subAccountId",
@@ -180,8 +160,33 @@ function buildStrategySessionPageRowsQuery({
            AND r.execution_scope = ${executionScope}
            AND r.ownership_confidence = ${ownershipConfidence}
         LEFT JOIN algo_runtime_sessions ars ON ars.strategy_session_id = s.id
-        LEFT JOIN latest_pnl lp ON lp.strategy_session_id = s.id
-        LEFT JOIN latest_param lpar ON lpar.strategy_session_id = s.id
+        LEFT JOIN LATERAL (
+            SELECT
+                p.sampled_at,
+                p.realized_pnl,
+                p.unrealized_pnl,
+                p.net_pnl,
+                p.fees_total,
+                p.open_qty,
+                p.open_notional,
+                p.fill_count,
+                p.close_count,
+                p.win_count,
+                p.loss_count
+            FROM strategy_session_pnl_samples p
+            WHERE p.strategy_session_id = s.id
+            ORDER BY p.sampled_at DESC, p.created_at DESC
+            LIMIT 1
+        ) lp ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT
+                p.sampled_at,
+                p.pause_reasons_json
+            FROM strategy_session_param_samples p
+            WHERE p.strategy_session_id = s.id
+            ORDER BY p.sampled_at DESC, p.created_at DESC
+            LIMIT 1
+        ) lpar ON TRUE
         ${whereSql}
         ORDER BY ${sortColumn} ${sortDirection}, s.id ${sortDirection}
         LIMIT ${query.take}

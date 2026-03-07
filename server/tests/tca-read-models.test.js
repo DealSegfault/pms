@@ -158,6 +158,20 @@ test('buildStrategyTimeseriesQuery derives adaptive bucket defaults and accepts 
     assert.equal(query.eventsPage, 1);
     assert.equal(query.eventsPageSize, 12);
     assert.equal(query.eventsSkip, 0);
+    assert.equal(query.defaultedWindow, false);
+    assert.equal(query.defaultWindowMs, 15 * 60 * 1000);
+});
+
+test('buildStrategyTimeseriesQuery defaults missing from to the last 15 minutes', () => {
+    const before = Date.now();
+    const query = buildStrategyTimeseriesQuery({});
+    const after = Date.now();
+
+    assert.equal(query.defaultedWindow, true);
+    assert.equal(query.defaultWindowMs, 15 * 60 * 1000);
+    assert.ok(query.to.getTime() >= before);
+    assert.ok(query.to.getTime() <= after + 1000);
+    assert.equal(query.to.getTime() - query.from.getTime(), 15 * 60 * 1000);
 });
 
 test('buildRollupQuery and buildStrategyRollupQuery honor updated-at date filters', () => {
