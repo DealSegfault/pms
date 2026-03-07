@@ -34,6 +34,10 @@ import os
 import signal
 import socket
 
+from trading_engine_python.env import load_project_env
+
+load_project_env()
+
 logger = logging.getLogger("trading_engine")
 
 EXIT_OK = 0

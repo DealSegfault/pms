@@ -24,21 +24,15 @@ from pathlib import Path
 from typing import Any, List, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
+from trading_engine_python.env import load_project_env
+
 logger = logging.getLogger(__name__)
 
 # Default: SQLite at prisma/pms.db (relative to project root)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_DB_PATH = _PROJECT_ROOT / "prisma" / "pms.db"
 
-# Load .env from project root (same file Node/Prisma uses)
-_ENV_FILE = _PROJECT_ROOT / ".env"
-if _ENV_FILE.exists():
-    with open(_ENV_FILE) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, value = line.partition("=")
-                os.environ.setdefault(key.strip(), value.strip())
+load_project_env()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 

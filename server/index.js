@@ -41,6 +41,7 @@ dotenv.config();
 const app = express();
 
 const PORT = process.env.PORT || 3900;
+const shouldManagePythonEngine = process.env.MANAGE_PYTHON_ENGINE !== '0';
 
 // Middleware
 app.use(cors({
@@ -222,8 +223,11 @@ async function start() {
             });
         });
 
-        // Start Python trading engine as child process (after server is listening)
-        await startPythonEngine();
+        if (shouldManagePythonEngine) {
+            await startPythonEngine();
+        } else {
+            console.log('[Server] MANAGE_PYTHON_ENGINE=0 — expecting Python engine to be managed externally');
+        }
     } catch (err) {
         console.error('Failed to start server:', err);
         process.exit(1);
@@ -236,7 +240,9 @@ start();
 async function gracefulShutdown(signal) {
     console.log(`\n[Shutdown] Received ${signal}, cleaning up...`);
     try {
-        await stopPythonEngine();
+        if (shouldManagePythonEngine) {
+            await stopPythonEngine();
+        }
         await closeRedis();
         await disconnectPrisma();
         await new Promise((resolve) => {

@@ -2,11 +2,12 @@ module.exports = {
     apps: [
         {
             name: 'pms-backend',
-            script: 'bash',
-            args: '-c "set -a; source .env; set +a; exec node --max-old-space-size=384 server/index.js"',
+            script: 'node',
+            args: '--max-old-space-size=384 server/index.js',
             interpreter: 'none',
             cwd: '/root/pms',
             env: {
+                MANAGE_PYTHON_ENGINE: '0',
                 NODE_ENV: 'production',
                 PORT: 3900,
             },
@@ -21,8 +22,8 @@ module.exports = {
         },
         {
             name: 'pms-engine',
-            script: 'bash',
-            args: '-c "set -a; source .env; set +a; exec trading_engine_python/.venv/bin/python -m trading_engine_python.main"',
+            script: 'trading_engine_python/.venv/bin/python',
+            args: '-m trading_engine_python.main',
             interpreter: 'none',
             cwd: '/root/pms',
             restart_delay: 5000,
