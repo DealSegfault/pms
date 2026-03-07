@@ -40,7 +40,7 @@ const DEFAULT_FILTERS = {
     symbol: '',
     strategyType: '',
     finalStatus: 'FILLED',
-    strategyStatus: '',
+    strategyStatus: 'ACTIVE',
     lookback: '7d',
     includeNonHard: false,
     benchmarkMs: 5000,
@@ -481,7 +481,7 @@ function parseTcaHashState(hash) {
     stateFromHash.filters.symbol = String(params.get('symbol') || '');
     stateFromHash.filters.strategyType = String(params.get('strategyType') || '');
     stateFromHash.filters.finalStatus = String(params.get('finalStatus') || DEFAULT_FILTERS.finalStatus);
-    stateFromHash.filters.strategyStatus = String(params.get('sessionStatus') || '');
+    stateFromHash.filters.strategyStatus = String(params.get('sessionStatus') || DEFAULT_FILTERS.strategyStatus);
     stateFromHash.filters.lookback = String(params.get('lookback') || DEFAULT_FILTERS.lookback);
     stateFromHash.filters.includeNonHard = params.get('includeNonHard') === '1';
     stateFromHash.selectedStrategySessionId = String(params.get('sessionId') || '') || null;
@@ -1569,7 +1569,7 @@ async function loadStrategyLineage(strategySessionId, { silent = false } = {}) {
 
 async function loadStrategySessionBundle(
     strategySessionId,
-    { silent = false, parts = { detail: true, timeseries: true, ledger: true, lineage: true } } = {},
+    { silent = false, parts = { detail: true, timeseries: true, ledger: true, lineage: false } } = {},
 ) {
     if (!PAGE.container || !state.currentAccount || !strategySessionId) return;
     const tasks = [];
@@ -2184,7 +2184,7 @@ function renderStrategyStudio() {
                         ${PAGE.strategyTimeseriesLoading ? '<span class="tca-refreshing">Refreshing…</span>' : ''}
                     </div>
                     ${renderMultiSeriesChart(
-        timeseries?.series?.pnl || [],
+        (timeseries?.series?.pnl?.length ? timeseries.series.pnl : (livePnl.sampledAt ? [{ ts: livePnl.sampledAt, netPnl: livePnl.netPnl || 0, realizedPnl: livePnl.realizedPnl || 0, unrealizedPnl: livePnl.unrealizedPnl || 0, openNotional: livePnl.openNotional || 0 }] : [])),
         [
             ['netPnl', 'Net', '#16a34a'],
             ['realizedPnl', 'Realized', '#0ea5e9'],
@@ -2221,7 +2221,7 @@ function renderStrategyStudio() {
                     <div class="tca-panel-head">
                         <div>
                             <div class="card-title">Execution Quality ${renderInfoHelp(INFO_TIPS.executionQuality)}</div>
-                            <div class="tca-panel-caption">Role-sliced arrival and markout quality. These metrics move when fills and markouts land, not on every heartbeat.</div>
+                            <div class="tca-panel-caption">Role-sliced arrival and markout quality.</div>
                         </div>
                     </div>
                     ${renderExecutionQualityGuide(detail?.anomalyCounts || {})}
@@ -2230,32 +2230,12 @@ function renderStrategyStudio() {
                 <div class="glass-card tca-panel">
                     <div class="tca-panel-head">
                         <div>
-                            <div class="card-title">State Timeline ${renderInfoHelp(INFO_TIPS.stateTimeline)}</div>
-                            <div class="tca-panel-caption">Runtime checkpoints and anomalies. Newest items are shown first.</div>
-                        </div>
-                    </div>
-                    ${renderStrategyTimeline(timeseries?.events || {}, detail?.anomalyCounts || {})}
-                </div>
-            </section>
-            <section class="tca-grid tca-strategy-grid">
-                <div class="glass-card tca-panel">
-                    <div class="tca-panel-head">
-                        <div>
-                            <div class="card-title">Lot Ledger</div>
-                            <div class="tca-panel-caption">Open lots, close allocations, and session PnL anomalies.</div>
+                            <div class="card-title">Trade Ledger</div>
+                            <div class="tca-panel-caption">Recent fills and PnL per trade.</div>
                         </div>
                         ${PAGE.strategyLedgerLoading ? '<span class="tca-refreshing">Refreshing…</span>' : ''}
                     </div>
                     ${renderStrategyLotLedger(ledger)}
-                </div>
-                <div class="glass-card tca-panel">
-                    <div class="tca-panel-head">
-                        <div>
-                            <div class="card-title">Lineage ${renderInfoHelp('Recursive graph from root scalper session through child sessions and submitted lifecycles. Loaded lazily so charts stay fast.')}</div>
-                            <div class="tca-panel-caption">Recursive root-session graph with anomaly counters.</div>
-                        </div>
-                    </div>
-                    ${detail ? renderLineageGraph(detail) : '<div class="tca-chart-empty">No lineage graph available for this strategy session.</div>'}
                 </div>
             </section>
         ` : '<section class="glass-card tca-panel"><div class="tca-chart-empty">No strategy session matches the current filter.</div></section>'}
@@ -2454,7 +2434,7 @@ function buildAnomalySummary(lifecycles) {
 }
 
 function renderRoleMetricCards(roleMetrics) {
-    const rows = Object.entries(roleMetrics || {});
+    const rows = Object.entries(roleMetrics || {}).filter(([role]) => role !== 'REPRICE');
     if (!rows.length) {
         return '<div class="tca-chart-empty">No role-sliced metrics available in this window yet. Quality needs fills plus sampled markouts, so live sessions can still have runtime PnL while this panel stays empty.</div>';
     }
@@ -2685,32 +2665,16 @@ function renderStrategyTimeline(events, anomalyCounts) {
 }
 
 function renderStrategyLotLedger(ledger) {
-    if (!ledger) return '<div class="tca-chart-empty">Select a strategy session to load its lot ledger.</div>';
-    const openLots = ledger.openLots || [];
+    if (!ledger) return '<div class="tca-chart-empty">Select a strategy session to load its trade ledger.</div>';
     const realizations = ledger.realizations || [];
-    const anomalies = ledger.anomalies || [];
+    if (!realizations.length) return '<div class="tca-chart-empty">No fills recorded yet.</div>';
     return `
         <div class="tca-ledger-block">
-            <div class="tca-ledger-title">Open Lots</div>
-            ${openLots.length ? `
-                <div class="tca-ledger-table">
-                    <div class="tca-ledger-row head"><span>Side</span><span>Open</span><span>Remain</span><span>Price</span></div>
-                    ${openLots.map((row) => `<div class="tca-ledger-row"><span>${escapeHtml(row.positionSide)}</span><span>${formatQty(row.openQty)}</span><span>${formatQty(row.remainingQty)}</span><span>${formatPrice(row.openPrice)}</span></div>`).join('')}
-                </div>
-            ` : '<div class="tca-muted-line">No open lots.</div>'}
-        </div>
-        <div class="tca-ledger-block">
-            <div class="tca-ledger-title">Recent Realizations</div>
-            ${realizations.length ? `
-                <div class="tca-ledger-table">
-                    <div class="tca-ledger-row head"><span>Qty</span><span>Open</span><span>Close</span><span>Net PnL</span></div>
-                    ${realizations.slice(0, 8).map((row) => `<div class="tca-ledger-row"><span>${formatQty(row.allocatedQty)}</span><span>${formatPrice(row.openPrice)}</span><span>${formatPrice(row.closePrice)}</span><span class="${formatPnlClass(row.netRealizedPnl || 0)}">${formatUsd(row.netRealizedPnl || 0, 2)}</span></div>`).join('')}
-                </div>
-            ` : '<div class="tca-muted-line">No close allocations yet.</div>'}
-        </div>
-        <div class="tca-ledger-block">
-            <div class="tca-ledger-title">Anomalies</div>
-            ${anomalies.length ? anomalies.map((row) => `<div class="tca-anomaly-banner">${escapeHtml(row.payload?.reason || 'UNKNOWN')} · ${row.sourceTs ? formatAbsoluteTime(row.sourceTs) : 'No timestamp'}</div>`).join('') : '<div class="tca-muted-line">No session PnL anomalies.</div>'}
+            <div class="tca-ledger-table">
+                <div class="tca-ledger-row head"><span>Qty</span><span>Entry</span><span>Exit</span><span>PnL</span></div>
+                ${realizations.slice(0, 15).map((row) => `<div class="tca-ledger-row"><span>${formatQty(row.allocatedQty)}</span><span>${formatPrice(row.openPrice)}</span><span>${formatPrice(row.closePrice)}</span><span class="${formatPnlClass(row.netRealizedPnl || 0)}">${formatUsd(row.netRealizedPnl || 0, 4)}</span></div>`).join('')}
+            </div>
+            ${realizations.length > 15 ? `<div class="tca-muted-line">${realizations.length - 15} more realization(s) not shown.</div>` : ''}
         </div>
     `;
 }
