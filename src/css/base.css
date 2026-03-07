@@ -297,6 +297,70 @@ body {
     width: 100%;
 }
 
+/* === Clickable Affordance ═══════════════════════ */
+.clickable,
+.compact-pos-row,
+/* position panel rows       */
+.oo-row,
+/* open-order rows           */
+.hist-dense-row,
+/* history dense rows        */
+.pos-hist-row,
+/* position history rows     */
+.pos-symbol-card,
+/* symbol rollup cards       */
+.idx-card,
+/* index cards               */
+.tca-leader-row-button,
+/* TCA strategy leaders      */
+.tca-strategy-card,
+/* TCA strategy sessions     */
+.tca-row-button,
+/* TCA lifecycle row buttons */
+.hist-lifecycle-btn,
+/* history → TCA lifecycle   */
+.hist-filter-toggle,
+/* filter accordion toggle   */
+.pos-sym-link {
+    /* position symbol links     */
+    cursor: pointer;
+    transition: background 0.15s, border-left-color 0.15s, transform 0.1s;
+    border-left: 2px solid rgba(99, 102, 241, 0.2);
+}
+
+.clickable:hover,
+.compact-pos-row:hover,
+.oo-row:hover,
+.hist-dense-row:hover,
+.pos-hist-row:hover,
+.pos-symbol-card:hover,
+.idx-card:hover,
+.tca-leader-row-button:hover,
+.tca-strategy-card:hover,
+.tca-row-button:hover,
+.hist-lifecycle-btn:hover,
+.hist-filter-toggle:hover,
+.pos-sym-link:hover {
+    background: var(--bg-card-hover, rgba(255, 255, 255, 0.04));
+    border-left-color: var(--accent);
+}
+
+.clickable:active,
+.compact-pos-row:active,
+.oo-row:active,
+.hist-dense-row:active,
+.pos-hist-row:active,
+.pos-symbol-card:active,
+.idx-card:active,
+.tca-leader-row-button:active,
+.tca-strategy-card:active,
+.tca-row-button:active,
+.hist-lifecycle-btn:active,
+.hist-filter-toggle:active,
+.pos-sym-link:active {
+    transform: scale(0.98);
+}
+
 /* === Inputs === */
 .input-group {
     margin-bottom: 14px;

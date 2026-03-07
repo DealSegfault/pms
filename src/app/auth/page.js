@@ -160,6 +160,7 @@ function renderRegisterForm(onAuthenticated) {
         <div class="input-group">
             <label>Password</label>
             <input type="password" id="reg-pass" placeholder="Choose a password" autocomplete="new-password" />
+            <div style="font-size:10px; color:var(--text-muted); margin-top:4px;">Min 8 characters, must include at least 1 number</div>
         </div>
         <button class="btn btn-primary btn-block" onclick="window._doRegister()">Register</button>
         <div id="auth-error" style="color: var(--red); font-size: 12px; text-align: center; margin-top: 10px;"></div>
@@ -172,6 +173,14 @@ function renderRegisterForm(onAuthenticated) {
 
         if (!username || !password) {
             errEl.textContent = 'Enter username and password';
+            return;
+        }
+        if (password.length < 8) {
+            errEl.textContent = 'Password must be at least 8 characters';
+            return;
+        }
+        if (!/[0-9]/.test(password)) {
+            errEl.textContent = 'Password must contain at least 1 number';
             return;
         }
 
