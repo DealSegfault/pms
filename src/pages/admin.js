@@ -398,10 +398,41 @@ async function renderUsersTab(container) {
   }
 }
 
-window._approveUser = async (id) => {
+window._approveUser = (id) => {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal-content">
+      <div class="modal-header">
+        <span class="modal-title">Approve User</span>
+        <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">×</button>
+      </div>
+      <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+        Set an initial balance to auto-create a sub-account.<br>Leave at 0 to approve without a balance.
+      </p>
+      <div class="input-group">
+        <label>Initial Balance (USDT)</label>
+        <input type="number" id="approve-balance" placeholder="0.00" value="0" step="0.01" min="0" inputmode="decimal" />
+      </div>
+      <button class="btn btn-primary btn-block" onclick="window._doApproveUser('${id}')">Approve</button>
+    </div>
+  `;
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  document.body.appendChild(overlay);
+};
+
+window._doApproveUser = async (id) => {
+  const balance = parseFloat(document.getElementById('approve-balance')?.value) || 0;
   try {
-    await api(`/auth/approve/${id}`, { method: 'POST' });
-    showToast('User approved', 'success');
+    const result = await api(`/auth/approve/${id}`, {
+      method: 'POST',
+      body: balance > 0 ? { initialBalance: balance } : {},
+    });
+    const msg = result.subAccount
+      ? `User approved with $${balance.toFixed(2)} balance`
+      : 'User approved';
+    showToast(msg, 'success');
+    document.querySelector('.modal-overlay')?.remove();
     renderTabContent();
   } catch (err) {
     showToast(err.message, 'error');

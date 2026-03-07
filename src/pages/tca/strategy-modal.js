@@ -619,29 +619,28 @@ export function closeTcaStrategyModal() {
 }
 
 async function loadStrategyPayload(subAccountId, strategySessionId) {
-    const timeseriesParams = new URLSearchParams({
-        series: 'pnl,quality',
+    // Combined endpoint: 1 HTTP call for detail + timeseries + ledger (was 3 separate calls)
+    // Plus 2 lightweight Redis calls for live layer state
+    const params = new URLSearchParams({
         maxPoints: String(DEFAULT_MAX_POINTS),
-        eventsPage: '1',
         eventsPageSize: String(DEFAULT_EVENTS_PAGE_SIZE),
     });
 
-    const [detailResult, timeseriesResult, ledgerResult, scalperResult, chaseResult] = await Promise.allSettled([
-        api(`/trade/tca/strategy-session/${subAccountId}/${strategySessionId}?includeLineage=0`),
-        api(`/trade/tca/strategy-session-timeseries/${subAccountId}/${strategySessionId}?${timeseriesParams.toString()}`),
-        api(`/trade/tca/strategy-session-lot-ledger/${subAccountId}/${strategySessionId}`),
+    const [combinedResult, scalperResult, chaseResult] = await Promise.allSettled([
+        api(`/trade/tca/strategy-modal-payload/${subAccountId}/${strategySessionId}?${params.toString()}`),
         api(`/trade/scalper/active/${subAccountId}`),
         api(`/trade/chase-limit/active/${subAccountId}`),
     ]);
 
-    if (detailResult.status !== 'fulfilled') throw detailResult.reason;
+    if (combinedResult.status !== 'fulfilled') throw combinedResult.reason;
+    const combined = combinedResult.value;
     const scalpers = scalperResult.status === 'fulfilled' && Array.isArray(scalperResult.value) ? scalperResult.value : [];
     const chases = chaseResult.status === 'fulfilled' && Array.isArray(chaseResult.value) ? chaseResult.value : [];
 
     return {
-        detail: detailResult.value,
-        timeseries: timeseriesResult.status === 'fulfilled' ? timeseriesResult.value : null,
-        ledger: ledgerResult.status === 'fulfilled' ? ledgerResult.value : null,
+        detail: combined.detail,
+        timeseries: combined.timeseries || null,
+        ledger: combined.ledger || null,
         activeLayers: {
             scalper: scalpers.find((row) => String(row.scalperId || '') === String(strategySessionId || '')) || null,
             chases: chases.filter((row) => String(row.parentScalperId || '') === String(strategySessionId || '')),

@@ -49,7 +49,7 @@ export function createEmbedSummarySource({
     getSubAccountId,
     getSymbol = null,
     getStrategySessionId = null,
-    intervalMs = 15000,
+    intervalMs = 45000,
 }) {
     let timer = null;
     let destroyed = false;
@@ -115,7 +115,7 @@ export function createEmbedSummarySource({
 }
 
 function mountWidget(container, source, render) {
-    if (!container || !source) return () => {};
+    if (!container || !source) return () => { };
     container.innerHTML = renderPlaceholder('Loading TCA…');
     const unsubscribe = source.subscribe((payload) => {
         container.innerHTML = render(payload);

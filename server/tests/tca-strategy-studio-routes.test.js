@@ -540,3 +540,116 @@ test('GET /trade/tca/embed-summary returns compact score-card, badge, and sparkl
         prisma.strategySessionPnlSample.findMany = originals.pnlFindMany;
     }
 });
+
+test('GET /trade/tca/strategy-modal-payload returns combined detail+timeseries+ledger in one call', { concurrency: false }, async () => {
+    const originals = {
+        queryRaw: prisma.$queryRaw,
+        strategySessionFindFirst: prisma.strategySession.findFirst,
+        strategyRollupFindFirst: prisma.strategyTcaRollup.findFirst,
+        runtimeFindUnique: prisma.algoRuntimeSession.findUnique,
+        pnlFindFirst: prisma.strategySessionPnlSample.findFirst,
+        pnlFindMany: prisma.strategySessionPnlSample.findMany,
+        paramFindFirst: prisma.strategySessionParamSample.findFirst,
+        paramFindMany: prisma.strategySessionParamSample.findMany,
+        checkpointCount: prisma.algoRuntimeCheckpoint.count,
+        checkpointFindMany: prisma.algoRuntimeCheckpoint.findMany,
+        lifecycleFindMany: prisma.orderLifecycle.findMany,
+        positionLotFindMany: prisma.strategyPositionLot.findMany,
+        lotRealizationFindMany: prisma.strategyLotRealization.findMany,
+        tcaAnomaly: prisma.tcaAnomaly,
+    };
+
+    prisma.$queryRaw = async (query) => {
+        const sql = query.strings.join(' ');
+        if (sql.includes('WITH unknown_roles AS')) {
+            return [{ strategySessionId: 'scalper-1', unknownRoleCount: 0, unknownLineageCount: 0, sessionPnlAnomalyCount: 0 }];
+        }
+        throw new Error(`Unexpected query: ${sql}`);
+    };
+
+    prisma.strategySession.findFirst = async () => ({
+        id: 'scalper-1', subAccountId: 'sub-1', origin: 'SCALPER', strategyType: 'SCALPER',
+        rootStrategySessionId: 'scalper-1', sessionRole: 'ROOT', symbol: 'BTCUSDT', side: 'LONG',
+        startedAt: new Date('2026-03-05T10:00:00.000Z'), updatedAt: new Date('2026-03-05T10:05:00.000Z'),
+        _count: { lifecycles: 2, rollups: 1 },
+    });
+    prisma.strategyTcaRollup.findFirst = async () => ({
+        strategySessionId: 'scalper-1', strategyType: 'SCALPER', rollupLevel: 'ROOT',
+        executionScope: 'SUB_ACCOUNT', ownershipConfidence: 'HARD',
+        fillCount: 3, realizedPnl: 10, unrealizedPnl: 2, netPnl: 12,
+        avgArrivalSlippageBps: 0.5, avgMarkout1sBps: -1, avgMarkout5sBps: -0.5,
+        updatedAt: new Date('2026-03-05T10:05:00.000Z'),
+    });
+    prisma.algoRuntimeSession.findUnique = async () => ({
+        strategySessionId: 'scalper-1', status: 'ACTIVE', resumePolicy: 'RECREATE_CHILD_ORDERS',
+        updatedAt: new Date('2026-03-05T10:05:00.000Z'),
+    });
+    prisma.strategySessionPnlSample.findFirst = async () => ({
+        strategySessionId: 'scalper-1', sampledAt: new Date('2026-03-05T10:05:00.000Z'), netPnl: 12,
+    });
+    prisma.strategySessionParamSample.findFirst = async () => ({
+        strategySessionId: 'scalper-1', sampledAt: new Date('2026-03-05T10:05:00.000Z'),
+    });
+    prisma.strategySessionPnlSample.findMany = async () => ([
+        { sampledAt: new Date('2026-03-05T10:00:01.000Z'), netPnl: 5, realizedPnl: 3, unrealizedPnl: 2, openQty: 1, openNotional: 100, feesTotal: 0.1, fillCount: 1, closeCount: 0 },
+        { sampledAt: new Date('2026-03-05T10:00:04.000Z'), netPnl: 12, realizedPnl: 10, unrealizedPnl: 2, openQty: 1, openNotional: 110, feesTotal: 0.2, fillCount: 3, closeCount: 1 },
+    ]);
+    prisma.strategySessionParamSample.findMany = async () => ([]);
+    prisma.algoRuntimeCheckpoint.count = async () => 1;
+    prisma.algoRuntimeCheckpoint.findMany = async () => ([
+        { checkpointTs: new Date('2026-03-05T10:00:03.000Z'), checkpointReason: 'HEARTBEAT', status: 'ACTIVE', checkpointSeq: 5 },
+    ]);
+    prisma.orderLifecycle.findMany = async () => ([]);
+    prisma.strategyPositionLot.findMany = async () => ([]);
+    prisma.strategyLotRealization.findMany = async () => ([]);
+    prisma.tcaAnomaly = {
+        ...(originals.tcaAnomaly || {}),
+        findMany: async () => ([]),
+    };
+
+    try {
+        await withTestServer(async (baseUrl) => {
+            const response = await fetch(`${baseUrl}/trade/tca/strategy-modal-payload/sub-1/scalper-1?maxPoints=180&eventsPageSize=8`);
+            assert.equal(response.status, 200);
+            const payload = await response.json();
+
+            // Verify combined structure
+            assert.ok(payload.detail, 'should have detail section');
+            assert.ok(payload.timeseries, 'should have timeseries section');
+            assert.ok(payload.ledger, 'should have ledger section');
+
+            // Verify detail content
+            assert.equal(payload.detail.strategySession.strategySessionId, 'scalper-1');
+            assert.equal(payload.detail.strategySession.strategyType, 'SCALPER');
+            assert.equal(payload.detail.runtime.status, 'ACTIVE');
+
+            // Verify timeseries has series data
+            assert.ok(Array.isArray(payload.timeseries.series.pnl), 'should have pnl series');
+            assert.equal(payload.timeseries.series.pnl.length, 1); // 2 rows bucketed to 1
+            assert.equal(payload.timeseries.events.items.length, 1);
+
+            // Verify ledger has arrays
+            assert.ok(Array.isArray(payload.ledger.openLots), 'should have openLots');
+            assert.ok(Array.isArray(payload.ledger.realizations), 'should have realizations');
+        });
+    } finally {
+        prisma.$queryRaw = originals.queryRaw;
+        prisma.strategySession.findFirst = originals.strategySessionFindFirst;
+        prisma.strategyTcaRollup.findFirst = originals.strategyRollupFindFirst;
+        prisma.algoRuntimeSession.findUnique = originals.runtimeFindUnique;
+        prisma.strategySessionPnlSample.findFirst = originals.pnlFindFirst;
+        prisma.strategySessionPnlSample.findMany = originals.pnlFindMany;
+        prisma.strategySessionParamSample.findFirst = originals.paramFindFirst;
+        prisma.strategySessionParamSample.findMany = originals.paramFindMany;
+        prisma.algoRuntimeCheckpoint.count = originals.checkpointCount;
+        prisma.algoRuntimeCheckpoint.findMany = originals.checkpointFindMany;
+        prisma.orderLifecycle.findMany = originals.lifecycleFindMany;
+        prisma.strategyPositionLot.findMany = originals.positionLotFindMany;
+        prisma.strategyLotRealization.findMany = originals.lotRealizationFindMany;
+        if (originals.tcaAnomaly === undefined) {
+            delete prisma.tcaAnomaly;
+        } else {
+            prisma.tcaAnomaly = originals.tcaAnomaly;
+        }
+    }
+});

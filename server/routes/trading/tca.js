@@ -2,6 +2,7 @@ import { Router } from 'express';
 import prisma from '../../db/prisma.js';
 import { buildApiErrorBody } from '../../http/api-taxonomy.js';
 import { requireOwnership } from '../../ownership.js';
+import { modalCache, embedCache } from '../../tca-modal-cache.js';
 import {
     bucketTimeSeries,
     buildLifecyclePageQuery,
@@ -422,6 +423,7 @@ router.get('/tca/strategy-session-timeseries/:subAccountId/:strategySessionId', 
                         ...(Object.keys(sampledAt).length ? { sampledAt } : {}),
                     },
                     orderBy: { sampledAt: 'asc' },
+                    take: 500,
                 })
                 : [],
             query.series.has('params')
@@ -431,6 +433,7 @@ router.get('/tca/strategy-session-timeseries/:subAccountId/:strategySessionId', 
                         ...(Object.keys(sampledAt).length ? { sampledAt } : {}),
                     },
                     orderBy: { sampledAt: 'asc' },
+                    take: 500,
                 })
                 : [],
             prisma.algoRuntimeCheckpoint.count({
@@ -457,14 +460,25 @@ router.get('/tca/strategy-session-timeseries/:subAccountId/:strategySessionId', 
                         subAccountId: req.params.subAccountId,
                         rootStrategySessionId: req.params.strategySessionId,
                     },
-                    include: {
+                    select: {
+                        orderRole: true,
+                        side: true,
+                        decisionMid: true,
+                        avgFillPrice: true,
                         fillFacts: {
                             where: Object.keys(fillTs).length ? { fillTs } : undefined,
-                            include: {
-                                markouts: true,
+                            select: {
+                                fillTs: true,
+                                markouts: {
+                                    select: {
+                                        horizonMs: true,
+                                        markoutBps: true,
+                                    },
+                                },
                             },
                         },
                     },
+                    take: 50,
                 })
                 : [],
         ]);
@@ -662,6 +676,11 @@ router.get('/tca/embed-summary/:subAccountId', requireOwnership(), async (req, r
         const symbol = normalizeSymbolFilter(req.query.symbol);
         const requestedStrategySessionId = req.query.strategySessionId ? String(req.query.strategySessionId) : null;
 
+        // ── Check embed cache ──
+        const embedCacheKey = `${req.params.subAccountId}:${symbol || ''}:${requestedStrategySessionId || ''}`;
+        const cachedEmbed = embedCache.get(embedCacheKey);
+        if (cachedEmbed) return res.json(cachedEmbed);
+
         const scoreCardRollup = await prisma.subAccountTcaRollup.findFirst({
             where: {
                 subAccountId: req.params.subAccountId,
@@ -732,7 +751,7 @@ router.get('/tca/embed-summary/:subAccountId', requireOwnership(), async (req, r
                 }));
         }
 
-        res.json({
+        const embedPayload = {
             subAccountId: req.params.subAccountId,
             scoreCard: scoreCardRollup ? {
                 executionScope: scoreCardRollup.executionScope,
@@ -760,7 +779,9 @@ router.get('/tca/embed-summary/:subAccountId', requireOwnership(), async (req, r
                 updatedAt: runtime?.updatedAt || strategyRollup?.updatedAt || strategySession.updatedAt,
             } : null,
             sparkline,
-        });
+        };
+        embedCache.set(embedCacheKey, embedPayload);
+        res.json(embedPayload);
     } catch (err) {
         res.status(500).json(buildApiErrorBody({
             code: 'TCA_EMBED_SUMMARY_READ_FAILED',
@@ -802,6 +823,232 @@ router.get('/tca/strategy-rollups/:subAccountId', requireOwnership(), async (req
             code: 'TCA_STRATEGY_ROLLUP_READ_FAILED',
             category: 'INFRA',
             message: err.message || 'Failed to read strategy rollups',
+            retryable: true,
+        }));
+    }
+});
+
+// ── Combined modal endpoint — merges strategy-session detail + timeseries + lot-ledger ──
+// Reduces 3 parallel HTTP calls to 1, with phased query execution to limit peak memory.
+router.get('/tca/strategy-modal-payload/:subAccountId/:strategySessionId', requireOwnership(), async (req, res) => {
+    try {
+        const { subAccountId, strategySessionId } = req.params;
+
+        // ── Check cache ──
+        const cacheKey = `${subAccountId}:${strategySessionId}`;
+        const cached = modalCache.get(cacheKey);
+        if (cached) return res.json(cached);
+
+        const executionScope = String(req.query.executionScope || 'SUB_ACCOUNT').toUpperCase();
+        const ownershipConfidence = String(req.query.ownershipConfidence || 'HARD').toUpperCase();
+        const maxPoints = Math.min(parseInt(req.query.maxPoints) || 180, 500);
+        const eventsPageSize = Math.min(parseInt(req.query.eventsPageSize) || 8, 50);
+
+        // ── Phase 1: Fast detail (6 queries) ──
+        const [strategySession, rollup, runtime, latestPnlSample, latestParamSample, anomalyCounts] = await Promise.all([
+            prisma.strategySession.findFirst({
+                where: { id: strategySessionId, subAccountId },
+                include: {
+                    _count: { select: { lifecycles: true, rollups: true } },
+                },
+            }),
+            prisma.strategyTcaRollup.findFirst({
+                where: { strategySessionId, executionScope, ownershipConfidence, rollupLevel: 'ROOT' },
+            }),
+            prisma.algoRuntimeSession.findUnique({
+                where: { strategySessionId },
+            }),
+            prisma.strategySessionPnlSample.findFirst({
+                where: { strategySessionId },
+                orderBy: { sampledAt: 'desc' },
+            }),
+            prisma.strategySessionParamSample.findFirst({
+                where: { strategySessionId },
+                orderBy: { sampledAt: 'desc' },
+            }),
+            loadRootAnomalyCounts(subAccountId, [strategySessionId]),
+        ]);
+
+        if (!strategySession) {
+            return res.status(404).json(buildApiErrorBody({
+                code: 'TCA_STRATEGY_SESSION_NOT_FOUND',
+                category: 'NOT_FOUND',
+                message: 'Strategy session not found',
+            }));
+        }
+
+        const qualityByRole = parseQualityByRole(rollup);
+        const counts = anomalyCounts.get(strategySessionId) || {
+            unknownRoleCount: 0,
+            unknownLineageCount: 0,
+            sessionPnlAnomalyCount: 0,
+        };
+
+        const detail = serializeStrategySessionDetail({
+            strategySession: { ...strategySession, origin: strategySession.origin, strategyType: strategySession.strategyType },
+            rollup,
+            qualityByRole,
+            runtime,
+            latestPnlSample,
+            latestParamSample,
+            anomalyCounts: counts,
+            lineageGraph: null, // skip lineage for modal speed
+        });
+
+        // ── Phase 2: Charts + ledger (7 queries, starts after Phase 1) ──
+        const [pnlRows, paramRows, checkpointTotal, checkpointRows, qualityLifecycles, openLots, realizations, anomalyRows] = await Promise.all([
+            prisma.strategySessionPnlSample.findMany({
+                where: { strategySessionId },
+                orderBy: { sampledAt: 'asc' },
+                take: maxPoints,
+            }),
+            prisma.strategySessionParamSample.findMany({
+                where: { strategySessionId },
+                orderBy: { sampledAt: 'asc' },
+                take: maxPoints,
+            }),
+            prisma.algoRuntimeCheckpoint.count({
+                where: { strategySessionId },
+            }),
+            prisma.algoRuntimeCheckpoint.findMany({
+                where: { strategySessionId },
+                orderBy: [{ checkpointTs: 'desc' }, { checkpointSeq: 'desc' }],
+                take: eventsPageSize,
+            }),
+            prisma.orderLifecycle.findMany({
+                where: { subAccountId, rootStrategySessionId: strategySessionId },
+                select: {
+                    orderRole: true,
+                    side: true,
+                    decisionMid: true,
+                    avgFillPrice: true,
+                    fillFacts: {
+                        select: {
+                            fillTs: true,
+                            markouts: { select: { horizonMs: true, markoutBps: true } },
+                        },
+                    },
+                },
+                take: 50,
+            }),
+            prisma.strategyPositionLot.findMany({
+                where: { subAccountId, rootStrategySessionId: strategySessionId },
+                orderBy: { openedTs: 'desc' },
+            }),
+            prisma.strategyLotRealization.findMany({
+                where: { subAccountId, rootStrategySessionId: strategySessionId },
+                orderBy: { realizedTs: 'desc' },
+                take: 200,
+            }),
+            prisma.tcaAnomaly.findMany({
+                where: { subAccountId, rootStrategySessionId: strategySessionId, anomalyType: 'SESSION_PNL' },
+                orderBy: [{ lastSeenAt: 'desc' }, { createdAt: 'desc' }],
+                take: 100,
+            }),
+        ]);
+
+        // ── Build timeseries payload ──
+        const pnlPoints = (pnlRows || []).map((row) => ({
+            ts: row.sampledAt, realizedPnl: row.realizedPnl, unrealizedPnl: row.unrealizedPnl,
+            netPnl: row.netPnl, openQty: row.openQty, openNotional: row.openNotional,
+            feesTotal: row.feesTotal, fillCount: row.fillCount, closeCount: row.closeCount,
+        }));
+        const paramPoints = (paramRows || []).map((row) => ({
+            ts: row.sampledAt, longOffsetPct: row.longOffsetPct, shortOffsetPct: row.shortOffsetPct,
+            skew: row.skew, longActiveSlots: row.longActiveSlots, shortActiveSlots: row.shortActiveSlots,
+            longPausedSlots: row.longPausedSlots, shortPausedSlots: row.shortPausedSlots,
+            longRetryingSlots: row.longRetryingSlots, shortRetryingSlots: row.shortRetryingSlots,
+            minFillSpreadPct: row.minFillSpreadPct, minRefillDelayMs: row.minRefillDelayMs,
+            maxLossPerCloseBps: row.maxLossPerCloseBps,
+        }));
+        const qualityPoints = [];
+        for (const lifecycle of qualityLifecycles || []) {
+            for (const fill of lifecycle.fillFacts || []) {
+                const mk1 = (fill.markouts || []).find((r) => r.horizonMs === 1000)?.markoutBps ?? null;
+                const mk5 = (fill.markouts || []).find((r) => r.horizonMs === 5000)?.markoutBps ?? null;
+                const mk30 = (fill.markouts || []).find((r) => r.horizonMs === 30000)?.markoutBps ?? null;
+                const benchmark = Number(lifecycle.decisionMid);
+                const avgFillPrice = Number(lifecycle.avgFillPrice);
+                const arrival = benchmark > 0 && avgFillPrice > 0
+                    ? (String(lifecycle.side || '').toUpperCase() === 'SELL'
+                        ? ((benchmark - avgFillPrice) / benchmark) * 10000
+                        : ((avgFillPrice - benchmark) / benchmark) * 10000)
+                    : null;
+                qualityPoints.push({
+                    ts: fill.fillTs, orderRole: lifecycle.orderRole || 'UNKNOWN',
+                    avgArrivalSlippageBps: arrival, avgMarkout1sBps: mk1, avgMarkout5sBps: mk5, avgMarkout30sBps: mk30,
+                });
+            }
+        }
+        const eventItems = (checkpointRows || []).map((row) => ({
+            ts: row.checkpointTs, type: row.checkpointReason, status: row.status, checkpointSeq: row.checkpointSeq,
+        }));
+        const eventTotalPages = checkpointTotal > 0 ? Math.ceil(checkpointTotal / eventsPageSize) : 0;
+
+        const qualityReducer = (bucket, items) => {
+            const avg = (field) => {
+                const values = items.map((item) => item[field]).filter(Number.isFinite);
+                if (!values.length) return null;
+                return values.reduce((sum, value) => sum + value, 0) / values.length;
+            };
+            return {
+                ts: new Date(bucket),
+                avgArrivalSlippageBps: avg('avgArrivalSlippageBps'),
+                avgMarkout1sBps: avg('avgMarkout1sBps'),
+                avgMarkout5sBps: avg('avgMarkout5sBps'),
+                avgMarkout30sBps: avg('avgMarkout30sBps'),
+            };
+        };
+
+        const defaultBucketMs = 5000;
+        const seriesPayload = {
+            pnl: bucketTimeSeries(pnlPoints, defaultBucketMs),
+            exposure: bucketTimeSeries(
+                pnlPoints.map((row) => ({ ts: row.ts, openQty: row.openQty, openNotional: row.openNotional })),
+                defaultBucketMs,
+            ),
+            params: bucketTimeSeries(paramPoints, defaultBucketMs),
+            quality: bucketTimeSeries(qualityPoints, defaultBucketMs, qualityReducer),
+        };
+
+        const timeseries = {
+            strategySessionId,
+            bucketMs: defaultBucketMs,
+            effectiveBucketMs: defaultBucketMs,
+            pointCount: Math.max(seriesPayload.pnl.length, seriesPayload.exposure.length, seriesPayload.params.length, seriesPayload.quality.length),
+            truncated: false,
+            range: { from: null, to: null },
+            series: seriesPayload,
+            events: {
+                items: eventItems, page: 1, pageSize: eventsPageSize,
+                total: checkpointTotal, totalPages: eventTotalPages,
+                hasPrev: false, hasNext: 1 < eventTotalPages,
+            },
+        };
+
+        // ── Build ledger payload ──
+        const ledger = serializeStrategyLotLedger({
+            strategySessionId,
+            openLots,
+            realizations,
+            anomalies: (anomalyRows || []).map((row) => {
+                let payload = null;
+                try { payload = row.payloadJson ? JSON.parse(row.payloadJson) : null; } catch { payload = null; }
+                return {
+                    anomalyId: row.id, anomalyKey: row.anomalyKey, lifecycleId: row.lifecycleId,
+                    sourceTs: row.sourceTs, status: row.status, severity: row.severity, payload,
+                };
+            }),
+        });
+
+        const result = { detail, timeseries, ledger };
+        modalCache.set(cacheKey, result);
+        res.json(result);
+    } catch (err) {
+        res.status(500).json(buildApiErrorBody({
+            code: 'TCA_STRATEGY_MODAL_PAYLOAD_READ_FAILED',
+            category: 'INFRA',
+            message: err.message || 'Failed to read strategy modal payload',
             retryable: true,
         }));
     }

@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { randomUUID } from 'crypto';
 import prisma from '../db/prisma.js';
 import {
     hashPassword, verifyPassword, generateToken, generateApiKey,
@@ -6,6 +7,7 @@ import {
 } from '../auth.js';
 import { validate } from '../middleware/validate.js';
 import { RegisterBody, LoginBody, UserIdParam } from '../contracts/auth.contracts.js';
+import { deriveRoutingPrefix } from '../routing-prefix.js';
 
 const router = Router();
 
@@ -132,14 +134,48 @@ router.get('/users', authMiddleware, adminMiddleware, async (req, res) => {
     }
 });
 
-/** Approve a user */
+/** Approve a user (optionally set initial balance → auto-creates sub-account) */
 router.post('/approve/:userId', authMiddleware, adminMiddleware, validate(UserIdParam, 'params'), async (req, res) => {
     try {
+        const { initialBalance } = req.body || {};
         const user = await prisma.user.update({
             where: { id: req.params.userId },
             data: { status: 'APPROVED' },
         });
-        res.json({ id: user.id, username: user.username, status: user.status });
+
+        let subAccount = null;
+        const bal = parseFloat(initialBalance);
+        if (bal && bal > 0) {
+            const id = randomUUID();
+            subAccount = await prisma.subAccount.create({
+                data: {
+                    id,
+                    name: user.username,
+                    type: 'USER',
+                    userId: user.id,
+                    routingPrefix: deriveRoutingPrefix(id),
+                    initialBalance: bal,
+                    currentBalance: bal,
+                },
+            });
+
+            await prisma.balanceLog.create({
+                data: {
+                    subAccountId: subAccount.id,
+                    balanceBefore: 0,
+                    balanceAfter: bal,
+                    changeAmount: bal,
+                    reason: 'DEPOSIT',
+                },
+            });
+        }
+
+        res.json({
+            id: user.id,
+            username: user.username,
+            status: user.status,
+            subAccount: subAccount ? { id: subAccount.id, name: subAccount.name, balance: subAccount.currentBalance } : null,
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
