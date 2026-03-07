@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 
 REPRICE_THROTTLE_MS = 10  # Minimum ms between reprices
 CHASE_REDIS_TTL = 86400     # 24h
+ACTIVE_CHASE_HASH_TTL = 90
+ACTIVE_CHASE_SWEEP_INTERVAL_S = 30.0
 
 
 # Symbol normalization delegated to contracts.common
@@ -91,6 +93,7 @@ class ChaseEngine:
         self._redis = redis_client
         self._active: Dict[str, ChaseState] = {}
         self._fill_checker_task: Optional[asyncio.Task] = None
+        self._redis_sweeper_task: Optional[asyncio.Task] = None
         # WS health check — set via set_ws_health_checker() after UserStream is created
         self._ws_healthy: Optional[Callable[[], bool]] = None
 
@@ -132,6 +135,8 @@ class ChaseEngine:
         if not self._fill_checker_task:
             self._fill_checker_task = asyncio.create_task(self._fill_checker_loop())
             logger.info("Chase fill checker started (adaptive: 1s when WS down, 5s when up)")
+        if self._redis and not self._redis_sweeper_task:
+            self._redis_sweeper_task = asyncio.create_task(self._redis_sweeper_loop())
 
     async def stop(self) -> None:
         """Stop background tasks."""
@@ -142,6 +147,13 @@ class ChaseEngine:
             except asyncio.CancelledError:
                 pass
             self._fill_checker_task = None
+        if self._redis_sweeper_task:
+            self._redis_sweeper_task.cancel()
+            try:
+                await self._redis_sweeper_task
+            except asyncio.CancelledError:
+                pass
+            self._redis_sweeper_task = None
 
     async def shutdown(self) -> None:
         """Stop background work and cancel any remaining active chases."""
@@ -470,7 +482,17 @@ class ChaseEngine:
         """Cancel a chase order."""
         state = self._active.get(chase_id)
         if not state:
-            return False
+            persisted = await self._load_persisted_state(chase_id)
+            if not persisted:
+                return False
+            await self._cleanup_redis_state(chase_id, persisted)
+            current_order_id = persisted.get("currentOrderClientId") or persisted.get("currentOrderId")
+            if current_order_id:
+                try:
+                    await self._om.cancel_order(current_order_id)
+                except Exception as e:
+                    logger.warning("Chase %s: persisted cancel_order error (non-fatal): %s", chase_id, e)
+            return True
 
         # ── FSM guard: validate transition ──
         try:
@@ -1015,8 +1037,10 @@ class ChaseEngine:
 
         # Remove chase state from Redis
         if self._redis:
-            await self._redis.delete(RedisKey.chase(state.id))
-            await self._redis.hdel(RedisKey.active_chase(state.sub_account_id), state.id)
+            await self._cleanup_redis_state(state.id, {
+                "subAccountId": state.sub_account_id,
+                "parentScalperId": state.parent_scalper_id,
+            })
 
         # NOTE: Don't remove from Redis open_orders here — let the feed's
         # CANCELED/FILLED event do it via on_order_update → _redis_remove_open_order.
@@ -1046,13 +1070,75 @@ class ChaseEngine:
             reduce_only=state.reduce_only,
             order_role=self._default_order_role(state),
             parent_scalper_id=state.parent_scalper_id,
+            current_order_client_id=state.current_order_id,
         )
         data_json = json.dumps(dto.to_dict())
         await self._redis.set(RedisKey.chase(state.id), data_json, ex=CHASE_REDIS_TTL)
         # Also write to per-account hash for bulk queries
         acct_key = RedisKey.active_chase(state.sub_account_id)
         await self._redis.hset(acct_key, state.id, data_json)
-        await self._redis.expire(acct_key, CHASE_REDIS_TTL)
+        await self._redis.expire(acct_key, ACTIVE_CHASE_HASH_TTL)
+        if state.parent_scalper_id:
+            child_key = RedisKey.scalper_children(state.parent_scalper_id)
+            await self._redis.sadd(child_key, state.id)
+            await self._redis.expire(child_key, CHASE_REDIS_TTL)
+
+    async def _load_persisted_state(self, chase_id: str) -> Optional[dict]:
+        if not self._redis:
+            return None
+        try:
+            raw = await self._redis.get(RedisKey.chase(chase_id))
+        except Exception:
+            return None
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    async def _cleanup_redis_state(self, chase_id: str, payload: dict) -> None:
+        if not self._redis:
+            return
+        sub_account_id = str(payload.get("subAccountId") or payload.get("sub_account_id") or "")
+        parent_scalper_id = payload.get("parentScalperId") or payload.get("parent_scalper_id")
+        await self._redis.delete(RedisKey.chase(chase_id))
+        if sub_account_id:
+            await self._redis.hdel(RedisKey.active_chase(sub_account_id), chase_id)
+        if parent_scalper_id:
+            await self._redis.srem(RedisKey.scalper_children(str(parent_scalper_id)), chase_id)
+
+    async def _redis_sweeper_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(ACTIVE_CHASE_SWEEP_INTERVAL_S)
+                await self._sweep_active_hashes()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.debug("Chase Redis sweeper skipped: %s", e)
+
+    async def _sweep_active_hashes(self) -> None:
+        if not self._redis:
+            return
+        keys = await self._redis.keys("pms:active_chase:*")
+        for key in keys or []:
+            entries = await self._redis.hgetall(key)
+            for chase_id, raw in (entries or {}).items():
+                payload = None
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    payload = None
+                durable = await self._redis.get(RedisKey.chase(chase_id))
+                if durable:
+                    try:
+                        durable_payload = json.loads(durable)
+                    except Exception:
+                        durable_payload = None
+                    if durable_payload and str(durable_payload.get("status") or "").upper() == "ACTIVE":
+                        continue
+                await self._cleanup_redis_state(chase_id, payload or {})
 
     async def _publish_event(self, event_type: str, state: ChaseState, **extra) -> None:
         """Publish chase event to Redis using typed event DTOs."""

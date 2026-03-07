@@ -370,6 +370,53 @@ async function getActiveFromRedis(prefix, subAccountId) {
     return items;
 }
 
+async function getStrategySamplesFromRedis(subAccountId, strategySessionId, limit = 180) {
+    const { getRedis } = await import('../../redis.js');
+    const redis = getRedis();
+    const key = `pms:strategy_samples:${strategySessionId}`;
+    const raw = await redis.lrange(key, 0, Math.max(0, limit - 1));
+    return (raw || [])
+        .map((value) => {
+            try {
+                return JSON.parse(value);
+            } catch {
+                return null;
+            }
+        })
+        .filter((item) => item && String(item.subAccountId || '') === String(subAccountId || ''))
+        .reverse();
+}
+
+router.get('/live/algo-state/:subAccountId', requireOwnership(), async (req, res) => {
+    try {
+        const [scalpers, chases] = await Promise.all([
+            getActiveFromRedis('pms:active_scalper', req.params.subAccountId),
+            getActiveFromRedis('pms:active_chase', req.params.subAccountId),
+        ]);
+        res.json({ scalpers, chases });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.get('/live/strategy-samples/:subAccountId/:strategySessionId', requireOwnership(), async (req, res) => {
+    try {
+        const points = Math.min(720, Math.max(10, Number.parseInt(req.query.points, 10) || 180));
+        const samples = await getStrategySamplesFromRedis(
+            req.params.subAccountId,
+            req.params.strategySessionId,
+            points,
+        );
+        res.json({
+            strategySessionId: req.params.strategySessionId,
+            subAccountId: req.params.subAccountId,
+            points: samples,
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Chase: Python to_dict() output passed through directly
 router.get('/chase-limit/active/:subAccountId', requireOwnership(), async (req, res) => {
     try {

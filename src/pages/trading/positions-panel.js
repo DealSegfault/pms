@@ -7,6 +7,7 @@ import * as S from './state.js';
 import { _refreshEquityUpnl } from './order-form.js';
 import { cancelTwap } from './twap.js';
 import { scheduleTradingRefresh } from './refresh-scheduler.js';
+import { primeLiveAlgoState } from './live-strategy-store.js';
 import { openTcaStrategyModal } from '../tca/strategy-modal.js';
 
 /** Compact notional formatter: $1.2K, $45.6K, $1.2M etc. */
@@ -164,13 +165,15 @@ export async function loadOpenOrders() {
     if (!list) return;
 
     try {
-        const [orders, twaps, trailStops, chaseOrders, scalpers] = await Promise.all([
+        const [orders, twaps, trailStops, liveAlgoState] = await Promise.all([
             api(`/trade/orders/${state.currentAccount}`),
             api(`/trade/twap/active/${state.currentAccount}`).catch(() => []),
             api(`/trade/trail-stop/active/${state.currentAccount}`).catch(() => []),
-            api(`/trade/chase-limit/active/${state.currentAccount}`).catch(() => []),
-            api(`/trade/scalper/active/${state.currentAccount}`).catch(() => []),
+            api(`/trade/live/algo-state/${state.currentAccount}`).catch(() => ({ scalpers: [], chases: [] })),
         ]);
+        const chaseOrders = Array.isArray(liveAlgoState?.chases) ? liveAlgoState.chases : [];
+        const scalpers = Array.isArray(liveAlgoState?.scalpers) ? liveAlgoState.scalpers : [];
+        primeLiveAlgoState(state.currentAccount, { scalpers, chases: chaseOrders });
 
         // Group child chases by parentScalperId for the drawer
         const scalperChildMap = new Map(); // scalperId → chase[]
@@ -191,6 +194,14 @@ export async function loadOpenOrders() {
             const ordersTabActive = document.getElementById('bp-orders')?.classList.contains('active');
             cancelAllBtn.style.display = (orders.length > 0 && ordersTabActive !== false) ? '' : 'none';
         }
+
+        // Toggle per-type cancel-all buttons
+        const cancelAllScalpersBtn = document.getElementById('cancel-all-scalpers');
+        const cancelAllTwapsBtn = document.getElementById('cancel-all-twaps');
+        const cancelAllChasesBtn = document.getElementById('cancel-all-chases');
+        if (cancelAllScalpersBtn) cancelAllScalpersBtn.style.display = scalpers.length > 0 ? '' : 'none';
+        if (cancelAllTwapsBtn) cancelAllTwapsBtn.style.display = twaps.length > 0 ? '' : 'none';
+        if (cancelAllChasesBtn) cancelAllChasesBtn.style.display = standaloneChases.length > 0 ? '' : 'none';
 
         if (totalCount === 0) {
             list.innerHTML = '<div style="padding:8px; color:var(--text-muted); text-align:center;">No open orders</div>';
@@ -509,6 +520,58 @@ export async function cancelAllOrders() {
     } finally {
         if (btn) { btn.disabled = false; btn.textContent = 'Cancel All'; }
     }
+}
+
+export async function cancelAllScalpers() {
+    const rows = document.querySelectorAll('[data-cancel-scalper]');
+    if (rows.length === 0) return showToast('No active scalpers', 'info');
+    if (!(await cuteConfirm({ title: `Stop ${rows.length} Scalper${rows.length > 1 ? 's' : ''}?`, message: 'All scalpers will be stopped (positions kept open).', confirmText: 'Stop All', danger: true }))) return;
+
+    const btn = document.getElementById('cancel-all-scalpers');
+    if (btn) { btn.disabled = true; btn.textContent = 'Stopping...'; }
+    showToast(`Stopping ${rows.length} scalper${rows.length > 1 ? 's' : ''}...`, 'info');
+    let ok = 0, fail = 0;
+    for (const el of rows) {
+        try { await api(`/trade/scalper/${el.dataset.cancelScalper}`, { method: 'DELETE' }); ok++; } catch { fail++; }
+    }
+    showToast(`${ok} scalper${ok !== 1 ? 's' : ''} stopped${fail ? `, ${fail} failed` : ''}`, ok > 0 ? 'success' : 'error');
+    scheduleTradingRefresh({ openOrders: true, annotations: true, forceAnnotations: true }, 40);
+    if (btn) { btn.disabled = false; btn.textContent = '⚔ Stop All'; }
+}
+
+export async function cancelAllTwaps() {
+    const rows = document.querySelectorAll('[data-cancel-twap]');
+    if (rows.length === 0) return showToast('No active TWAPs', 'info');
+    if (!(await cuteConfirm({ title: `Cancel ${rows.length} TWAP${rows.length > 1 ? 's' : ''}?`, message: 'All TWAPs will be cancelled.', confirmText: 'Cancel All', danger: true }))) return;
+
+    const btn = document.getElementById('cancel-all-twaps');
+    if (btn) { btn.disabled = true; btn.textContent = 'Cancelling...'; }
+    showToast(`Cancelling ${rows.length} TWAP${rows.length > 1 ? 's' : ''}...`, 'info');
+    let ok = 0, fail = 0;
+    for (const el of rows) {
+        try { await cancelTwap(el.dataset.cancelTwap); ok++; } catch { fail++; }
+    }
+    showToast(`${ok} TWAP${ok !== 1 ? 's' : ''} cancelled${fail ? `, ${fail} failed` : ''}`, ok > 0 ? 'success' : 'error');
+    scheduleTradingRefresh({ openOrders: true, annotations: true, forceAnnotations: true }, 40);
+    if (btn) { btn.disabled = false; btn.textContent = '⏱ Stop All'; }
+}
+
+export async function cancelAllChases() {
+    const rows = document.querySelectorAll('#open-orders-list > [data-chase-id] [data-cancel-chase]');
+    if (rows.length === 0) return showToast('No active chases', 'info');
+    if (!(await cuteConfirm({ title: `Cancel ${rows.length} Chase${rows.length > 1 ? 's' : ''}?`, message: 'All standalone chases will be cancelled.', confirmText: 'Cancel All', danger: true }))) return;
+
+    const btn = document.getElementById('cancel-all-chases');
+    if (btn) { btn.disabled = true; btn.textContent = 'Cancelling...'; }
+    showToast(`Cancelling ${rows.length} chase${rows.length > 1 ? 's' : ''}...`, 'info');
+    const { cancelChase } = await import('./chase-limit.js');
+    let ok = 0, fail = 0;
+    for (const el of rows) {
+        try { await cancelChase(el.dataset.cancelChase); ok++; } catch { fail++; }
+    }
+    showToast(`${ok} chase${ok !== 1 ? 's' : ''} cancelled${fail ? `, ${fail} failed` : ''}`, ok > 0 ? 'success' : 'error');
+    scheduleTradingRefresh({ openOrders: true, annotations: true, forceAnnotations: true }, 40);
+    if (btn) { btn.disabled = false; btn.textContent = '🎯 Stop All'; }
 }
 
 // ── Order Form Prefill ───────────────────────────

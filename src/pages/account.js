@@ -1,6 +1,11 @@
 import { state, api, formatUsd, formatPrice, formatPnlClass } from '../core/index.js';
 import { THEMES, getTheme, applyTheme } from '../css/theme-manager.js';
 import { cuteSeedling, cuteCrystalBall } from '../lib/cute-empty.js';
+import {
+  getShowChart, setShowChart,
+  getShowOrderbook, setShowOrderbook,
+  getNotifications, setNotifications,
+} from '../core/display-settings.js';
 
 let _botStatusInterval = null;
 let _botStatusListener = null;
@@ -189,6 +194,32 @@ export function renderAccountPage(container) {
           </button>
           <div id="webauthn-status" style="font-size:11px; margin-top:8px;"></div>
         </div>
+
+        <div style="border-top: 1px solid var(--border);"></div>
+
+        <!-- Trade Page Settings -->
+        <div class="acct-section-toggle" data-section="trade-display">
+          <span style="font-weight:600;">📊 Trade Page</span>
+          <span class="acct-chevron">▾</span>
+        </div>
+        <div class="acct-section-body" data-section="trade-display">
+          <div style="font-size:11px; color:var(--text-muted); margin-bottom:12px;">Toggle components on the trading page.</div>
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; padding:6px 0; user-select:none; font-size:12px; color:var(--text-primary);">
+            <input type="checkbox" id="ds-show-chart" ${getShowChart() ? 'checked' : ''}
+              style="accent-color:var(--accent); cursor:pointer; width:16px; height:16px;" />
+            Show Chart
+          </label>
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; padding:6px 0; user-select:none; font-size:12px; color:var(--text-primary);">
+            <input type="checkbox" id="ds-show-orderbook" ${getShowOrderbook() ? 'checked' : ''}
+              style="accent-color:var(--accent); cursor:pointer; width:16px; height:16px;" />
+            Show Orderbook
+          </label>
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; padding:6px 0; user-select:none; font-size:12px; color:var(--text-primary);">
+            <input type="checkbox" id="ds-notifications" ${getNotifications() ? 'checked' : ''}
+              style="accent-color:var(--accent); cursor:pointer; width:16px; height:16px;" />
+            Notifications (toasts &amp; sounds)
+          </label>
+        </div>
       </div>
 
     </div>
@@ -197,6 +228,11 @@ export function renderAccountPage(container) {
   loadAccountStats();
   initApiKeySection();
   initWebAuthnSection();
+
+  // Trade display settings
+  document.getElementById('ds-show-chart')?.addEventListener('change', (e) => setShowChart(e.target.checked));
+  document.getElementById('ds-show-orderbook')?.addEventListener('change', (e) => setShowOrderbook(e.target.checked));
+  document.getElementById('ds-notifications')?.addEventListener('change', (e) => setNotifications(e.target.checked));
 
   // 6a. Accordion section toggles
   document.querySelectorAll('.acct-section-toggle').forEach(toggle => {

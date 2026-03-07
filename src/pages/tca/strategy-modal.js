@@ -1,4 +1,10 @@
 import { api, formatPnlClass, formatUsd, showToast } from '../../core/index.js';
+import {
+    ensureLiveAlgoState,
+    ensureLiveStrategySamples,
+    getStrategyLiveState,
+    subscribeLiveStrategyStore,
+} from '../trading/live-strategy-store.js';
 
 const MODAL_ID = 'tca-strategy-modal-overlay';
 const DEFAULT_MAX_POINTS = 120;
@@ -14,6 +20,7 @@ let activeOverlay = null;
 let activeKeyHandler = null;
 let activeRequestSeq = 0;
 let activeModalState = null;
+let activeLiveStoreUnsubscribe = null;
 const activeControllers = new Set();
 
 function escapeHtml(value) {
@@ -73,6 +80,24 @@ function formatAbsoluteTime(value) {
     });
 }
 
+function isLiveRuntimeStatus(value) {
+    const status = String(value || '').toUpperCase();
+    return ['ACTIVE', 'PAUSED', 'PAUSED_RESTARTABLE', 'RESTARTING', 'LIVE'].includes(status);
+}
+
+function buildLivePnlPoints(samples = []) {
+    return (Array.isArray(samples) ? samples : [])
+        .map((sample) => ({
+            ts: sample.sampledAt instanceof Date ? sample.sampledAt : new Date(sample.sampledAt || Date.now()),
+            netPnl: Number(sample.netPnl || 0),
+            realizedPnl: Number(sample.realizedPnl || 0),
+            unrealizedPnl: Number(sample.unrealizedPnl || 0),
+            openQty: Number(sample.openQty || 0),
+            openNotional: Number(sample.openNotional || 0),
+        }))
+        .filter((sample) => !Number.isNaN(sample.ts.getTime()));
+}
+
 function toxicityScore(avgArrivalSlippageBps, avgMarkout1sBps, avgMarkout5sBps) {
     const clip = (value) => Math.min(50, Math.max(0, Number.isFinite(Number(value)) ? Number(value) : 0));
     const adverse1 = clip(-Number(avgMarkout1sBps));
@@ -95,15 +120,6 @@ function formatCompactPrice(value) {
     if (price >= 1) return `$${price.toFixed(4)}`;
     if (price >= 0.01) return `$${price.toFixed(5)}`;
     return `$${price.toFixed(6)}`;
-}
-
-function checkpointTone(row = {}) {
-    const type = String(row.type || '').toUpperCase();
-    const status = String(row.status || '').toUpperCase();
-    if (type.includes('FAIL') || status.includes('FAILED')) return 'is-bad';
-    if (type.includes('PAUSE') || status.includes('PAUSED')) return 'is-warn';
-    if (type.includes('STOP') || status.includes('CANCELLED')) return 'is-muted';
-    return 'is-good';
 }
 
 function _formatAxisValue(value, isBps = false) {
@@ -422,42 +438,6 @@ function renderRoleQuality(detail = {}) {
     `;
 }
 
-function renderCheckpointTimeline(timeseries = {}) {
-    const events = Array.isArray(timeseries?.events?.items) ? timeseries.events.items : [];
-    if (!events.length) {
-        return '';
-    }
-
-    const latestTone = checkpointTone(events[0] || {});
-    const latestType = String(events[0]?.type || 'EVENT').toUpperCase();
-
-    return `
-        <details class="glass-card tca-detail-card tca-checkpoint-drawer">
-            <summary class="tca-checkpoint-drawer-summary">
-                <div class="tca-checkpoint-drawer-head">
-                    <span class="card-title">Checkpoints</span>
-                    <span class="tca-checkpoint-pill ${latestTone}" style="font-size:9px;padding:3px 7px;">${escapeHtml(latestType)}</span>
-                    <span style="color:var(--text-muted);font-size:11px;">${events.length} event${events.length !== 1 ? 's' : ''}</span>
-                </div>
-                <span class="tca-checkpoint-drawer-arrow">▸</span>
-            </summary>
-            <div class="tca-timeline" style="padding:12px 16px 16px;">
-                ${events.map((row) => `
-                    <div class="tca-timeline-row tca-checkpoint-row ${checkpointTone(row)}">
-                        <div class="tca-timeline-meta">
-                            <strong><span class="tca-checkpoint-pill ${checkpointTone(row)}">${escapeHtml(row.type || 'EVENT')}</span></strong>
-                            <span class="tca-meta-pill">${escapeHtml(row.status || 'UNKNOWN')}</span>
-                        </div>
-                        <div class="tca-leader-subtitle">
-                            ${escapeHtml(formatRelativeTime(row.ts))} · ${escapeHtml(formatAbsoluteTime(row.ts))} · seq ${Number(row.checkpointSeq || 0)}
-                        </div>
-                    </div>
-                `).join('')}
-            </div>
-        </details>
-    `;
-}
-
 function renderLotLedger(ledger = {}, { omitWrapper = false } = {}) {
     const openLots = Array.isArray(ledger.openLots) ? ledger.openLots : [];
     const realizations = Array.isArray(ledger.realizations) ? ledger.realizations : [];
@@ -575,6 +555,56 @@ function renderChartCard(title, body, { caption = '', controls = '' } = {}) {
     `;
 }
 
+function renderQualitySummary(detail = {}, { loading = false, canLoadHistory = false, historyLimited = false } = {}) {
+    const rollup = detail?.rollup || {};
+    const body = `
+        <div class="tca-fill-list">
+            <div class="tca-fill-row">
+                <div class="tca-leader-title">
+                    <span>Arrival</span>
+                    <span class="${formatPnlClass(-(rollup.avgArrivalSlippageBps || 0))}">${formatBps(rollup.avgArrivalSlippageBps)}</span>
+                </div>
+                <div class="tca-leader-subtitle">Summary rollup from the root session.</div>
+            </div>
+            <div class="tca-fill-row">
+                <div class="tca-leader-title">
+                    <span>1s / 5s Markout</span>
+                    <span class="${formatPnlClass(rollup.avgMarkout5sBps || 0)}">${formatBps(rollup.avgMarkout1sBps)} / ${formatBps(rollup.avgMarkout5sBps)}</span>
+                </div>
+                <div class="tca-leader-subtitle">Historical quality is opt-in while the scalper is active.</div>
+            </div>
+            <div class="tca-fill-row">
+                <div class="tca-leader-title">
+                    <span>Toxicity</span>
+                    <span>${Number(rollup.toxicityScore || toxicityScore(
+        rollup.avgArrivalSlippageBps,
+        rollup.avgMarkout1sBps,
+        rollup.avgMarkout5sBps,
+    ) || 0).toFixed(2)}</span>
+                </div>
+                <div class="tca-leader-subtitle">${historyLimited ? 'History temporarily limited under memory pressure.' : 'Use history only when you need the exact curve.'}</div>
+            </div>
+        </div>
+    `;
+    const button = canLoadHistory
+        ? `
+            <button
+                type="button"
+                class="tca-meta-pill"
+                data-action="load-quality-history"
+                ${loading ? 'aria-busy="true"' : ''}
+                style="cursor:pointer;"
+            >${loading ? 'Loading history…' : 'Load quality history'}</button>
+        `
+        : '';
+    return `
+        <div style="display:flex;justify-content:flex-end;margin-bottom:10px;">
+            ${button}
+        </div>
+        ${body}
+    `;
+}
+
 function renderDeferredDrawer({
     role,
     title,
@@ -604,26 +634,30 @@ function renderTimeseriesSections(state) {
     const timeseries = state.timeseries || null;
     const pnlPoints = Array.isArray(timeseries?.series?.pnl) ? timeseries.series.pnl : [];
     const qualityPoints = Array.isArray(timeseries?.series?.quality) ? timeseries.series.quality : [];
+    const livePnlPoints = buildLivePnlPoints(state.liveSamples || []);
     const isLoading = Boolean(state.loadingTimeseries);
     const error = state.timeseriesError || null;
     const selectedRange = state.timeseriesRange || DEFAULT_RANGE_KEY;
+    const isActiveSession = Boolean(state.isActiveSession);
+    const useLivePnl = Boolean(isActiveSession && livePnlPoints.length && (!pnlPoints.length || error?.code === 'TCA_MEMORY_GUARD_ACTIVE' || !state.historyRequested));
     const rangeLabel = selectedRange === 'full'
         ? 'Full session window'
         : (selectedRange === '1h' ? 'Last 1 hour window' : 'Last 15 minute window');
     let body = '';
     let qualityBody = '';
 
-    if (timeseries) {
+    if (pnlPoints.length) {
         body = buildSeriesChart(pnlPoints, [
             ['netPnl', 'Net', '#16a34a'],
             ['realizedPnl', 'Realized', '#0ea5e9'],
             ['unrealizedPnl', 'Unrealized', '#f97316'],
         ], { yAxisLabel: 'USD' });
-        qualityBody = buildSeriesChart(qualityPoints, [
-            ['avgMarkout1sBps', '1s Markout', '#38bdf8'],
-            ['avgMarkout5sBps', '5s Markout', '#818cf8'],
-            ['avgArrivalSlippageBps', 'Arrival', '#fb7185'],
-        ], { yAxisLabel: 'bps', isBps: true });
+    } else if (useLivePnl) {
+        body = buildSeriesChart(livePnlPoints, [
+            ['netPnl', 'Net', '#16a34a'],
+            ['realizedPnl', 'Realized', '#0ea5e9'],
+            ['unrealizedPnl', 'Unrealized', '#f97316'],
+        ], { yAxisLabel: 'USD' });
     } else if (error) {
         const retryButton = error.code === 'TCA_MEMORY_GUARD_ACTIVE' && selectedRange !== DEFAULT_RANGE_KEY
             ? `
@@ -638,27 +672,51 @@ function renderTimeseriesSections(state) {
                 ${retryButton}
             </div>
         `;
-        qualityBody = body;
     } else if (isLoading) {
         body = '<div class="tca-chart-empty">Loading timeseries window…</div>';
-        qualityBody = '<div class="tca-chart-empty">Loading execution-quality window…</div>';
+    } else if (isActiveSession) {
+        body = '<div class="tca-chart-empty">Live samples are building for this active session…</div>';
     } else {
         body = '<div class="tca-chart-empty">Timeseries not loaded yet.</div>';
-        qualityBody = '<div class="tca-chart-empty">Execution-quality series not loaded yet.</div>';
     }
 
-    const loadingCaption = isLoading && (pnlPoints.length || qualityPoints.length)
+    if (qualityPoints.length) {
+        qualityBody = buildSeriesChart(qualityPoints, [
+            ['avgMarkout1sBps', '1s Markout', '#38bdf8'],
+            ['avgMarkout5sBps', '5s Markout', '#818cf8'],
+            ['avgArrivalSlippageBps', 'Arrival', '#fb7185'],
+        ], { yAxisLabel: 'bps', isBps: true });
+    } else if (state.qualityHistoryRequested && isLoading) {
+        qualityBody = '<div class="tca-chart-empty">Loading execution-quality history…</div>';
+    } else if (state.qualityHistoryRequested && error && !qualityPoints.length) {
+        qualityBody = `
+            <div class="tca-inline-error">
+                ${escapeHtml(error.message || 'Failed to load quality history.')}
+            </div>
+        `;
+    } else {
+        qualityBody = renderQualitySummary(state.detail, {
+            loading: state.qualityHistoryRequested && isLoading,
+            canLoadHistory: true,
+            historyLimited: error?.code === 'TCA_MEMORY_GUARD_ACTIVE',
+        });
+    }
+
+    const loadingCaption = isLoading && (pnlPoints.length || qualityPoints.length || livePnlPoints.length)
         ? `${rangeLabel} · refreshing`
-        : rangeLabel;
+        : (useLivePnl ? `${rangeLabel} · live sample buffer` : rangeLabel);
     const controls = renderTimeseriesRangeControls(selectedRange, isLoading);
+    const pnlCaption = useLivePnl && error?.code === 'TCA_MEMORY_GUARD_ACTIVE'
+        ? `${loadingCaption} · Live only`
+        : loadingCaption;
 
     return `
         ${renderChartCard('PnL Curve', body, {
-        caption: loadingCaption,
+        caption: pnlCaption,
         controls,
     })}
         ${renderChartCard('Execution Quality', qualityBody, {
-        caption: loadingCaption,
+        caption: state.qualityHistoryRequested ? loadingCaption : 'Historical quality remains manual on the trade page.',
     })}
     `;
 }
@@ -697,9 +755,9 @@ function renderActiveLayersSection(state) {
             <span class="tca-meta-pill">${chases.length} chases</span>
         `
         : '';
-    let body = '<div class="tca-chart-empty">Expand to load live Redis layer state.</div>';
+    let body = '<div class="tca-chart-empty">Live layer state will appear here once the execution stream is warm.</div>';
     if (state.loadingActiveLayers) {
-        body = '<div class="tca-chart-empty">Loading live layer state…</div>';
+        body = '<div class="tca-chart-empty">Connecting live execution state…</div>';
     } else if (state.activeLayersError) {
         body = `<div class="tca-inline-error">${escapeHtml(state.activeLayersError)}</div>`;
     } else if (state.activeLayers) {
@@ -708,7 +766,7 @@ function renderActiveLayersSection(state) {
     return renderDeferredDrawer({
         role: 'active-layers-details',
         title: 'Active Layers',
-        caption: 'Live chase ladders load only when this drawer is opened.',
+        caption: 'Driven from the live trading store, not a modal-only backend fetch.',
         open: Boolean(state.activeLayersOpen),
         badges,
         body,
@@ -720,7 +778,6 @@ function renderModalBody(state) {
     const strategySession = detail?.strategySession || {};
     const runtime = detail?.runtime || {};
     const rollup = detail?.rollup || {};
-    const timeseries = state.timeseries || null;
     const symbol = strategySession.symbol || 'Unknown';
     const strategyType = strategySession.strategyType || runtime.strategyType || rollup.strategyType || 'Strategy';
     const status = runtime.status || strategySession.status || 'UNKNOWN';
@@ -747,7 +804,6 @@ function renderModalBody(state) {
             ${renderActiveLayersSection(state)}
             ${renderInventorySection(state)}
             ${renderRoleQuality(detail)}
-            ${renderCheckpointTimeline(timeseries)}
         </div>
     `;
 }
@@ -804,12 +860,16 @@ function buildModalRequestPath(subAccountId, strategySessionId, params) {
     return `/trade/tca/strategy-modal-payload/${subAccountId}/${strategySessionId}?${params.toString()}`;
 }
 
-function buildTimeseriesParams(detail, rangeKey) {
+function buildTimeseriesParams(detail, rangeKey, { includeQuality = false, includeEvents = false } = {}) {
     const params = new URLSearchParams({
         sections: 'timeseries',
         maxPoints: String(DEFAULT_MAX_POINTS),
-        eventsPageSize: String(DEFAULT_EVENTS_PAGE_SIZE),
+        series: includeQuality ? 'pnl,params,quality,exposure' : 'pnl,params,exposure',
+        includeEvents: includeEvents ? '1' : '0',
     });
+    if (includeEvents) {
+        params.set('eventsPageSize', String(DEFAULT_EVENTS_PAGE_SIZE));
+    }
     const now = new Date();
     let from = null;
     if (rangeKey === 'full') {
@@ -824,6 +884,50 @@ function buildTimeseriesParams(detail, rangeKey) {
     if (from) params.set('from', from.toISOString());
     params.set('to', now.toISOString());
     return params;
+}
+
+function syncLiveStateFromStore(state, { render = true } = {}) {
+    const liveState = getStrategyLiveState(state.subAccountId, state.strategySessionId);
+    state.activeLayers = {
+        scalper: liveState.scalper || null,
+        chases: liveState.chases || [],
+    };
+    state.liveSamples = liveState.samples || [];
+    state.liveStoreReady = Boolean(liveState.bootstrapped);
+    if (render && isStateActive(state)) {
+        renderActiveModal();
+    }
+}
+
+async function bootstrapLiveExecutionState(state, { forceSamples = false } = {}) {
+    if (!isStateActive(state)) return;
+    state.loadingActiveLayers = !state.liveStoreReady;
+    state.loadingLiveSamples = forceSamples || !(state.liveSamples || []).length;
+    state.activeLayersError = '';
+    renderActiveModal();
+
+    try {
+        await ensureLiveAlgoState(state.subAccountId);
+        if (!isStateActive(state)) return;
+        syncLiveStateFromStore(state, { render: false });
+        if (forceSamples || !(state.liveSamples || []).length) {
+            await ensureLiveStrategySamples(state.subAccountId, state.strategySessionId, {
+                points: DEFAULT_MAX_POINTS,
+                force: forceSamples,
+            });
+        }
+        if (!isStateActive(state)) return;
+        syncLiveStateFromStore(state, { render: false });
+        state.loadingActiveLayers = false;
+        state.loadingLiveSamples = false;
+        renderActiveModal();
+    } catch (err) {
+        if (isAbortError(err) || !isStateActive(state)) return;
+        state.loadingActiveLayers = false;
+        state.loadingLiveSamples = false;
+        state.activeLayersError = err?.message || 'Failed to connect live execution state.';
+        renderActiveModal();
+    }
 }
 
 function renderActiveModal() {
@@ -867,16 +971,22 @@ function buildInitialModalState(subAccountId, strategySessionId, requestSeq) {
         timeseries: null,
         ledger: null,
         activeLayers: null,
+        liveSamples: [],
         loadingDetail: true,
         loadingTimeseries: false,
         loadingLedger: false,
         loadingActiveLayers: false,
+        loadingLiveSamples: false,
         detailError: '',
         timeseriesError: null,
         ledgerError: '',
         activeLayersError: '',
         inventoryOpen: false,
         activeLayersOpen: false,
+        isActiveSession: false,
+        historyRequested: false,
+        qualityHistoryRequested: false,
+        liveStoreReady: false,
         timeseriesRange: DEFAULT_RANGE_KEY,
         controllers: {},
     };
@@ -905,10 +1015,17 @@ async function loadDetailSection(state) {
         state.detail = payload?.detail || null;
         state.loadingDetail = false;
         state.detailError = state.detail ? '' : 'Strategy session not found';
+        const runtimeStatus = state.detail?.runtime?.status || state.detail?.strategySession?.status || '';
+        state.isActiveSession = isLiveRuntimeStatus(runtimeStatus);
         renderActiveModal();
         if (state.detail) {
             window.requestAnimationFrame(() => {
-                if (isStateActive(state) && !state.loadingTimeseries && !state.timeseries) {
+                if (!isStateActive(state)) return;
+                if (state.isActiveSession) {
+                    void bootstrapLiveExecutionState(state, { forceSamples: true });
+                    return;
+                }
+                if (!state.loadingTimeseries && !state.timeseries) {
                     void loadTimeseriesSection(state, DEFAULT_RANGE_KEY, { force: true });
                 }
             });
@@ -923,17 +1040,26 @@ async function loadDetailSection(state) {
     }
 }
 
-async function loadTimeseriesSection(state, rangeKey, { force = false } = {}) {
+async function loadTimeseriesSection(state, rangeKey, { force = false, includeQuality = false } = {}) {
     if (!state.detail) return;
     if (!force && state.loadingTimeseries && state.timeseriesRange === rangeKey) return;
 
+    state.historyRequested = true;
+    state.qualityHistoryRequested = state.qualityHistoryRequested || includeQuality;
     state.loadingTimeseries = true;
     state.timeseriesError = null;
     state.timeseriesRange = rangeKey;
     renderActiveModal();
 
     try {
-        const payload = await fetchModalPayload(state, 'timeseries', buildTimeseriesParams(state.detail, rangeKey));
+        const payload = await fetchModalPayload(
+            state,
+            'timeseries',
+            buildTimeseriesParams(state.detail, rangeKey, {
+                includeQuality: state.qualityHistoryRequested,
+                includeEvents: false,
+            }),
+        );
         if (!isStateActive(state)) return;
         state.timeseries = payload?.timeseries || null;
         state.loadingTimeseries = false;
@@ -975,41 +1101,8 @@ async function loadLedgerSection(state) {
 }
 
 async function loadActiveLayersSection(state) {
-    if (state.loadingActiveLayers || state.activeLayers) return;
-
-    state.loadingActiveLayers = true;
-    state.activeLayersError = '';
-    renderActiveModal();
-
-    const controller = createSectionController(state, 'activeLayers');
-    try {
-        const [scalpersResult, chasesResult] = await Promise.allSettled([
-            api(`/trade/scalper/active/${state.subAccountId}`, { signal: controller.signal }),
-            api(`/trade/chase-limit/active/${state.subAccountId}`, { signal: controller.signal }),
-        ]);
-        if (!isStateActive(state)) return;
-        const scalpers = scalpersResult.status === 'fulfilled' && Array.isArray(scalpersResult.value)
-            ? scalpersResult.value
-            : [];
-        const chases = chasesResult.status === 'fulfilled' && Array.isArray(chasesResult.value)
-            ? chasesResult.value
-            : [];
-        state.activeLayers = {
-            scalper: scalpers.find((row) => String(row.scalperId || '') === String(state.strategySessionId || '')) || null,
-            chases: chases.filter((row) => String(row.parentScalperId || '') === String(state.strategySessionId || '')),
-        };
-        state.loadingActiveLayers = false;
-        state.activeLayersError = '';
-        renderActiveModal();
-    } catch (err) {
-        if (isAbortError(err)) return;
-        if (!isStateActive(state)) return;
-        state.loadingActiveLayers = false;
-        state.activeLayersError = err?.message || 'Failed to load live layer state.';
-        renderActiveModal();
-    } finally {
-        clearSectionController(state, 'activeLayers', controller);
-    }
+    if (state.loadingActiveLayers && state.liveStoreReady) return;
+    await bootstrapLiveExecutionState(state, { forceSamples: false });
 }
 
 function bindOverlayEvents(overlay) {
@@ -1031,6 +1124,17 @@ function bindOverlayEvents(overlay) {
         if (retryButton && activeModalState) {
             event.preventDefault();
             void loadTimeseriesSection(activeModalState, DEFAULT_RANGE_KEY, { force: true });
+            return;
+        }
+
+        const qualityButton = target?.closest?.('[data-action="load-quality-history"]');
+        if (qualityButton && activeModalState) {
+            event.preventDefault();
+            void loadTimeseriesSection(
+                activeModalState,
+                activeModalState.timeseriesRange || DEFAULT_RANGE_KEY,
+                { force: true, includeQuality: true },
+            );
         }
     });
 }
@@ -1040,6 +1144,13 @@ function detachKeyHandler() {
         window.removeEventListener('keydown', activeKeyHandler);
         activeKeyHandler = null;
     }
+}
+
+function detachLiveStoreSubscription() {
+    if (typeof activeLiveStoreUnsubscribe === 'function') {
+        activeLiveStoreUnsubscribe();
+    }
+    activeLiveStoreUnsubscribe = null;
 }
 
 function abortActiveRequests() {
@@ -1055,6 +1166,7 @@ export function closeTcaStrategyModal() {
     activeOverlay = null;
     activeModalState = null;
     detachKeyHandler();
+    detachLiveStoreSubscription();
 }
 
 export async function openTcaStrategyModal({ subAccountId, strategySessionId } = {}) {
@@ -1077,6 +1189,12 @@ export async function openTcaStrategyModal({ subAccountId, strategySessionId } =
     document.body.appendChild(overlay);
     activeOverlay = overlay;
     activeModalState = buildInitialModalState(subAccountId, strategySessionId, requestSeq);
+    activeLiveStoreUnsubscribe = subscribeLiveStrategyStore(({ subAccountId: changedAccountId, strategySessionId: changedStrategySessionId }) => {
+        if (!activeModalState) return;
+        if (String(changedAccountId || '') !== String(activeModalState.subAccountId || '')) return;
+        if (changedStrategySessionId && String(changedStrategySessionId || '') !== String(activeModalState.strategySessionId || '')) return;
+        syncLiveStateFromStore(activeModalState);
+    });
     activeKeyHandler = (event) => {
         if (event.key === 'Escape') closeTcaStrategyModal();
     };

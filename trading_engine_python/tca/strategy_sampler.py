@@ -12,6 +12,9 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from contracts.common import EventType, RedisKey, ts_ms
+from contracts.events import StrategySampleEvent
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,7 +40,10 @@ def _to_datetime(value: Any) -> Optional[datetime]:
         return datetime.fromtimestamp(numeric, timezone.utc).replace(tzinfo=None)
     if isinstance(value, str):
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
         except ValueError:
             return None
     return None
@@ -54,11 +60,31 @@ def _mark_price(market_data: Any, symbol: str, fallback: float) -> float:
     return fallback
 
 
+def _build_in_clause(values: list[str]) -> tuple[str, tuple[str, ...]]:
+    if not values:
+        return "(NULL)", ()
+    return f"({','.join('?' for _ in values)})", tuple(values)
+
+
 class StrategySessionSampler:
-    def __init__(self, db: Any, market_data: Any = None, *, interval_sec: float = 5.0) -> None:
+    def __init__(
+        self,
+        db: Any,
+        market_data: Any = None,
+        redis_client: Any = None,
+        *,
+        interval_sec: float = 5.0,
+        db_interval_sec: float = 15.0,
+        live_retention_sec: int = 3600,
+        live_cap: int = 720,
+    ) -> None:
         self._db = db
         self._market_data = market_data
+        self._redis = redis_client
         self._interval_sec = interval_sec
+        self._db_interval_sec = max(interval_sec, db_interval_sec)
+        self._live_retention_sec = live_retention_sec
+        self._live_cap = max(60, live_cap)
 
     async def run(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
@@ -79,26 +105,16 @@ class StrategySessionSampler:
 
     async def sample_once(self) -> dict:
         if not self._db:
-            return {"pnl_samples": 0, "param_samples": 0}
+            return {"pnl_samples": 0, "param_samples": 0, "live_samples": 0}
 
-        sampled_at = _bucket_now(5_000)
-        sessions = await self._db.fetch_all(
-            """SELECT * FROM algo_runtime_sessions
-               WHERE strategy_type = ? AND status = ?""",
-            ("SCALPER", "ACTIVE"),
-        )
+        live_sampled_at = _bucket_now(5_000)
+        sampled_at = _bucket_now(int(self._db_interval_sec * 1000))
+        sessions = await self._load_active_sessions()
         if not sessions:
-            return {"pnl_samples": 0, "param_samples": 0}
+            return {"pnl_samples": 0, "param_samples": 0, "live_samples": 0}
 
-        open_lots = await self._db.fetch_all("SELECT * FROM strategy_position_lots WHERE status = ?", ("OPEN",))
-        realizations = await self._db.fetch_all("SELECT * FROM strategy_lot_realizations")
-        fill_counts = await self._db.fetch_all(
-            """SELECT l.root_strategy_session_id, COUNT(*) AS fill_count
-               FROM fill_facts f
-               JOIN order_lifecycles l ON l.id = f.lifecycle_id
-               WHERE l.root_strategy_session_id IS NOT NULL
-               GROUP BY l.root_strategy_session_id"""
-        )
+        session_ids = [str(session["strategy_session_id"]) for session in sessions if session.get("strategy_session_id")]
+        open_lots, realizations, fill_counts = await self._load_session_data(session_ids)
 
         open_by_session = defaultdict(list)
         for row in open_lots or []:
@@ -118,20 +134,12 @@ class StrategySessionSampler:
 
         pnl_samples = 0
         param_samples = 0
+        live_samples = 0
         for session in sessions:
-            checkpoint = await self._db.fetch_one(
-                """SELECT snapshot_json
-                   FROM algo_runtime_checkpoints
-                   WHERE strategy_session_id = ?
-                   ORDER BY checkpoint_seq DESC
-                   LIMIT 1""",
-                (session["strategy_session_id"],),
-            )
-            if not checkpoint or not checkpoint.get("snapshot_json"):
-                continue
-            try:
-                snapshot = json.loads(checkpoint["snapshot_json"])
-            except Exception:
+            snapshot = session.get("_snapshot")
+            if not snapshot:
+                snapshot = await self._load_checkpoint_snapshot(session["strategy_session_id"])
+            if not snapshot:
                 continue
 
             symbol = str(snapshot.get("symbol") or "")
@@ -168,6 +176,31 @@ class StrategySessionSampler:
             loss_count = sum(1 for value in close_totals.values() if value < 0)
             close_count = len(close_totals)
             net_pnl = realized_pnl + unrealized_pnl
+
+            sample_event = StrategySampleEvent(
+                strategy_session_id=session_id,
+                sub_account_id=session["sub_account_id"],
+                symbol=symbol,
+                status=str(snapshot.get("status") or "ACTIVE"),
+                sampled_at=ts_ms() if live_sampled_at is None else int(live_sampled_at.replace(tzinfo=timezone.utc).timestamp() * 1000),
+                net_pnl=net_pnl,
+                realized_pnl=realized_pnl,
+                unrealized_pnl=unrealized_pnl,
+                open_qty=open_qty,
+                open_notional=open_notional,
+                fill_count=fill_count_by_session.get(session_id, 0),
+                close_count=close_count,
+                win_count=win_count,
+                loss_count=loss_count,
+                long_active_slots=sum(1 for slot in (snapshot.get("longSlots") or []) if slot.get("active")),
+                short_active_slots=sum(1 for slot in (snapshot.get("shortSlots") or []) if slot.get("active")),
+                long_paused_slots=sum(1 for slot in (snapshot.get("longSlots") or []) if slot.get("paused")),
+                short_paused_slots=sum(1 for slot in (snapshot.get("shortSlots") or []) if slot.get("paused")),
+                long_retrying_slots=sum(1 for slot in (snapshot.get("longSlots") or []) if slot.get("retryAt")),
+                short_retrying_slots=sum(1 for slot in (snapshot.get("shortSlots") or []) if slot.get("retryAt")),
+            )
+            if await self._publish_live_sample(sample_event):
+                live_samples += 1
 
             await self._db.execute(
                 """INSERT INTO strategy_session_pnl_samples
@@ -260,4 +293,112 @@ class StrategySessionSampler:
             )
             param_samples += 1
 
-        return {"pnl_samples": pnl_samples, "param_samples": param_samples}
+        return {"pnl_samples": pnl_samples, "param_samples": param_samples, "live_samples": live_samples}
+
+    async def _load_active_sessions(self) -> list[dict]:
+        sessions = await self._load_active_sessions_from_redis()
+        if sessions:
+            return sessions
+        return await self._db.fetch_all(
+            """SELECT * FROM algo_runtime_sessions
+               WHERE strategy_type = ? AND status = ?""",
+            ("SCALPER", "ACTIVE"),
+        )
+
+    async def _load_active_sessions_from_redis(self) -> list[dict]:
+        if not self._redis:
+            return []
+
+        snapshots: list[dict] = []
+        try:
+            active_keys = await self._redis.keys("pms:active_scalper:*")
+        except Exception:
+            return []
+
+        seen: set[str] = set()
+        for key in active_keys or []:
+            try:
+                entries = await self._redis.hgetall(key)
+            except Exception:
+                continue
+            for raw_state in (entries or {}).values():
+                try:
+                    slim = json.loads(raw_state)
+                except Exception:
+                    continue
+                strategy_session_id = str(slim.get("scalperId") or "")
+                sub_account_id = str(slim.get("subAccountId") or "")
+                if not strategy_session_id or not sub_account_id or strategy_session_id in seen:
+                    continue
+                try:
+                    runtime_json = await self._redis.get(RedisKey.scalper(strategy_session_id))
+                except Exception:
+                    runtime_json = None
+                if not runtime_json:
+                    continue
+                try:
+                    snapshot = json.loads(runtime_json)
+                except Exception:
+                    continue
+                if str(snapshot.get("status") or "").upper() != "ACTIVE":
+                    continue
+                seen.add(strategy_session_id)
+                snapshots.append({
+                    "strategy_session_id": strategy_session_id,
+                    "sub_account_id": sub_account_id,
+                    "_snapshot": snapshot,
+                })
+        return snapshots
+
+    async def _load_session_data(self, session_ids: list[str]) -> tuple[list[dict], list[dict], list[dict]]:
+        in_clause, params = _build_in_clause(session_ids)
+        open_lots = await self._db.fetch_all(
+            f"""SELECT * FROM strategy_position_lots
+                WHERE status = ? AND root_strategy_session_id IN {in_clause}""",
+            ("OPEN", *params),
+        )
+        realizations = await self._db.fetch_all(
+            f"SELECT * FROM strategy_lot_realizations WHERE root_strategy_session_id IN {in_clause}",
+            params,
+        )
+        fill_counts = await self._db.fetch_all(
+            f"""SELECT l.root_strategy_session_id, COUNT(*) AS fill_count
+                FROM fill_facts f
+                JOIN order_lifecycles l ON l.id = f.lifecycle_id
+                WHERE l.root_strategy_session_id IN {in_clause}
+                GROUP BY l.root_strategy_session_id""",
+            params,
+        )
+        return open_lots or [], realizations or [], fill_counts or []
+
+    async def _load_checkpoint_snapshot(self, strategy_session_id: str) -> Optional[dict]:
+        checkpoint = await self._db.fetch_one(
+            """SELECT snapshot_json
+               FROM algo_runtime_checkpoints
+               WHERE strategy_session_id = ?
+               ORDER BY checkpoint_seq DESC
+               LIMIT 1""",
+            (strategy_session_id,),
+        )
+        if not checkpoint or not checkpoint.get("snapshot_json"):
+            return None
+        try:
+            return json.loads(checkpoint["snapshot_json"])
+        except Exception:
+            return None
+
+    async def _publish_live_sample(self, event: StrategySampleEvent) -> bool:
+        if not self._redis:
+            return False
+        payload = event.to_dict()
+        encoded = json.dumps(payload, sort_keys=True)
+        try:
+            key = RedisKey.strategy_samples(event.strategy_session_id)
+            await self._redis.lpush(key, encoded)
+            await self._redis.ltrim(key, 0, self._live_cap - 1)
+            await self._redis.expire(key, self._live_retention_sec)
+            await self._redis.publish(RedisKey.event_channel(EventType.STRATEGY_SAMPLE), encoded)
+            return True
+        except Exception as exc:
+            logger.debug("StrategySessionSampler live publish skipped for %s: %s", event.strategy_session_id, exc)
+            return False

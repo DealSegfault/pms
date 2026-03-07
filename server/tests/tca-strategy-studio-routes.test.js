@@ -441,7 +441,7 @@ test('GET /trade/tca/strategy-session-timeseries and lot-ledger expose chart/led
     try {
         await withTestServer(async (baseUrl) => {
             const [timeseriesRes, ledgerRes] = await Promise.all([
-                fetch(`${baseUrl}/trade/tca/strategy-session-timeseries/sub-1/scalper-1?series=pnl,params,quality,exposure&from=2026-03-05T10:00:00.000Z&to=2026-03-05T10:00:10.000Z&bucketMs=5000`),
+                fetch(`${baseUrl}/trade/tca/strategy-session-timeseries/sub-1/scalper-1?series=pnl,params,quality,exposure&includeEvents=1&from=2026-03-05T10:00:00.000Z&to=2026-03-05T10:00:10.000Z&bucketMs=5000`),
                 fetch(`${baseUrl}/trade/tca/strategy-session-lot-ledger/sub-1/scalper-1`),
             ]);
             assert.equal(timeseriesRes.status, 200);
@@ -625,7 +625,7 @@ test('GET /trade/tca/strategy-modal-payload returns combined detail+timeseries+l
 
     try {
         await withTestServer(async (baseUrl) => {
-            const response = await fetch(`${baseUrl}/trade/tca/strategy-modal-payload/sub-1/scalper-1?maxPoints=180&eventsPageSize=8`);
+            const response = await fetch(`${baseUrl}/trade/tca/strategy-modal-payload/sub-1/scalper-1?sections=detail,timeseries,ledger&series=pnl,params,quality,exposure&includeEvents=1&maxPoints=180&eventsPageSize=8`);
             assert.equal(response.status, 200);
             const payload = await response.json();
 

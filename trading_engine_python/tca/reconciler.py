@@ -33,7 +33,10 @@ def _to_datetime(value: Any) -> Optional[datetime]:
         return datetime.fromtimestamp(ts, timezone.utc).replace(tzinfo=None)
     if isinstance(value, str):
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
         except ValueError:
             try:
                 numeric = float(value)
@@ -53,11 +56,13 @@ class TCAReconciler:
         interval_sec: float = 30.0,
         intent_stale_after_sec: float = 15.0,
         working_stale_after_sec: float = 60.0,
+        batch_size: int = 500,
     ) -> None:
         self._db = db
         self._interval_sec = interval_sec
         self._intent_stale_after_sec = intent_stale_after_sec
         self._working_stale_after_sec = working_stale_after_sec
+        self._batch_size = max(50, batch_size)
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Periodic reconcile loop."""
@@ -82,7 +87,10 @@ class TCAReconciler:
         rows = await self._db.fetch_all(
             """SELECT * FROM order_lifecycles
                WHERE final_status IS NULL
-                  OR reconciliation_status IN ('PENDING', 'LIVE', 'STALE', 'AMBIGUOUS')"""
+                  OR reconciliation_status IN ('PENDING', 'LIVE', 'STALE', 'AMBIGUOUS')
+               ORDER BY COALESCE(last_reconciled_at, created_at) ASC, created_at ASC
+               LIMIT ?""",
+            (self._batch_size,),
         )
 
         summary = {"touched": 0, "stale": 0, "ambiguous": 0, "recovered": 0, "live": 0}
@@ -223,10 +231,6 @@ class TCAReconciler:
         existing_status = row.get("reconciliation_status")
         existing_reason = row.get("reconciliation_reason")
         if existing_status == status and existing_reason == reason:
-            await self._db.execute(
-                "UPDATE order_lifecycles SET last_reconciled_at = ? WHERE id = ?",
-                (_now_utc(), row["id"]),
-            )
             return None
 
         now = _now_utc()
@@ -253,4 +257,3 @@ class TCAReconciler:
             ),
         )
         return outcome
-

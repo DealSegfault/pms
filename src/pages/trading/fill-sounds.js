@@ -11,6 +11,8 @@
  *   playFillSound('LONG');   // or 'SHORT'
  */
 
+import { getNotifications } from '../../core/display-settings.js';
+
 let _ctx = null;
 
 /**
@@ -103,8 +105,10 @@ async function playShortFill() {
  *
  * @param {'LONG'|'SHORT'|'buy'|'sell'} side
  */
+
 export async function playFillSound(side) {
     try {
+        if (!getNotifications()) return;
         const s = String(side || '').toUpperCase();
         if (s === 'LONG' || s === 'BUY') {
             await playLongFill();

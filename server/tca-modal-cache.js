@@ -37,6 +37,8 @@ export function buildTcaCacheKey({
     to = '',
     bucketMs = '',
     maxPoints = '',
+    series = '',
+    includeEvents = '',
     eventsPage = '',
     eventsPageSize = '',
 } = {}) {
@@ -53,6 +55,8 @@ export function buildTcaCacheKey({
         normalizeKeyPart(to),
         normalizeKeyPart(bucketMs),
         normalizeKeyPart(maxPoints),
+        normalizeKeyPart(series),
+        normalizeKeyPart(includeEvents),
         normalizeKeyPart(eventsPage),
         normalizeKeyPart(eventsPageSize),
     ].join('|');

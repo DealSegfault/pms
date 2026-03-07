@@ -4,6 +4,12 @@ import { cuteKey, cuteSadFace, cuteSpinner } from '../lib/cute-empty.js';
 import { createTcaInstrumentation } from './tca/instrumentation.js';
 import { ensureTcaPageShell, ensureTcaStrategyShell, patchTcaRegion } from './tca/render-islands.js';
 import { openTcaStrategyModal } from './tca/strategy-modal.js';
+import {
+    ensureLiveAlgoState,
+    ensureLiveStrategySamples,
+    getStrategyLiveState,
+    subscribeLiveStrategyStore,
+} from './trading/live-strategy-store.js';
 
 const TCA_TABS = new Set(['overview', 'lifecycles', 'strategies']);
 const DEFAULT_TAB = 'overview';
@@ -18,7 +24,17 @@ const DEFAULT_TIMELINE_PAGE_SIZE = 10;
 
 const WS_LIFECYCLE_EVENTS = ['order_placed', 'order_active', 'order_filled', 'order_cancelled', 'order_failed'];
 const WS_OVERVIEW_EVENTS = ['order_filled', 'order_cancelled', 'order_failed'];
-const WS_STRATEGY_EVENTS = ['scalper_progress', 'scalper_filled', 'order_filled', 'order_cancelled', 'pnl_update', 'position_updated', 'position_closed'];
+const WS_STRATEGY_EVENTS = [
+    'scalper_progress',
+    'scalper_filled',
+    'scalper_cancelled',
+    'strategy_sample',
+    'order_filled',
+    'order_cancelled',
+    'pnl_update',
+    'position_updated',
+    'position_closed',
+];
 
 const DEFAULT_FILTERS = {
     symbol: '',
@@ -109,6 +125,7 @@ const PAGE = {
     strategyTimeseries: null,
     strategyLedger: null,
     unsubscribe: null,
+    liveStoreUnsubscribe: null,
     refreshTimer: null,
     strategyLiveTimer: null,
     inputTimer: null,
@@ -298,6 +315,9 @@ export function renderTcaPage(container) {
             loadInitialData();
         }
     });
+    PAGE.liveStoreUnsubscribe = subscribeLiveStrategyStore((change) => {
+        handleStrategyLiveStoreChange(change);
+    });
 
     PAGE.refreshTimer = setInterval(() => {
         if (!PAGE.container || !location.hash.startsWith('#/tca')) return;
@@ -309,11 +329,7 @@ export function renderTcaPage(container) {
         if (!PAGE.container || PAGE.tab !== 'strategies' || !PAGE.selectedStrategySessionId) return;
         if (!isSelectedStrategyLive()) return;
         PAGE.instrumentation.recordSchedule('timer.strategy-live', { delayMs: 5000, source: 'interval' });
-        loadStrategyPage({ silent: true });
-        loadStrategySessionBundle(PAGE.selectedStrategySessionId, {
-            silent: true,
-            parts: { detail: false, timeseries: true, ledger: false, lineage: false },
-        });
+        void ensureSelectedStrategyLiveHydrated();
     }, 5000);
 
     PAGE._lifecycleHandler = (e) => {
@@ -379,6 +395,7 @@ export function cleanup() {
     if (PAGE.wsStrategyListTimer) clearTimeout(PAGE.wsStrategyListTimer);
     if (PAGE.wsStrategyDetailTimer) clearTimeout(PAGE.wsStrategyDetailTimer);
     if (PAGE.unsubscribe) PAGE.unsubscribe();
+    if (PAGE.liveStoreUnsubscribe) PAGE.liveStoreUnsubscribe();
 
     if (PAGE.controllers.overview) PAGE.controllers.overview.abort();
     if (PAGE.controllers.lifecycles) PAGE.controllers.lifecycles.abort();
@@ -403,6 +420,7 @@ export function cleanup() {
 
     PAGE.container = null;
     PAGE.unsubscribe = null;
+    PAGE.liveStoreUnsubscribe = null;
     PAGE.refreshTimer = null;
     PAGE.strategyLiveTimer = null;
     PAGE.inputTimer = null;
@@ -533,6 +551,194 @@ function isSelectedStrategyLive() {
     const selected = PAGE.strategyPage.items.find((row) => row.strategySessionId === PAGE.selectedStrategySessionId);
     const runtimeStatus = PAGE.strategyDetail?.runtime?.status || selected?.runtimeStatus || '';
     return String(runtimeStatus).toUpperCase() === 'ACTIVE';
+}
+
+function eventStrategySessionId(detail) {
+    return detail?.strategySessionId
+        || detail?.strategy_session_id
+        || detail?.scalperId
+        || detail?.scalper_id
+        || null;
+}
+
+function normalizeStrategySampleTime(value) {
+    const date = value instanceof Date ? value : new Date(value || Date.now());
+    return Number.isNaN(date.getTime()) ? new Date() : date;
+}
+
+function mergeSortedSeriesPoints(points = [], incoming = [], maxPoints = 300) {
+    const lookbackStart = getLookbackStart(PAGE.filters.lookback)?.getTime() || null;
+    const merged = new Map();
+    for (const row of [...(Array.isArray(points) ? points : []), ...(Array.isArray(incoming) ? incoming : [])]) {
+        if (!row) continue;
+        const ts = normalizeStrategySampleTime(row.ts);
+        const tsMs = ts.getTime();
+        if (lookbackStart && tsMs < lookbackStart) continue;
+        const previous = merged.get(tsMs) || {};
+        merged.set(tsMs, { ...previous, ...row, ts });
+    }
+    return Array.from(merged.entries())
+        .sort((left, right) => left[0] - right[0])
+        .slice(-Math.max(24, maxPoints))
+        .map((entry) => entry[1]);
+}
+
+function toLivePnlPoint(sample) {
+    return {
+        ts: normalizeStrategySampleTime(sample.sampledAt),
+        realizedPnl: Number(sample.realizedPnl || 0),
+        unrealizedPnl: Number(sample.unrealizedPnl || 0),
+        netPnl: Number(sample.netPnl || 0),
+        openQty: Number(sample.openQty || 0),
+        openNotional: Number(sample.openNotional || 0),
+        fillCount: Number(sample.fillCount || 0),
+        closeCount: Number(sample.closeCount || 0),
+    };
+}
+
+function toLiveParamPoint(sample) {
+    return {
+        ts: normalizeStrategySampleTime(sample.sampledAt),
+        longActiveSlots: Number(sample.longActiveSlots || 0),
+        shortActiveSlots: Number(sample.shortActiveSlots || 0),
+        longPausedSlots: Number(sample.longPausedSlots || 0),
+        shortPausedSlots: Number(sample.shortPausedSlots || 0),
+        longRetryingSlots: Number(sample.longRetryingSlots || 0),
+        shortRetryingSlots: Number(sample.shortRetryingSlots || 0),
+    };
+}
+
+function toSparklinePoint(sample) {
+    return {
+        ts: normalizeStrategySampleTime(sample.sampledAt),
+        value: Number(sample.netPnl || 0),
+    };
+}
+
+function mergeStrategyCardSparkline(existing = [], samples = []) {
+    return mergeSortedSeriesPoints(existing, samples.map((sample) => toSparklinePoint(sample)), 30)
+        .map((row) => ({ ts: row.ts, value: Number(row.value || 0) }));
+}
+
+function buildLatestPnlSample(sample) {
+    return {
+        sampledAt: normalizeStrategySampleTime(sample.sampledAt),
+        realizedPnl: Number(sample.realizedPnl || 0),
+        unrealizedPnl: Number(sample.unrealizedPnl || 0),
+        netPnl: Number(sample.netPnl || 0),
+        openQty: Number(sample.openQty || 0),
+        openNotional: Number(sample.openNotional || 0),
+        fillCount: Number(sample.fillCount || 0),
+        closeCount: Number(sample.closeCount || 0),
+        winCount: Number(sample.winCount || 0),
+        lossCount: Number(sample.lossCount || 0),
+    };
+}
+
+function applyStrategyLiveState(strategySessionId) {
+    if (!PAGE.container || !state.currentAccount || !strategySessionId) return false;
+    const liveState = getStrategyLiveState(state.currentAccount, strategySessionId);
+    const samples = Array.isArray(liveState.samples) ? liveState.samples : [];
+    const latestSample = samples[samples.length - 1] || null;
+    const runtimeStatus = liveState.scalper?.status || latestSample?.status || null;
+    let changed = false;
+
+    if (Array.isArray(PAGE.strategyPage.items) && PAGE.strategyPage.items.length) {
+        let rowChanged = false;
+        PAGE.strategyPage.items = PAGE.strategyPage.items.map((row) => {
+            if (row.strategySessionId !== strategySessionId) return row;
+            rowChanged = true;
+            return {
+                ...row,
+                runtimeStatus: runtimeStatus || row.runtimeStatus,
+                netPnl: latestSample?.netPnl ?? row.netPnl,
+                realizedPnl: latestSample?.realizedPnl ?? row.realizedPnl,
+                unrealizedPnl: latestSample?.unrealizedPnl ?? row.unrealizedPnl,
+                openNotional: latestSample?.openNotional ?? row.openNotional,
+                fillCount: latestSample?.fillCount ?? row.fillCount,
+                closeCount: latestSample?.closeCount ?? row.closeCount,
+                updatedAt: latestSample?.sampledAt || row.updatedAt,
+                sparkline: samples.length ? mergeStrategyCardSparkline(row.sparkline || [], samples) : row.sparkline,
+            };
+        });
+        changed = changed || rowChanged;
+    }
+
+    if (PAGE.selectedStrategySessionId !== strategySessionId) {
+        return changed;
+    }
+
+    if (runtimeStatus || latestSample) {
+        PAGE.strategyDetail = {
+            ...(PAGE.strategyDetail || {}),
+            runtime: {
+                ...(PAGE.strategyDetail?.runtime || {}),
+                status: runtimeStatus || PAGE.strategyDetail?.runtime?.status || 'ACTIVE',
+            },
+            latestPnlSample: latestSample
+                ? {
+                    ...(PAGE.strategyDetail?.latestPnlSample || {}),
+                    ...buildLatestPnlSample(latestSample),
+                }
+                : (PAGE.strategyDetail?.latestPnlSample || null),
+        };
+        changed = true;
+    }
+
+    if (samples.length) {
+        const previous = PAGE.strategyTimeseries || {
+            series: {},
+            events: { items: [], total: 0, page: PAGE.strategyTimelinePage, totalPages: 1 },
+        };
+        const nextSeries = {
+            ...(previous.series || {}),
+            pnl: mergeSortedSeriesPoints(previous.series?.pnl || [], samples.map((sample) => toLivePnlPoint(sample)), 300),
+        };
+        if (PAGE.strategyParamsExpanded || Array.isArray(previous.series?.params)) {
+            nextSeries.params = mergeSortedSeriesPoints(previous.series?.params || [], samples.map((sample) => toLiveParamPoint(sample)), 300);
+        }
+        PAGE.strategyTimeseries = {
+            ...previous,
+            series: nextSeries,
+        };
+        changed = true;
+    }
+
+    return changed;
+}
+
+function handleStrategyLiveStoreChange(change) {
+    if (!PAGE.container || !state.currentAccount) return;
+    if (change?.subAccountId && change.subAccountId !== state.currentAccount) return;
+    let changed = false;
+    if (change?.strategySessionId) {
+        changed = applyStrategyLiveState(change.strategySessionId);
+    } else {
+        for (const row of PAGE.strategyPage.items || []) {
+            changed = applyStrategyLiveState(row.strategySessionId) || changed;
+        }
+        if (PAGE.selectedStrategySessionId) {
+            changed = applyStrategyLiveState(PAGE.selectedStrategySessionId) || changed;
+        }
+    }
+    if (changed) render('strategy-live-store-update');
+}
+
+async function ensureSelectedStrategyLiveHydrated({ forceSamples = false } = {}) {
+    if (!PAGE.container || !state.currentAccount || !PAGE.selectedStrategySessionId) return;
+    if (!isSelectedStrategyLive()) return;
+    const subAccountId = state.currentAccount;
+    const strategySessionId = PAGE.selectedStrategySessionId;
+    try {
+        await ensureLiveAlgoState(subAccountId);
+        await ensureLiveStrategySamples(subAccountId, strategySessionId, { points: 180, force: forceSamples });
+        if (PAGE.selectedStrategySessionId !== strategySessionId || state.currentAccount !== subAccountId) return;
+        if (applyStrategyLiveState(strategySessionId)) {
+            render('strategy-live-hydrated');
+        }
+    } catch {
+        // Keep the studio on the last known snapshot if the live bootstrap is unavailable.
+    }
 }
 
 function roleDescription(role) {
@@ -1205,6 +1411,7 @@ async function loadStrategyPage({ silent = false } = {}) {
         }
         syncHashState();
         PAGE.error = null;
+        void ensureSelectedStrategyLiveHydrated();
         if (PAGE.selectedStrategySessionId && PAGE.selectedStrategySessionId !== previousSelected && PAGE.tab === 'strategies') {
             PAGE.strategyTimelinePage = 1;
             PAGE.strategyDetail = null;
@@ -1226,6 +1433,7 @@ async function loadStrategyPage({ silent = false } = {}) {
 function buildStrategyTimeseriesParams() {
     const range = new URLSearchParams();
     range.set('series', PAGE.strategyParamsExpanded ? 'pnl,params,quality,exposure' : 'pnl,quality,exposure');
+    range.set('includeEvents', '1');
     const lookbackStart = getLookbackStart(PAGE.filters.lookback);
     if (lookbackStart) range.set('from', lookbackStart.toISOString());
     range.set('to', new Date().toISOString());
@@ -1259,6 +1467,7 @@ async function loadStrategyDetail(strategySessionId, { silent = false } = {}) {
         };
         PAGE.strategyDetailLoading = false;
         PAGE.error = null;
+        void ensureSelectedStrategyLiveHydrated();
         render('strategy-detail-loaded');
     } catch (err) {
         if (err?.name === 'AbortError') return;
@@ -1285,6 +1494,7 @@ async function loadStrategyTimeseries(strategySessionId, { silent = false } = {}
         );
         if (timeseriesSeq !== PAGE.requestSeqStrategyTimeseries || PAGE.selectedStrategySessionId !== strategySessionId) return;
         PAGE.strategyTimeseries = timeseries;
+        applyStrategyLiveState(strategySessionId);
         PAGE.strategyTimeseriesLoading = false;
         PAGE.error = null;
         render('strategy-timeseries-loaded');
@@ -1479,11 +1689,20 @@ function handleOverviewWsEvent(event) {
 function handleStrategyWsEvent(event) {
     const detail = event?.detail || {};
     if (!isCurrentSubAccountEvent(detail)) return;
+    const eventType = String(event?.type || '').toLowerCase();
+    const strategySessionId = eventStrategySessionId(detail);
+    if (eventType === 'strategy_sample' || eventType === 'scalper_progress' || eventType === 'scalper_filled' || eventType === 'scalper_cancelled' || eventType === 'pnl_update') {
+        const changed = strategySessionId ? applyStrategyLiveState(strategySessionId) : false;
+        if (changed) render('strategy-live-event');
+        if (strategySessionId === PAGE.selectedStrategySessionId || isSelectedStrategyLive()) {
+            void ensureSelectedStrategyLiveHydrated();
+        }
+        return;
+    }
     scheduleStrategyListRefresh();
     if (!PAGE.selectedStrategySessionId) return;
-    const eventType = String(event?.type || '').toLowerCase();
-    if (eventType === 'scalper_progress' || eventType === 'pnl_update') {
-        scheduleStrategyDetailRefresh({ detail: false, timeseries: true, ledger: false, lineage: false });
+    if (isSelectedStrategyLive()) {
+        scheduleStrategyDetailRefresh({ detail: true, timeseries: false, ledger: true, lineage: false });
         return;
     }
     scheduleStrategyDetailRefresh({ detail: true, timeseries: true, ledger: true, lineage: false });
@@ -1502,7 +1721,9 @@ function refreshFromTimer() {
         if (PAGE.selectedStrategySessionId) {
             loadStrategySessionBundle(PAGE.selectedStrategySessionId, {
                 silent: true,
-                parts: { detail: true, timeseries: true, ledger: true, lineage: false },
+                parts: isSelectedStrategyLive()
+                    ? { detail: true, timeseries: false, ledger: true, lineage: false }
+                    : { detail: true, timeseries: true, ledger: true, lineage: false },
             });
         }
     }

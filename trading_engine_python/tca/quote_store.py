@@ -7,7 +7,6 @@ when the sampler runs.
 """
 
 from __future__ import annotations
-
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -32,6 +31,8 @@ def _ms_from_dt(value: Any) -> Optional[int]:
     if isinstance(value, str):
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
             return int(parsed.timestamp() * 1000)
         except ValueError:
             try:
@@ -54,10 +55,19 @@ def _spread_bps(bid: float, ask: float, mid: float) -> Optional[float]:
 class MarketQuoteStore:
     """Persist and query bounded market quote history."""
 
-    def __init__(self, db: Any, *, retention_ms: int = 3_600_000, max_gap_ms: int = 15_000) -> None:
+    def __init__(
+        self,
+        db: Any,
+        *,
+        retention_ms: int = 3_600_000,
+        max_gap_ms: int = 15_000,
+        prune_interval_ms: int = 60_000,
+    ) -> None:
         self._db = db
         self._retention_ms = retention_ms
         self._max_gap_ms = max_gap_ms
+        self._prune_interval_ms = prune_interval_ms
+        self._last_prune_ms: dict[str, int] = {}
 
     async def record_quote(
         self,
@@ -103,23 +113,35 @@ class MarketQuoteStore:
             return None
 
         max_gap = self._max_gap_ms if max_gap_ms is None else max_gap_ms
-        rows = await self._db.fetch_all(
+        target_dt = _dt_from_ms(target_ts_ms)
+        before_row = await self._db.fetch_one(
             """SELECT * FROM market_quotes
-               WHERE symbol = ?
-               ORDER BY ts ASC""",
-            (symbol,),
+               WHERE symbol = ? AND ts <= ?
+               ORDER BY ts DESC
+               LIMIT 1""",
+            (symbol, target_dt),
+        )
+        after_row = await self._db.fetch_one(
+            """SELECT * FROM market_quotes
+               WHERE symbol = ? AND ts >= ?
+               ORDER BY ts ASC
+               LIMIT 1""",
+            (symbol, target_dt),
         )
 
         candidates = []
-        for row in rows or []:
+        for row in (before_row, after_row):
+            if not row:
+                continue
+            row = dict(row)
             row_ts_ms = _ms_from_dt(row.get("ts"))
             if row_ts_ms is None:
                 continue
             delta = abs(row_ts_ms - target_ts_ms)
-            if delta <= max_gap:
-                row = dict(row)
-                row["ts_ms"] = row_ts_ms
-                candidates.append((delta, row_ts_ms, row))
+            if delta > max_gap:
+                continue
+            row["ts_ms"] = row_ts_ms
+            candidates.append((delta, row_ts_ms, row))
 
         if not candidates:
             return None
@@ -146,11 +168,15 @@ class MarketQuoteStore:
     async def _prune(self, symbol: str, newest_ts_ms: int) -> None:
         if self._retention_ms <= 0:
             return
+        last_prune_ms = int(self._last_prune_ms.get(symbol) or 0)
+        if self._prune_interval_ms > 0 and last_prune_ms and (newest_ts_ms - last_prune_ms) < self._prune_interval_ms:
+            return
         cutoff_dt = _dt_from_ms(max(0, newest_ts_ms - self._retention_ms))
         try:
             await self._db.execute(
                 "DELETE FROM market_quotes WHERE symbol = ? AND ts < ?",
                 (symbol, cutoff_dt),
             )
+            self._last_prune_ms[symbol] = newest_ts_ms
         except Exception as exc:
             logger.debug("MarketQuoteStore prune skipped for %s: %s", symbol, exc)

@@ -32,7 +32,8 @@ import {
 } from '../../tca/services/strategy-session-timeseries-service.js';
 
 const router = Router();
-const DEFAULT_MODAL_SECTIONS = ['detail', 'timeseries', 'ledger'];
+const ALLOWED_MODAL_SECTIONS = ['detail', 'timeseries', 'ledger'];
+const DEFAULT_MODAL_SECTIONS = ['detail'];
 const DEFAULT_MODAL_WINDOW_MS = 15 * 60 * 1000;
 const DEFAULT_MODAL_MAX_POINTS = 120;
 const DEFAULT_MODAL_EVENTS_PAGE_SIZE = 8;
@@ -61,7 +62,7 @@ function parseModalSections(rawValue) {
         .map((value) => value.trim().toLowerCase())
         .filter(Boolean)
         .filter((value, index, items) => items.indexOf(value) === index)
-        .filter((value) => DEFAULT_MODAL_SECTIONS.includes(value));
+        .filter((value) => ALLOWED_MODAL_SECTIONS.includes(value));
     return parsed.length ? parsed : DEFAULT_MODAL_SECTIONS.slice();
 }
 
@@ -625,6 +626,8 @@ router.get('/tca/strategy-modal-payload/:subAccountId/:strategySessionId', requi
             to: includeTimeseries ? timeseriesQuery.to : '',
             bucketMs: includeTimeseries ? timeseriesQuery.bucketMs : '',
             maxPoints: includeTimeseries ? timeseriesQuery.maxPoints : '',
+            series: includeTimeseries ? Array.from(timeseriesQuery.series || []).sort().join(',') : '',
+            includeEvents: includeTimeseries ? timeseriesQuery.includeEvents : '',
             eventsPage: includeTimeseries ? timeseriesQuery.eventsPage : '',
             eventsPageSize: includeTimeseries ? timeseriesQuery.eventsPageSize : '',
         });

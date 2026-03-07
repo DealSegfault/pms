@@ -372,7 +372,7 @@ async def main() -> int:
         tca_reconciler = TCAReconciler(db) if db else None
         tca_market_sampler = TCAMarketSampler(db, market_data, quote_store=quote_store) if db else None
         strategy_lot_ledger = StrategyLotLedgerWorker(db) if db else None
-        strategy_sampler = StrategySessionSampler(db, market_data) if db else None
+        strategy_sampler = StrategySessionSampler(db, market_data, redis_client) if db else None
         tca_rollups = TCARollupWorker(db) if db else None
 
         # ── 9. CommandHandler ──

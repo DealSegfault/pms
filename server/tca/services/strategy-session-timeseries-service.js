@@ -327,6 +327,13 @@ async function loadBucketedSeries(subAccountId, strategySessionId, query) {
 }
 
 async function loadCheckpointWindow(strategySessionId, query) {
+    if (!query.includeEvents) {
+        return {
+            checkpointTotal: 0,
+            checkpointRows: [],
+        };
+    }
+
     const checkpointWhere = {
         strategySessionId,
         checkpointTs: {

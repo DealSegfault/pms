@@ -221,6 +221,16 @@ export function createWsClient({
                     return;
                 }
 
+                if (msg.type === 'scalper_cancelled') {
+                    if (isMyEvent) dispatchEvent('scalper_cancelled', msg.data);
+                    return;
+                }
+
+                if (msg.type === 'strategy_sample') {
+                    if (isMyEvent) dispatchEvent('strategy_sample', msg.data);
+                    return;
+                }
+
                 if (msg.type === 'twap_progress') {
                     if (isMyEvent) dispatchEvent('twap_progress', msg.data);
                     return;

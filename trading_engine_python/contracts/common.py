@@ -133,6 +133,7 @@ class EventType:
     SCALPER_PROGRESS = "scalper_progress"
     SCALPER_FILLED = "scalper_filled"
     SCALPER_CANCELLED = "scalper_cancelled"
+    STRATEGY_SAMPLE = "strategy_sample"
 
     # TWAP algo
     TWAP_PROGRESS = "twap_progress"
@@ -232,6 +233,14 @@ class RedisKey:
     @staticmethod
     def active_scalper(sub_account_id: str) -> str:
         return f"pms:active_scalper:{sub_account_id}"
+
+    @staticmethod
+    def scalper_children(scalper_id: str) -> str:
+        return f"pms:scalper_children:{scalper_id}"
+
+    @staticmethod
+    def strategy_samples(strategy_session_id: str) -> str:
+        return f"pms:strategy_samples:{strategy_session_id}"
 
     @staticmethod
     def twap(twap_id: str) -> str:

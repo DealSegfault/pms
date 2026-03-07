@@ -54,17 +54,18 @@ function isoNow() {
     return new Date().toISOString();
 }
 
-function buildHeaders(cookie = '') {
+function buildHeaders({ cookie = '', token = '' } = {}) {
     const headers = {
         Accept: 'application/json',
     };
     if (cookie) headers.Cookie = cookie;
+    if (token) headers.Authorization = `Bearer ${token}`;
     return headers;
 }
 
-async function fetchJson(baseUrl, routePath, { cookie = '', signal } = {}) {
+async function fetchJson(baseUrl, routePath, { cookie = '', token = '', signal } = {}) {
     const response = await fetch(`${baseUrl}${routePath}`, {
-        headers: buildHeaders(cookie),
+        headers: buildHeaders({ cookie, token }),
         cache: 'no-store',
         signal,
     });
@@ -104,11 +105,11 @@ function buildTimeseriesPath({
     return `/api/trade/tca/strategy-session-timeseries/${subAccountId}/${strategySessionId}?${params.toString()}`;
 }
 
-async function resolveFullWindowStart(baseUrl, { subAccountId, strategySessionId, cookie }) {
+async function resolveFullWindowStart(baseUrl, { subAccountId, strategySessionId, cookie, token }) {
     const detail = await fetchJson(
         baseUrl,
         `/api/trade/tca/strategy-session/${subAccountId}/${strategySessionId}?includeLineage=0`,
-        { cookie },
+        { cookie, token },
     );
     const startedAt = detail?.strategySession?.startedAt;
     return startedAt ? new Date(startedAt).toISOString() : null;
@@ -127,7 +128,7 @@ async function executeProfile(baseUrl, options, workerIndex) {
     const runStep = async (name, routePath) => {
         const started = performance.now();
         try {
-            await fetchJson(baseUrl, routePath, { cookie: options.cookie });
+            await fetchJson(baseUrl, routePath, { cookie: options.cookie, token: options.token });
             result.steps.push({
                 name,
                 routePath,
@@ -213,10 +214,10 @@ async function executeProfile(baseUrl, options, workerIndex) {
     return result;
 }
 
-async function sampleRuntimeMemory(baseUrl, cookie, samples, stopFlag, sampleIntervalMs) {
+async function sampleRuntimeMemory(baseUrl, auth, samples, stopFlag, sampleIntervalMs) {
     while (!stopFlag.done) {
         try {
-            const snapshot = await fetchJson(baseUrl, '/api/admin/runtime/memory', { cookie });
+            const snapshot = await fetchJson(baseUrl, '/api/admin/runtime/memory', auth);
             samples.push(snapshot);
         } catch (error) {
             samples.push({
@@ -269,6 +270,7 @@ async function main() {
         baseUrl,
         profile,
         cookie: String(args.cookie || ''),
+        token: String(args.token || ''),
         subAccountId: requireArg(args, 'sub-account-id'),
         strategySessionId: String(args['strategy-session-id'] || ''),
         iterations: toPositiveInt(args.iterations, 1),
@@ -292,7 +294,7 @@ async function main() {
         const stopFlag = { done: false };
         const samplerPromise = sampleRuntimeMemory(
             baseUrl,
-            options.cookie,
+            { cookie: options.cookie, token: options.token },
             samples,
             stopFlag,
             options.sampleIntervalMs,

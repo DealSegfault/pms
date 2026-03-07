@@ -41,6 +41,7 @@ class ChaseRedisState:
     order_role: str = "ENTRY"
     parent_scalper_id: Optional[str] = None
     layer_idx: Optional[int] = None
+    current_order_client_id: Optional[str] = None
     paused: bool = False
     retry_at: Optional[int] = None      # ms
 
@@ -69,6 +70,8 @@ class ChaseRedisState:
             d["parentScalperId"] = self.parent_scalper_id
         if self.layer_idx is not None:
             d["layerIdx"] = self.layer_idx
+        if self.current_order_client_id:
+            d["currentOrderClientId"] = self.current_order_client_id
         if self.paused:
             d["paused"] = True
         if self.retry_at:

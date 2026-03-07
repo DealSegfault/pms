@@ -30,6 +30,7 @@ export const EVENT_TYPES = {
     SCALPER_PROGRESS: 'scalper_progress',
     SCALPER_FILLED: 'scalper_filled',
     SCALPER_CANCELLED: 'scalper_cancelled',
+    STRATEGY_SAMPLE: 'strategy_sample',
 
     // TWAP algo
     TWAP_PROGRESS: 'twap_progress',
@@ -185,6 +186,30 @@ export const LIFECYCLE_STREAM_EVENTS = {
  * @property {boolean} allowLoss
  * @property {number} startedAt                - ms timestamp
  * @property {boolean} reduceOnlyArmed
+ */
+
+/**
+ * @typedef {Object} StrategySamplePayload
+ * @property {string} strategySessionId
+ * @property {string} subAccountId
+ * @property {string} symbol
+ * @property {string} status
+ * @property {number} sampledAt
+ * @property {number} netPnl
+ * @property {number} realizedPnl
+ * @property {number} unrealizedPnl
+ * @property {number} openQty
+ * @property {number} openNotional
+ * @property {number} fillCount
+ * @property {number} closeCount
+ * @property {number} winCount
+ * @property {number} lossCount
+ * @property {number} longActiveSlots
+ * @property {number} shortActiveSlots
+ * @property {number} longPausedSlots
+ * @property {number} shortPausedSlots
+ * @property {number} longRetryingSlots
+ * @property {number} shortRetryingSlots
  */
 
 // ── TWAP State Shape (REST + Redis) ─────────────────────────

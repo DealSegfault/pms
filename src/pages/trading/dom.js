@@ -1,6 +1,7 @@
 // ── Trading Page – DOM / HTML Template ───────────────────────
 import { state } from '../../core/index.js';
 import { cuteSpinner } from '../../lib/cute-empty.js';
+import { getShowChart, getShowOrderbook } from '../../core/display-settings.js';
 import * as S from './state.js';
 
 /**
@@ -63,7 +64,7 @@ export function buildTradingHTML() {
       </div>
 
       <!-- Single Grid: all panels as direct children -->
-      <div class="terminal-grid">
+      <div class="terminal-grid${!getShowChart() ? ' ds-no-chart' : ''}${!getShowOrderbook() ? ' ds-no-orderbook' : ''}">
         <!-- Chart Area -->
         <div class="chart-area">
           <div class="chart-panel tab-chart-item">
@@ -111,6 +112,9 @@ export function buildTradingHTML() {
               <input type="checkbox" id="bp-filter-current-sym" style="accent-color:var(--accent); cursor:pointer; width:12px; height:12px;" />
               Current only
             </label>
+            <button id="cancel-all-scalpers" class="btn-cancel-all-type" data-type="scalper" style="display:none;" title="Cancel all scalpers">⚔ Stop All</button>
+            <button id="cancel-all-twaps" class="btn-cancel-all-type" data-type="twap" style="display:none;" title="Cancel all TWAPs">⏱ Stop All</button>
+            <button id="cancel-all-chases" class="btn-cancel-all-type" data-type="chase" style="display:none;" title="Cancel all chases">🎯 Stop All</button>
             <button id="cancel-all-orders" class="btn-cancel-all" style="display:none;" title="Cancel all open orders">Cancel All</button>
           </div>
           <div class="bp-content">

@@ -42,6 +42,8 @@ from contracts.state import ScalperRedisState, ScalperRuntimeSnapshot, ScalperSl
 logger = logging.getLogger(__name__)
 
 SCALPER_REDIS_TTL = 172800  # 48h
+ACTIVE_SCALPER_HASH_TTL = 90
+HEARTBEAT_CHECKPOINT_INTERVAL_S = 60.0
 MIN_NOTIONAL_USD = 5        # Binance minimum
 BACKOFF_BASE_S = 2.0        # 2s initial backoff
 BACKOFF_MAX_S = 300.0       # 5min cap
@@ -646,7 +648,28 @@ class ScalperEngine:
         """Stop a scalper, cancel all its chase orders."""
         state = self._active.get(scalper_id)
         if not state:
-            return False
+            if not self._redis:
+                return False
+            raw = await self._redis.get(RedisKey.scalper(scalper_id))
+            child_ids = await self._redis.smembers(RedisKey.scalper_children(scalper_id))
+            if not raw and not child_ids:
+                return False
+            if raw:
+                try:
+                    persisted = json.loads(raw)
+                    sub_account_id = persisted.get("subAccountId")
+                    if sub_account_id:
+                        await self._redis.hdel(RedisKey.active_scalper(sub_account_id), scalper_id)
+                except Exception:
+                    pass
+            for child_id in child_ids or []:
+                try:
+                    await self._chase.cancel_chase(str(child_id))
+                except Exception:
+                    pass
+            await self._redis.delete(RedisKey.scalper(scalper_id))
+            await self._redis.delete(RedisKey.scalper_children(scalper_id))
+            return True
 
         if state.status == "stopped":
             return False
@@ -699,25 +722,24 @@ class ScalperEngine:
                 pass
         await self._publish_event("scalper_cancelled", state)
 
-        # Cancel all child chases (first pass)
-        all_slots = state.long_slots + state.short_slots
-        for slot in all_slots:
-            if slot.chase_id:
-                try:
-                    await self._chase.cancel_chase(slot.chase_id)
-                except Exception as e:
-                    logger.warning("Scalper %s: cancel child %s error: %s", scalper_id, slot.chase_id, e)
-                slot.chase_id = None
-                slot.active = False
+        child_ids = {slot.chase_id for slot in (state.long_slots + state.short_slots) if slot.chase_id}
+        if self._redis:
+            try:
+                child_ids.update(str(value) for value in (await self._redis.smembers(RedisKey.scalper_children(scalper_id))) or [])
+            except Exception:
+                pass
 
-        # Second sweep for chases spawned by in-flight restarts
+        for child_id in child_ids:
+            if not child_id:
+                continue
+            try:
+                await self._chase.cancel_chase(str(child_id))
+            except Exception as e:
+                logger.warning("Scalper %s: cancel child %s error: %s", scalper_id, child_id, e)
+
         for slot in state.long_slots + state.short_slots:
-            if slot.chase_id:
-                try:
-                    await self._chase.cancel_chase(slot.chase_id)
-                except Exception:
-                    pass
-                slot.chase_id = None
+            slot.chase_id = None
+            slot.active = False
 
         # Close positions if requested (#16)
         if close_positions:
@@ -744,6 +766,12 @@ class ScalperEngine:
                             )
             except Exception as e:
                 logger.error("Scalper %s: close positions failed: %s", scalper_id, e)
+
+        if self._redis:
+            try:
+                await self._redis.delete(RedisKey.scalper_children(scalper_id))
+            except Exception:
+                pass
 
         return True
 
@@ -1643,6 +1671,7 @@ class ScalperEngine:
         resume_status: Optional[str] = None,
         save_hot_snapshot: bool = True,
         update_active_hash: bool = True,
+        publish_runtime_bus: bool = True,
     ) -> None:
         state.checkpoint_seq += 1
         runtime = self._runtime_snapshot(
@@ -1664,11 +1693,11 @@ class ScalperEngine:
             try:
                 acct_key = RedisKey.active_scalper(state.sub_account_id)
                 await self._redis.hset(acct_key, state.id, slim_json)
-                await self._redis.expire(acct_key, SCALPER_REDIS_TTL)
+                await self._redis.expire(acct_key, ACTIVE_SCALPER_HASH_TTL)
             except Exception as e:
                 logger.error("Failed to save active scalper snapshot: %s", e)
 
-        if self._runtime_bus:
+        if self._runtime_bus and publish_runtime_bus:
             try:
                 await self._runtime_bus.publish(
                     "SCALPER_RUNTIME_SNAPSHOT",
@@ -1687,12 +1716,21 @@ class ScalperEngine:
 
     async def _start_heartbeat(self, state: ScalperState) -> None:
         async def _heartbeat_loop() -> None:
+            last_persisted_at = 0.0
             try:
                 while state.id in self._active and self._active.get(state.id) is state and state.status == "active":
                     await asyncio.sleep(5.0)
                     if state.id not in self._active or state.status != "active":
                         break
-                    await self._publish_runtime_checkpoint(state, "HEARTBEAT")
+                    now = time.time()
+                    emit_checkpoint = (now - last_persisted_at) >= HEARTBEAT_CHECKPOINT_INTERVAL_S
+                    await self._publish_runtime_checkpoint(
+                        state,
+                        "HEARTBEAT",
+                        publish_runtime_bus=emit_checkpoint,
+                    )
+                    if emit_checkpoint:
+                        last_persisted_at = now
             except asyncio.CancelledError:
                 return
             except Exception as e:

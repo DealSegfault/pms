@@ -34,6 +34,8 @@ def _to_epoch_ms(value: Any) -> Optional[int]:
     if isinstance(value, str):
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
             return int(parsed.timestamp() * 1000)
         except ValueError:
             try:

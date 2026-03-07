@@ -30,7 +30,8 @@ import { submitTwapOrder, cancelTwap } from './twap.js';
 import { submitTrailStop, cancelTrailStop, refreshTrailPositionDropdown, updateTrailPreview, drawLiveTrailStop, clearAllTrailStopLines, fetchAndDrawActiveTrailStops, onTrailPriceTick } from './trail-stop.js';
 import {
     loadOpenOrders, loadTradingPositions, loadChartAnnotations,
-    cancelAllOrders, applySymbolFilter,
+    cancelAllOrders, cancelAllScalpers, cancelAllTwaps, cancelAllChases,
+    applySymbolFilter,
 } from './positions-panel.js';
 import { initWebSockets, teardownStreams, setupAppEventListeners, startCompactPoll, stopCompactPoll } from './ws-handlers.js';
 import { clearTradingRefreshScheduler } from './refresh-scheduler.js';
@@ -538,6 +539,9 @@ function attachEventListeners() {
     // ── Load orders + positions ──
     loadOpenOrders();
     document.getElementById('cancel-all-orders')?.addEventListener('click', cancelAllOrders);
+    document.getElementById('cancel-all-scalpers')?.addEventListener('click', cancelAllScalpers);
+    document.getElementById('cancel-all-twaps')?.addEventListener('click', cancelAllTwaps);
+    document.getElementById('cancel-all-chases')?.addEventListener('click', cancelAllChases);
     loadTradingPositions();
 
     // ── Symbol filter checkbox (Current only) ──

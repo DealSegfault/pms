@@ -673,6 +673,98 @@ def test_tca_rollup_worker_sums_latest_session_economics_per_sub_account():
     asyncio.run(run())
 
 
+def test_tca_rollup_worker_incremental_run_targets_roots_not_whole_subaccounts():
+    async def run():
+        db = MemoryDB()
+        await db.connect()
+
+        await db.execute(
+            """INSERT INTO strategy_sessions
+               (id, sub_account_id, origin, strategy_type, root_strategy_session_id, session_role, symbol, side, started_at, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("root-1", "sub-1", "SCALPER", "SCALPER", "root-1", "ROOT", "BTCUSDT", "LONG", "2026-03-05 10:00:00", "2026-03-05 10:00:00", "2026-03-05 10:00:00"),
+        )
+        await db.execute(
+            """INSERT INTO strategy_sessions
+               (id, sub_account_id, origin, strategy_type, root_strategy_session_id, session_role, symbol, side, started_at, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("root-2", "sub-1", "SCALPER", "SCALPER", "root-2", "ROOT", "ETHUSDT", "SHORT", "2026-03-05 10:05:00", "2026-03-05 10:05:00", "2026-03-05 10:05:00"),
+        )
+        await db.execute(
+            """INSERT INTO strategy_session_pnl_samples
+               (id, strategy_session_id, sub_account_id, sampled_at, realized_pnl, unrealized_pnl, net_pnl,
+                fees_total, open_qty, open_notional, fill_count, close_count, win_count, loss_count, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("sample-1a", "root-1", "sub-1", "2026-03-05 10:00:00", 4.0, 1.0, 5.0, 0.5, 1.0, 100.0, 2, 1, 1, 0, "2026-03-05 10:00:00"),
+        )
+        await db.execute(
+            """INSERT INTO strategy_session_pnl_samples
+               (id, strategy_session_id, sub_account_id, sampled_at, realized_pnl, unrealized_pnl, net_pnl,
+                fees_total, open_qty, open_notional, fill_count, close_count, win_count, loss_count, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("sample-2a", "root-2", "sub-1", "2026-03-05 10:02:00", 2.0, 1.0, 3.0, 0.3, 0.25, 40.0, 1, 1, 0, 1, "2026-03-05 10:02:00"),
+        )
+
+        worker = TCARollupWorker(db)
+        await worker.recompute_once()
+
+        queries = []
+        original_fetch_all = db.fetch_all
+        original_execute = db.execute
+
+        async def recording_fetch_all(sql, params=()):
+            queries.append(" ".join(str(sql).split()))
+            return await original_fetch_all(sql, params)
+
+        async def recording_execute(sql, params=()):
+            queries.append(" ".join(str(sql).split()))
+            return await original_execute(sql, params)
+
+        db.fetch_all = recording_fetch_all  # type: ignore[method-assign]
+        db.execute = recording_execute  # type: ignore[method-assign]
+
+        await db.execute(
+            """INSERT INTO strategy_session_pnl_samples
+               (id, strategy_session_id, sub_account_id, sampled_at, realized_pnl, unrealized_pnl, net_pnl,
+                fees_total, open_qty, open_notional, fill_count, close_count, win_count, loss_count, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("sample-1b", "root-1", "sub-1", "2026-03-05 10:03:00", 6.0, 3.0, 9.0, 0.7, 0.5, 55.0, 3, 1, 1, 0, "2026-03-05 10:03:00"),
+        )
+
+        summary = await worker.recompute_once()
+
+        sub = await original_fetch_all(
+            """SELECT * FROM sub_account_tca_rollups
+               WHERE sub_account_id = ? AND execution_scope = ? AND ownership_confidence = ?""",
+            ("sub-1", "SUB_ACCOUNT", "HARD"),
+        )
+        roots = await original_fetch_all(
+            """SELECT * FROM strategy_tca_rollups
+               WHERE execution_scope = ? AND ownership_confidence = ?
+               ORDER BY strategy_session_id, rollup_level""",
+            ("SUB_ACCOUNT", "HARD"),
+        )
+
+        assert summary["reconcile_mode"] == "incremental"
+        assert summary["impacted_sub_accounts"] == 1
+        assert len(sub) == 1
+        assert sub[0]["net_pnl"] == 12.0
+
+        root_1 = next(row for row in roots if row["strategy_session_id"] == "root-1" and row["rollup_level"] == "ROOT")
+        root_2 = next(row for row in roots if row["strategy_session_id"] == "root-2" and row["rollup_level"] == "ROOT")
+        assert root_1["net_pnl"] == 9.0
+        assert root_2["net_pnl"] == 3.0
+
+        assert any("DELETE FROM strategy_tca_rollups WHERE strategy_session_id IN" in sql for sql in queries)
+        assert any("COALESCE(root_strategy_session_id, strategy_session_id) IN" in sql for sql in queries)
+        assert not any("FROM strategy_sessions WHERE sub_account_id IN" in sql for sql in queries)
+        assert not any("FROM order_lifecycles WHERE sub_account_id IN" in sql for sql in queries)
+
+        await db.close()
+
+    asyncio.run(run())
+
+
 def test_tca_rollup_worker_logs_only_when_rollup_snapshot_changes(caplog):
     async def run():
         stop_event = asyncio.Event()

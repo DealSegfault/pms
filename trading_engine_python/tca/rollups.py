@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
@@ -35,6 +36,8 @@ def _to_epoch_ms(value: Any) -> Optional[float]:
     if isinstance(value, str):
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
             return parsed.timestamp() * 1000.0
         except ValueError:
             try:
@@ -68,7 +71,10 @@ def _normalize_rollup_ts(value: Any) -> Optional[datetime]:
         return datetime.fromtimestamp(numeric, timezone.utc).replace(tzinfo=None)
     if isinstance(value, str):
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
         except ValueError:
             try:
                 return _normalize_rollup_ts(float(value))
@@ -234,6 +240,14 @@ def _build_in_clause(values: Sequence[Any]) -> tuple[str, tuple[Any, ...]]:
     return f"({','.join('?' for _ in values)})", tuple(values)
 
 
+def _coalesce_root_session_id(*values: Any) -> Optional[str]:
+    for value in values:
+        if value in (None, "", "None"):
+            continue
+        return str(value)
+    return None
+
+
 class TCARollupWorker:
     """Periodic bounded rebuild of TCA rollup tables."""
 
@@ -301,8 +315,9 @@ class TCARollupWorker:
         )
 
         if full_reconcile:
-            scope = await self._load_scope_full()
-            impacted_sub_accounts = sorted({row.get("sub_account_id") for row in scope["strategy_sessions"] if row.get("sub_account_id")})
+            impacted_root_sessions = await self._collect_all_root_sessions()
+            scope = await self._load_scope_for_root_sessions(impacted_root_sessions)
+            impacted_sub_accounts = self._collect_scope_sub_accounts(scope)
             next_cursor = {
                 "lifecycle_updated_at": _max_ts(scope["lifecycles"], "updated_at"),
                 "fill_created_at": _max_ts(scope["fills"], "created_at"),
@@ -318,8 +333,8 @@ class TCARollupWorker:
                 "sessions": len(scope["strategy_sessions"]),
             }
         else:
-            impacted_sub_accounts, changed_rows, next_cursor = await self._collect_impacted_sub_accounts(current_cursor)
-            if not impacted_sub_accounts:
+            impacted_root_sessions, impacted_sub_accounts, changed_rows, next_cursor = await self._collect_impacted_root_sessions(current_cursor)
+            if not impacted_root_sessions:
                 await save_worker_cursor(
                     self._db,
                     WORKER_KEY,
@@ -341,17 +356,34 @@ class TCARollupWorker:
                     "impacted_sub_accounts": 0,
                     "changed_rows": changed_rows,
                 }
-            scope = await self._load_scope_for_sub_accounts(impacted_sub_accounts)
+            scope = await self._load_scope_for_root_sessions(impacted_root_sessions)
+            impacted_sub_accounts = sorted(set(impacted_sub_accounts) | set(self._collect_scope_sub_accounts(scope)))
 
         sub_rollups, strategy_rollups = self._compute_rollups(scope)
+        impacted_strategy_session_ids_set = {str(root_id) for root_id in impacted_root_sessions if root_id}
+        impacted_strategy_session_ids_set.update(
+            str(row.get("id"))
+            for row in scope.get("strategy_sessions") or []
+            if row.get("id")
+        )
+        impacted_strategy_session_ids_set.update(
+            str(row.get("strategy_session_id"))
+            for row in scope.get("lifecycles") or []
+            if row.get("strategy_session_id")
+        )
+        impacted_strategy_session_ids = sorted(impacted_strategy_session_ids_set)
         await self._persist_rollups(
-            sub_rollups=sub_rollups,
             strategy_rollups=strategy_rollups,
+            impacted_strategy_session_ids=impacted_strategy_session_ids,
+            impacted_sub_accounts=impacted_sub_accounts,
+            full_reconcile=full_reconcile,
+        )
+        rebuilt_sub_rollups = await self._rebuild_sub_account_rollups(
             impacted_sub_accounts=impacted_sub_accounts,
             full_reconcile=full_reconcile,
         )
 
-        digest = _rollup_change_digest(sub_rollups, strategy_rollups)
+        digest = _rollup_change_digest(rebuilt_sub_rollups, strategy_rollups)
         completed_at = utc_now()
         await save_worker_cursor(
             self._db,
@@ -368,7 +400,7 @@ class TCARollupWorker:
         )
 
         return {
-            "sub_account_rollups": len(sub_rollups),
+            "sub_account_rollups": len(rebuilt_sub_rollups),
             "strategy_rollups": len(strategy_rollups),
             "change_digest": digest,
             "reconcile_mode": "full" if full_reconcile else "incremental",
@@ -376,92 +408,204 @@ class TCARollupWorker:
             "changed_rows": changed_rows,
         }
 
-    async def _collect_impacted_sub_accounts(self, cursor: dict) -> tuple[list[str], dict, dict]:
+    async def _collect_impacted_root_sessions(self, cursor: dict) -> tuple[list[str], list[str], dict, dict]:
         changed_rows = {}
-        impacted: set[str] = set()
+        impacted_sub_accounts: set[str] = set()
+        impacted_root_sessions: set[str] = set()
         next_cursor = dict(cursor)
 
         lifecycle_rows = await self._db.fetch_all(
-            "SELECT sub_account_id, updated_at FROM order_lifecycles WHERE updated_at > ?",
+            """SELECT sub_account_id, strategy_session_id, root_strategy_session_id, updated_at
+               FROM order_lifecycles
+               WHERE updated_at > ?""",
             (cursor["lifecycle_updated_at"],),
         ) if cursor.get("lifecycle_updated_at") else []
         changed_rows["lifecycles"] = len(lifecycle_rows)
-        impacted.update(str(row.get("sub_account_id")) for row in lifecycle_rows if row.get("sub_account_id"))
+        impacted_sub_accounts.update(str(row.get("sub_account_id")) for row in lifecycle_rows if row.get("sub_account_id"))
+        impacted_root_sessions.update(
+            root_id
+            for row in lifecycle_rows
+            for root_id in [_coalesce_root_session_id(row.get("root_strategy_session_id"), row.get("strategy_session_id"))]
+            if root_id
+        )
         next_cursor["lifecycle_updated_at"] = _max_ts(lifecycle_rows, "updated_at") or cursor.get("lifecycle_updated_at")
 
         fill_rows = await self._db.fetch_all(
-            "SELECT sub_account_id, created_at FROM fill_facts WHERE created_at > ?",
+            """SELECT f.sub_account_id, l.strategy_session_id, l.root_strategy_session_id, f.created_at
+               FROM fill_facts f
+               LEFT JOIN order_lifecycles l ON l.id = f.lifecycle_id
+               WHERE f.created_at > ?""",
             (cursor["fill_created_at"],),
         ) if cursor.get("fill_created_at") else []
         changed_rows["fills"] = len(fill_rows)
-        impacted.update(str(row.get("sub_account_id")) for row in fill_rows if row.get("sub_account_id"))
+        impacted_sub_accounts.update(str(row.get("sub_account_id")) for row in fill_rows if row.get("sub_account_id"))
+        impacted_root_sessions.update(
+            root_id
+            for row in fill_rows
+            for root_id in [_coalesce_root_session_id(row.get("root_strategy_session_id"), row.get("strategy_session_id"))]
+            if root_id
+        )
         next_cursor["fill_created_at"] = _max_ts(fill_rows, "created_at") or cursor.get("fill_created_at")
 
         markout_rows = await self._db.fetch_all(
-            """SELECT f.sub_account_id, m.created_at
+            """SELECT f.sub_account_id, l.strategy_session_id, l.root_strategy_session_id, m.created_at
                FROM fill_markouts m
                JOIN fill_facts f ON f.id = m.fill_fact_id
+               LEFT JOIN order_lifecycles l ON l.id = f.lifecycle_id
                WHERE m.created_at > ?""",
             (cursor["markout_created_at"],),
         ) if cursor.get("markout_created_at") else []
         changed_rows["markouts"] = len(markout_rows)
-        impacted.update(str(row.get("sub_account_id")) for row in markout_rows if row.get("sub_account_id"))
+        impacted_sub_accounts.update(str(row.get("sub_account_id")) for row in markout_rows if row.get("sub_account_id"))
+        impacted_root_sessions.update(
+            root_id
+            for row in markout_rows
+            for root_id in [_coalesce_root_session_id(row.get("root_strategy_session_id"), row.get("strategy_session_id"))]
+            if root_id
+        )
         next_cursor["markout_created_at"] = _max_ts(markout_rows, "created_at") or cursor.get("markout_created_at")
 
         sample_rows = await self._db.fetch_all(
-            "SELECT sub_account_id, created_at FROM strategy_session_pnl_samples WHERE created_at > ?",
+            """SELECT p.sub_account_id, p.strategy_session_id, s.root_strategy_session_id, p.created_at
+               FROM strategy_session_pnl_samples p
+               LEFT JOIN strategy_sessions s ON s.id = p.strategy_session_id
+               WHERE p.created_at > ?""",
             (cursor["sample_created_at"],),
         ) if cursor.get("sample_created_at") else []
         changed_rows["samples"] = len(sample_rows)
-        impacted.update(str(row.get("sub_account_id")) for row in sample_rows if row.get("sub_account_id"))
+        impacted_sub_accounts.update(str(row.get("sub_account_id")) for row in sample_rows if row.get("sub_account_id"))
+        impacted_root_sessions.update(
+            root_id
+            for row in sample_rows
+            for root_id in [_coalesce_root_session_id(row.get("root_strategy_session_id"), row.get("strategy_session_id"))]
+            if root_id
+        )
         next_cursor["sample_created_at"] = _max_ts(sample_rows, "created_at") or cursor.get("sample_created_at")
 
         session_rows = await self._db.fetch_all(
-            "SELECT sub_account_id, updated_at FROM strategy_sessions WHERE updated_at > ?",
+            "SELECT id, sub_account_id, root_strategy_session_id, updated_at FROM strategy_sessions WHERE updated_at > ?",
             (cursor["session_updated_at"],),
         ) if cursor.get("session_updated_at") else []
         changed_rows["sessions"] = len(session_rows)
-        impacted.update(str(row.get("sub_account_id")) for row in session_rows if row.get("sub_account_id"))
+        impacted_sub_accounts.update(str(row.get("sub_account_id")) for row in session_rows if row.get("sub_account_id"))
+        impacted_root_sessions.update(
+            root_id
+            for row in session_rows
+            for root_id in [_coalesce_root_session_id(row.get("root_strategy_session_id"), row.get("id"))]
+            if root_id
+        )
         next_cursor["session_updated_at"] = _max_ts(session_rows, "updated_at") or cursor.get("session_updated_at")
 
-        return sorted(impacted), changed_rows, next_cursor
+        return sorted(impacted_root_sessions), sorted(impacted_sub_accounts), changed_rows, next_cursor
 
-    async def _load_scope_full(self) -> dict:
+    async def _collect_all_root_sessions(self) -> list[str]:
+        roots: set[str] = set()
+
+        for row in await self._db.fetch_all("SELECT id, root_strategy_session_id FROM strategy_sessions"):
+            root_id = _coalesce_root_session_id(row.get("root_strategy_session_id"), row.get("id"))
+            if root_id:
+                roots.add(root_id)
+
+        for row in await self._db.fetch_all("SELECT strategy_session_id, root_strategy_session_id FROM order_lifecycles"):
+            root_id = _coalesce_root_session_id(row.get("root_strategy_session_id"), row.get("strategy_session_id"))
+            if root_id:
+                roots.add(root_id)
+
+        for row in await self._db.fetch_all(
+            """SELECT p.strategy_session_id, s.root_strategy_session_id
+               FROM strategy_session_pnl_samples p
+               LEFT JOIN strategy_sessions s ON s.id = p.strategy_session_id"""
+        ):
+            root_id = _coalesce_root_session_id(row.get("root_strategy_session_id"), row.get("strategy_session_id"))
+            if root_id:
+                roots.add(root_id)
+
+        return sorted(roots)
+
+    async def _load_scope_for_root_sessions(self, root_session_ids: Sequence[str]) -> dict:
+        if not root_session_ids:
+            return {
+                "strategy_sessions": [],
+                "lifecycles": [],
+                "fills": [],
+                "markouts": [],
+                "pnl_samples": [],
+            }
+
+        root_clause, root_params = _build_in_clause(root_session_ids)
+        strategy_sessions = await self._db.fetch_all(
+            f"""SELECT id, sub_account_id, strategy_type, root_strategy_session_id, updated_at
+                FROM strategy_sessions
+                WHERE id IN {root_clause} OR root_strategy_session_id IN {root_clause}""",
+            root_params + root_params,
+        )
+        lifecycles = await self._db.fetch_all(
+            f"""SELECT id, execution_scope, sub_account_id, ownership_confidence, strategy_type,
+                       strategy_session_id, root_strategy_session_id, order_role, side,
+                       requested_qty, decision_mid, avg_fill_price, final_status, reprice_count,
+                       intent_ts, ack_ts, done_ts, updated_at
+                FROM order_lifecycles
+                WHERE COALESCE(root_strategy_session_id, strategy_session_id) IN {root_clause}""",
+            root_params,
+        )
+
+        session_ids = {
+            str(row.get("id"))
+            for row in strategy_sessions
+            if row.get("id")
+        }
+        session_ids.update(
+            str(row.get("strategy_session_id"))
+            for row in lifecycles
+            if row.get("strategy_session_id")
+        )
+        session_ids.update(str(root_id) for root_id in root_session_ids if root_id)
+
+        fills = await self._db.fetch_all(
+            f"""SELECT f.id, f.lifecycle_id, f.sub_account_id, f.execution_scope,
+                       f.ownership_confidence, f.fill_qty, f.fill_price, f.created_at
+                FROM fill_facts f
+                JOIN order_lifecycles l ON l.id = f.lifecycle_id
+                WHERE COALESCE(l.root_strategy_session_id, l.strategy_session_id) IN {root_clause}""",
+            root_params,
+        )
+        markouts = await self._db.fetch_all(
+            f"""SELECT m.fill_fact_id, m.horizon_ms, m.markout_bps, m.created_at
+                FROM fill_markouts m
+                JOIN fill_facts f ON f.id = m.fill_fact_id
+                JOIN order_lifecycles l ON l.id = f.lifecycle_id
+                WHERE COALESCE(l.root_strategy_session_id, l.strategy_session_id) IN {root_clause}""",
+            root_params,
+        )
+
+        pnl_samples = []
+        if session_ids:
+            session_clause, session_params = _build_in_clause(sorted(session_ids))
+            pnl_samples = await self._db.fetch_all(
+                f"""SELECT strategy_session_id, sub_account_id, sampled_at, realized_pnl, unrealized_pnl,
+                           net_pnl, fees_total, open_qty, open_notional, fill_count, close_count,
+                           win_count, loss_count, created_at
+                    FROM strategy_session_pnl_samples
+                    WHERE strategy_session_id IN {session_clause}""",
+                session_params,
+            )
+
         return {
-            "strategy_sessions": await self._db.fetch_all("SELECT * FROM strategy_sessions"),
-            "lifecycles": await self._db.fetch_all("SELECT * FROM order_lifecycles"),
-            "fills": await self._db.fetch_all("SELECT * FROM fill_facts"),
-            "markouts": await self._db.fetch_all("SELECT * FROM fill_markouts"),
-            "pnl_samples": await self._db.fetch_all("SELECT * FROM strategy_session_pnl_samples"),
+            "strategy_sessions": strategy_sessions or [],
+            "lifecycles": lifecycles or [],
+            "fills": fills or [],
+            "markouts": markouts or [],
+            "pnl_samples": pnl_samples or [],
         }
 
-    async def _load_scope_for_sub_accounts(self, sub_account_ids: Sequence[str]) -> dict:
-        in_clause, params = _build_in_clause(sub_account_ids)
-        return {
-            "strategy_sessions": await self._db.fetch_all(
-                f"SELECT * FROM strategy_sessions WHERE sub_account_id IN {in_clause}",
-                params,
-            ),
-            "lifecycles": await self._db.fetch_all(
-                f"SELECT * FROM order_lifecycles WHERE sub_account_id IN {in_clause}",
-                params,
-            ),
-            "fills": await self._db.fetch_all(
-                f"SELECT * FROM fill_facts WHERE sub_account_id IN {in_clause}",
-                params,
-            ),
-            "markouts": await self._db.fetch_all(
-                f"""SELECT m.*
-                    FROM fill_markouts m
-                    JOIN fill_facts f ON f.id = m.fill_fact_id
-                    WHERE f.sub_account_id IN {in_clause}""",
-                params,
-            ),
-            "pnl_samples": await self._db.fetch_all(
-                f"SELECT * FROM strategy_session_pnl_samples WHERE sub_account_id IN {in_clause}",
-                params,
-            ),
-        }
+    @staticmethod
+    def _collect_scope_sub_accounts(scope: dict) -> list[str]:
+        sub_accounts: set[str] = set()
+        for bucket in ("strategy_sessions", "lifecycles", "fills", "pnl_samples"):
+            for row in scope.get(bucket) or []:
+                if row.get("sub_account_id"):
+                    sub_accounts.add(str(row.get("sub_account_id")))
+        return sorted(sub_accounts)
 
     def _compute_rollups(self, scope: dict) -> tuple[Dict[Tuple[str, str, str], Dict[str, Any]], Dict[Tuple[str, str, str, str], Dict[str, Any]]]:
         lifecycles = scope.get("lifecycles") or []
@@ -656,89 +800,21 @@ class TCARollupWorker:
     async def _persist_rollups(
         self,
         *,
-        sub_rollups: Dict[Tuple[str, str, str], Dict[str, Any]],
         strategy_rollups: Dict[Tuple[str, str, str, str], Dict[str, Any]],
+        impacted_strategy_session_ids: Sequence[str],
         impacted_sub_accounts: Sequence[str],
         full_reconcile: bool,
     ) -> None:
         if full_reconcile:
-            await self._db.execute("DELETE FROM sub_account_tca_rollups")
             await self._db.execute("DELETE FROM strategy_tca_rollups")
-        else:
-            for sub_account_id in impacted_sub_accounts:
-                await self._db.execute("DELETE FROM sub_account_tca_rollups WHERE sub_account_id = ?", (sub_account_id,))
-                await self._db.execute("DELETE FROM strategy_tca_rollups WHERE sub_account_id = ?", (sub_account_id,))
-
-        now = utc_now()
-        for (sub_account_id, execution_scope, ownership_confidence), agg in sub_rollups.items():
+        elif impacted_strategy_session_ids:
+            in_clause, params = _build_in_clause(impacted_strategy_session_ids)
             await self._db.execute(
-                """INSERT INTO sub_account_tca_rollups
-                   (id, sub_account_id, execution_scope, ownership_confidence, quality_by_role_json,
-                    order_count, terminal_order_count, fill_count, cancel_count, reject_count,
-                    total_requested_qty, total_filled_qty, total_fill_notional,
-                    fill_ratio, cancel_to_fill_ratio, avg_arrival_slippage_bps, avg_ack_latency_ms, avg_working_time_ms,
-                    avg_markout_1s_bps, avg_markout_5s_bps, avg_markout_30s_bps,
-                    realized_pnl, unrealized_pnl, net_pnl, fees_total, last_sampled_at,
-                    total_reprice_count, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(sub_account_id, execution_scope, ownership_confidence) DO UPDATE SET
-                     quality_by_role_json = excluded.quality_by_role_json,
-                     order_count = excluded.order_count,
-                     terminal_order_count = excluded.terminal_order_count,
-                     fill_count = excluded.fill_count,
-                     cancel_count = excluded.cancel_count,
-                     reject_count = excluded.reject_count,
-                     total_requested_qty = excluded.total_requested_qty,
-                     total_filled_qty = excluded.total_filled_qty,
-                     total_fill_notional = excluded.total_fill_notional,
-                     fill_ratio = excluded.fill_ratio,
-                     cancel_to_fill_ratio = excluded.cancel_to_fill_ratio,
-                     avg_arrival_slippage_bps = excluded.avg_arrival_slippage_bps,
-                     avg_ack_latency_ms = excluded.avg_ack_latency_ms,
-                     avg_working_time_ms = excluded.avg_working_time_ms,
-                     avg_markout_1s_bps = excluded.avg_markout_1s_bps,
-                     avg_markout_5s_bps = excluded.avg_markout_5s_bps,
-                     avg_markout_30s_bps = excluded.avg_markout_30s_bps,
-                     realized_pnl = excluded.realized_pnl,
-                     unrealized_pnl = excluded.unrealized_pnl,
-                     net_pnl = excluded.net_pnl,
-                     fees_total = excluded.fees_total,
-                     last_sampled_at = excluded.last_sampled_at,
-                     total_reprice_count = excluded.total_reprice_count,
-                     updated_at = excluded.updated_at""",
-                (
-                    f"sub:{sub_account_id}:{execution_scope}:{ownership_confidence}",
-                    sub_account_id,
-                    execution_scope,
-                    ownership_confidence,
-                    agg["quality_by_role_json"],
-                    agg["order_count"],
-                    agg["terminal_order_count"],
-                    agg["fill_count"],
-                    agg["cancel_count"],
-                    agg["reject_count"],
-                    agg["total_requested_qty"],
-                    agg["total_filled_qty"],
-                    agg["total_fill_notional"],
-                    (agg["total_filled_qty"] / agg["total_requested_qty"]) if agg["total_requested_qty"] > 0 else None,
-                    (agg["cancel_count"] / agg["fill_count"]) if agg["fill_count"] > 0 else None,
-                    _safe_avg(agg["arrival_slippage_total"], agg["arrival_slippage_count"]),
-                    _safe_avg(agg["ack_latency_total"], agg["ack_latency_count"]),
-                    _safe_avg(agg["working_time_total"], agg["working_time_count"]),
-                    _safe_avg(agg["markout_1s_total"], agg["markout_1s_count"]),
-                    _safe_avg(agg["markout_5s_total"], agg["markout_5s_count"]),
-                    _safe_avg(agg["markout_30s_total"], agg["markout_30s_count"]),
-                    agg["realized_pnl"],
-                    agg["unrealized_pnl"],
-                    agg["net_pnl"],
-                    agg["fees_total"],
-                    agg["last_sampled_at"],
-                    agg["total_reprice_count"],
-                    now,
-                    now,
-                ),
+                f"DELETE FROM strategy_tca_rollups WHERE strategy_session_id IN {in_clause}",
+                params,
             )
 
+        now = utc_now()
         for (strategy_session_id, execution_scope, ownership_confidence, rollup_level), agg in strategy_rollups.items():
             await self._db.execute(
                 """INSERT INTO strategy_tca_rollups
@@ -829,6 +905,188 @@ class TCARollupWorker:
                     now,
                 ),
             )
+
+    async def _rebuild_sub_account_rollups(
+        self,
+        *,
+        impacted_sub_accounts: Sequence[str],
+        full_reconcile: bool,
+    ) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+        if full_reconcile:
+            await self._db.execute("DELETE FROM sub_account_tca_rollups")
+            root_rows = await self._db.fetch_all(
+                "SELECT * FROM strategy_tca_rollups WHERE rollup_level = ?",
+                ("ROOT",),
+            )
+        else:
+            if not impacted_sub_accounts:
+                return {}
+            in_clause, params = _build_in_clause(impacted_sub_accounts)
+            await self._db.execute(
+                f"DELETE FROM sub_account_tca_rollups WHERE sub_account_id IN {in_clause}",
+                params,
+            )
+            root_rows = await self._db.fetch_all(
+                f"""SELECT * FROM strategy_tca_rollups
+                    WHERE rollup_level = ? AND sub_account_id IN {in_clause}""",
+                ("ROOT", *params),
+            )
+
+        sub_rollups = self._aggregate_sub_account_rollups_from_roots(root_rows or [])
+        now = utc_now()
+        for (sub_account_id, execution_scope, ownership_confidence), agg in sub_rollups.items():
+            await self._db.execute(
+                """INSERT INTO sub_account_tca_rollups
+                   (id, sub_account_id, execution_scope, ownership_confidence, quality_by_role_json,
+                    order_count, terminal_order_count, fill_count, cancel_count, reject_count,
+                    total_requested_qty, total_filled_qty, total_fill_notional,
+                    fill_ratio, cancel_to_fill_ratio, avg_arrival_slippage_bps, avg_ack_latency_ms, avg_working_time_ms,
+                    avg_markout_1s_bps, avg_markout_5s_bps, avg_markout_30s_bps,
+                    realized_pnl, unrealized_pnl, net_pnl, fees_total, last_sampled_at,
+                    total_reprice_count, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(sub_account_id, execution_scope, ownership_confidence) DO UPDATE SET
+                     quality_by_role_json = excluded.quality_by_role_json,
+                     order_count = excluded.order_count,
+                     terminal_order_count = excluded.terminal_order_count,
+                     fill_count = excluded.fill_count,
+                     cancel_count = excluded.cancel_count,
+                     reject_count = excluded.reject_count,
+                     total_requested_qty = excluded.total_requested_qty,
+                     total_filled_qty = excluded.total_filled_qty,
+                     total_fill_notional = excluded.total_fill_notional,
+                     fill_ratio = excluded.fill_ratio,
+                     cancel_to_fill_ratio = excluded.cancel_to_fill_ratio,
+                     avg_arrival_slippage_bps = excluded.avg_arrival_slippage_bps,
+                     avg_ack_latency_ms = excluded.avg_ack_latency_ms,
+                     avg_working_time_ms = excluded.avg_working_time_ms,
+                     avg_markout_1s_bps = excluded.avg_markout_1s_bps,
+                     avg_markout_5s_bps = excluded.avg_markout_5s_bps,
+                     avg_markout_30s_bps = excluded.avg_markout_30s_bps,
+                     realized_pnl = excluded.realized_pnl,
+                     unrealized_pnl = excluded.unrealized_pnl,
+                     net_pnl = excluded.net_pnl,
+                     fees_total = excluded.fees_total,
+                     last_sampled_at = excluded.last_sampled_at,
+                     total_reprice_count = excluded.total_reprice_count,
+                     updated_at = excluded.updated_at""",
+                (
+                    f"sub:{sub_account_id}:{execution_scope}:{ownership_confidence}",
+                    sub_account_id,
+                    execution_scope,
+                    ownership_confidence,
+                    agg["quality_by_role_json"],
+                    agg["order_count"],
+                    agg["terminal_order_count"],
+                    agg["fill_count"],
+                    agg["cancel_count"],
+                    agg["reject_count"],
+                    agg["total_requested_qty"],
+                    agg["total_filled_qty"],
+                    agg["total_fill_notional"],
+                    (agg["total_filled_qty"] / agg["total_requested_qty"]) if agg["total_requested_qty"] > 0 else None,
+                    (agg["cancel_count"] / agg["fill_count"]) if agg["fill_count"] > 0 else None,
+                    _safe_avg(agg["arrival_slippage_total"], agg["arrival_slippage_count"]),
+                    _safe_avg(agg["ack_latency_total"], agg["ack_latency_count"]),
+                    _safe_avg(agg["working_time_total"], agg["working_time_count"]),
+                    _safe_avg(agg["markout_1s_total"], agg["markout_1s_count"]),
+                    _safe_avg(agg["markout_5s_total"], agg["markout_5s_count"]),
+                    _safe_avg(agg["markout_30s_total"], agg["markout_30s_count"]),
+                    agg["realized_pnl"],
+                    agg["unrealized_pnl"],
+                    agg["net_pnl"],
+                    agg["fees_total"],
+                    agg["last_sampled_at"],
+                    agg["total_reprice_count"],
+                    now,
+                    now,
+                ),
+            )
+        return sub_rollups
+
+    def _aggregate_sub_account_rollups_from_roots(self, root_rows: Sequence[dict]) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+        sub_rollups: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for row in root_rows or []:
+            sub_account_id = row.get("sub_account_id")
+            if not sub_account_id:
+                continue
+            execution_scope = row.get("execution_scope") or "SUB_ACCOUNT"
+            ownership_confidence = row.get("ownership_confidence") or "HARD"
+            agg = sub_rollups.setdefault((str(sub_account_id), execution_scope, ownership_confidence), _new_rollup())
+            agg["sub_account_id"] = str(sub_account_id)
+
+            agg["order_count"] += int(row.get("order_count") or 0)
+            agg["terminal_order_count"] += int(row.get("terminal_order_count") or 0)
+            agg["fill_count"] += int(row.get("fill_count") or 0)
+            agg["cancel_count"] += int(row.get("cancel_count") or 0)
+            agg["reject_count"] += int(row.get("reject_count") or 0)
+            agg["total_requested_qty"] += float(row.get("total_requested_qty") or 0.0)
+            agg["total_filled_qty"] += float(row.get("total_filled_qty") or 0.0)
+            agg["total_fill_notional"] += float(row.get("total_fill_notional") or 0.0)
+            agg["total_reprice_count"] += int(row.get("total_reprice_count") or 0)
+            agg["realized_pnl"] += float(row.get("realized_pnl") or 0.0)
+            agg["unrealized_pnl"] += float(row.get("unrealized_pnl") or 0.0)
+            agg["net_pnl"] += float(row.get("net_pnl") or 0.0)
+            agg["fees_total"] += float(row.get("fees_total") or 0.0)
+
+            last_sampled_at = _normalize_rollup_ts(row.get("last_sampled_at"))
+            if last_sampled_at and (agg["last_sampled_at"] is None or last_sampled_at > agg["last_sampled_at"]):
+                agg["last_sampled_at"] = last_sampled_at
+
+            order_weight = max(0, int(row.get("order_count") or 0))
+            terminal_weight = max(0, int(row.get("terminal_order_count") or 0))
+            fill_weight = max(0, int(row.get("fill_count") or 0))
+
+            if row.get("avg_arrival_slippage_bps") is not None and order_weight > 0:
+                agg["arrival_slippage_total"] += float(row.get("avg_arrival_slippage_bps") or 0.0) * order_weight
+                agg["arrival_slippage_count"] += order_weight
+            if row.get("avg_ack_latency_ms") is not None and order_weight > 0:
+                agg["ack_latency_total"] += float(row.get("avg_ack_latency_ms") or 0.0) * order_weight
+                agg["ack_latency_count"] += order_weight
+            working_weight = terminal_weight if terminal_weight > 0 else order_weight
+            if row.get("avg_working_time_ms") is not None and working_weight > 0:
+                agg["working_time_total"] += float(row.get("avg_working_time_ms") or 0.0) * working_weight
+                agg["working_time_count"] += working_weight
+            if row.get("avg_markout_1s_bps") is not None and fill_weight > 0:
+                agg["markout_1s_total"] += float(row.get("avg_markout_1s_bps") or 0.0) * fill_weight
+                agg["markout_1s_count"] += fill_weight
+            if row.get("avg_markout_5s_bps") is not None and fill_weight > 0:
+                agg["markout_5s_total"] += float(row.get("avg_markout_5s_bps") or 0.0) * fill_weight
+                agg["markout_5s_count"] += fill_weight
+            if row.get("avg_markout_30s_bps") is not None and fill_weight > 0:
+                agg["markout_30s_total"] += float(row.get("avg_markout_30s_bps") or 0.0) * fill_weight
+                agg["markout_30s_count"] += fill_weight
+
+            try:
+                quality_by_role = row.get("quality_by_role_json")
+                quality_rows = json.loads(quality_by_role) if quality_by_role else {}
+            except Exception:
+                quality_rows = {}
+            for role_key, metrics in (quality_rows or {}).items():
+                if not isinstance(metrics, dict):
+                    continue
+                bucket = _bucket_quality(agg, role_key)
+                lifecycle_count = max(0, int(metrics.get("lifecycleCount") or 0))
+                fill_count = max(0, int(metrics.get("fillCount") or 0))
+                bucket["lifecycleCount"] += lifecycle_count
+                bucket["fillCount"] += fill_count
+                if metrics.get("avgArrivalSlippageBps") is not None and lifecycle_count > 0:
+                    bucket["arrivalTotal"] += float(metrics.get("avgArrivalSlippageBps") or 0.0) * lifecycle_count
+                    bucket["arrivalCount"] += lifecycle_count
+                if metrics.get("avgMarkout1sBps") is not None and fill_count > 0:
+                    bucket["mark1Total"] += float(metrics.get("avgMarkout1sBps") or 0.0) * fill_count
+                    bucket["mark1Count"] += fill_count
+                if metrics.get("avgMarkout5sBps") is not None and fill_count > 0:
+                    bucket["mark5Total"] += float(metrics.get("avgMarkout5sBps") or 0.0) * fill_count
+                    bucket["mark5Count"] += fill_count
+                if metrics.get("avgMarkout30sBps") is not None and fill_count > 0:
+                    bucket["mark30Total"] += float(metrics.get("avgMarkout30sBps") or 0.0) * fill_count
+                    bucket["mark30Count"] += fill_count
+
+        for agg in sub_rollups.values():
+            quality = _finalize_quality(agg)
+            agg["quality_by_role_json"] = json_dumps(quality)
+        return sub_rollups
 
     @staticmethod
     def _accumulate_sub_account_economics(agg: Dict[str, Any], sample: dict) -> None:

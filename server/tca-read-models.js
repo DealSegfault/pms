@@ -426,6 +426,8 @@ export function buildStrategyTimeseriesQuery(query = {}) {
             .map((item) => item.trim().toLowerCase())
             .filter(Boolean),
     );
+    const includeEvents = String(query.includeEvents ?? '0') === '1'
+        || String(query.includeEvents || '').toLowerCase() === 'true';
     const rangeMs = from && to ? Math.max(0, to.getTime() - from.getTime()) : 0;
     let bucketMs = Number.parseInt(query.bucketMs, 10);
     if (!Number.isFinite(bucketMs) || bucketMs <= 0) {
@@ -449,6 +451,7 @@ export function buildStrategyTimeseriesQuery(query = {}) {
         requestedBucketMs: bucketMs,
         bucketMs: effectiveBucketMs,
         maxPoints,
+        includeEvents,
         eventsPage,
         eventsPageSize,
         eventsSkip: (eventsPage - 1) * eventsPageSize,

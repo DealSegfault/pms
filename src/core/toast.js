@@ -1,3 +1,5 @@
+import { getNotifications } from './display-settings.js';
+
 const MAX_VISIBLE_TOASTS = 4;
 const MAX_QUEUED_TOASTS = 50;
 const DEDUPE_WINDOW_MS = 1200;
@@ -72,6 +74,7 @@ function _pump() {
 
 export function showToast(message, type = 'success') {
     if (!message) return;
+    if (!getNotifications()) return;
 
     const now = Date.now();
     const key = `${type}:${message}`;

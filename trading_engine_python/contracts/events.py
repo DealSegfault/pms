@@ -571,6 +571,57 @@ class ScalperCancelledEvent:
         }
 
 
+@dataclass
+class StrategySampleEvent:
+    """Published on live strategy sampling for active session charting."""
+    strategy_session_id: str = ""
+    sub_account_id: str = ""
+    symbol: str = ""
+    status: str = "ACTIVE"
+    sampled_at: int = 0
+    net_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    open_qty: float = 0.0
+    open_notional: float = 0.0
+    fill_count: int = 0
+    close_count: int = 0
+    win_count: int = 0
+    loss_count: int = 0
+    long_active_slots: int = 0
+    short_active_slots: int = 0
+    long_paused_slots: int = 0
+    short_paused_slots: int = 0
+    long_retrying_slots: int = 0
+    short_retrying_slots: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "type": EventType.STRATEGY_SAMPLE,
+            "strategySessionId": self.strategy_session_id,
+            "subAccountId": self.sub_account_id,
+            "symbol": normalize_symbol(self.symbol) if self.symbol else "",
+            "status": self.status,
+            "sampledAt": self.sampled_at or ts_ms(),
+            "netPnl": self.net_pnl,
+            "realizedPnl": self.realized_pnl,
+            "unrealizedPnl": self.unrealized_pnl,
+            "openQty": self.open_qty,
+            "openNotional": self.open_notional,
+            "fillCount": self.fill_count,
+            "closeCount": self.close_count,
+            "winCount": self.win_count,
+            "lossCount": self.loss_count,
+            "longActiveSlots": self.long_active_slots,
+            "shortActiveSlots": self.short_active_slots,
+            "longPausedSlots": self.long_paused_slots,
+            "shortPausedSlots": self.short_paused_slots,
+            "longRetryingSlots": self.long_retrying_slots,
+            "shortRetryingSlots": self.short_retrying_slots,
+            "timestamp": ts_ms(),
+        }
+
+
 # ══════════════════════════════════════════════════════════════
 # TWAP Events
 # ══════════════════════════════════════════════════════════════
