@@ -1,4 +1,5 @@
 import { getToken } from './session.js';
+import { showMaintenanceOverlay, isMaintenanceVisible } from '../lib/server-health.js';
 
 let unauthorizedHandler = () => { };
 
@@ -26,6 +27,27 @@ async function readResponsePayload(response) {
     }
 }
 
+/**
+ * Wait for the maintenance overlay to recover, then resolve.
+ */
+function waitForRecovery() {
+    return new Promise((resolve) => {
+        if (!isMaintenanceVisible()) {
+            showMaintenanceOverlay({ onRecovered: resolve });
+        }
+        // If already visible, the existing overlay will handle recovery
+        // but we still need to resolve when it does — piggyback on next health poll
+        else {
+            const check = setInterval(() => {
+                if (!isMaintenanceVisible()) {
+                    clearInterval(check);
+                    resolve();
+                }
+            }, 500);
+        }
+    });
+}
+
 export async function api(path, options = {}) {
     const token = getToken();
     const headers = {
@@ -38,12 +60,23 @@ export async function api(path, options = {}) {
         ? undefined
         : (typeof options.body === 'string' ? options.body : JSON.stringify(options.body));
 
-    const response = await fetch(`/api${path}`, {
-        ...options,
-        headers,
-        body,
-        cache: 'no-store',
-    });
+    let response;
+    try {
+        response = await fetch(`/api${path}`, {
+            ...options,
+            headers,
+            body,
+            cache: 'no-store',
+        });
+    } catch (err) {
+        // Network error — server is unreachable
+        if (err instanceof TypeError || err.name === 'TypeError') {
+            await waitForRecovery();
+            // Retry the original request after recovery
+            return api(path, options);
+        }
+        throw err;
+    }
 
     if (response.status === 401) {
         unauthorizedHandler();
