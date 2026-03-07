@@ -135,9 +135,11 @@ restart_backend() {
         # Kill old PMS/ENGINE screens if any
         screen -S PMS -X quit 2>/dev/null || true
         screen -S ENGINE -X quit 2>/dev/null || true
-        # Restart or start all pm2 services (backend + engine)
-        pm2 restart ecosystem.config.cjs --update-env 2>/dev/null || pm2 start ecosystem.config.cjs
-        sleep 3
+        # Clean slate — delete all pm2 processes and start fresh
+        pm2 delete all 2>/dev/null || true
+        pm2 start ecosystem.config.cjs
+        pm2 save
+        sleep 5
         pm2 list
     "
     ok "All services restarted (pm2)"
