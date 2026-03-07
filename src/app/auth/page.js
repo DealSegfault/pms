@@ -61,6 +61,11 @@ function renderLoginForm(onAuthenticated) {
             setUser(data.user);
             await onAuthenticated();
         } catch (err) {
+            if (err instanceof TypeError) {
+                const { showMaintenanceOverlay } = await import('../../lib/server-health.js');
+                showMaintenanceOverlay({ onRecovered: () => window._doLogin() });
+                return;
+            }
             errEl.textContent = err.message;
         }
     };
@@ -206,6 +211,11 @@ function renderRegisterForm(onAuthenticated) {
 
             errEl.innerHTML = `<span style="color: var(--green);">✓ Registered! Awaiting admin approval.</span>`;
         } catch (err) {
+            if (err instanceof TypeError) {
+                const { showMaintenanceOverlay } = await import('../../lib/server-health.js');
+                showMaintenanceOverlay({ onRecovered: () => window._doRegister() });
+                return;
+            }
             errEl.textContent = err.message;
         }
     };

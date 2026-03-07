@@ -272,8 +272,11 @@ async function init() {
             clearToken();
             resetSessionState();
         } catch {
-            teardownApp();
-            showAuthPage(true);
+            // Server is unreachable — show maintenance overlay
+            const { showMaintenanceOverlay } = await import('./lib/server-health.js');
+            showMaintenanceOverlay({
+                onRecovered: () => init(),
+            });
             return;
         }
     }
