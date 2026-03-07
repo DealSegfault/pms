@@ -1,0 +1,34 @@
+[Unit]
+Description=PMS PM2 Watchdog
+After=network-online.target pm2-root.service
+Wants=network-online.target pm2-root.service
+StartLimitIntervalSec=60
+StartLimitBurst=20
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/pms
+ExecStart=/usr/bin/node scripts/pm2-watchdog.mjs
+Restart=always
+RestartSec=5
+
+Environment=NODE_ENV=production
+Environment=PM2_SYSTEMD_UNIT=pm2-root
+Environment=WATCHDOG_BACKEND_URL=http://127.0.0.1:3900/api/health
+Environment=WATCHDOG_POLL_MS=10000
+Environment=WATCHDOG_RESTART_COOLDOWN_MS=30000
+Environment=WATCHDOG_HEALTH_FAILURES=3
+Environment=WATCHDOG_MEMORY_STRIKES=2
+Environment=WATCHDOG_BACKEND_MEMORY_MB=320
+Environment=WATCHDOG_ENGINE_MEMORY_MB=0
+
+MemoryMax=128M
+OOMScoreAdjust=-900
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pms-watchdog
+
+[Install]
+WantedBy=multi-user.target

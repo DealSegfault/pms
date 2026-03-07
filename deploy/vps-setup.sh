@@ -71,6 +71,11 @@ sleep 3
 pm2 list
 ok "pm2 services running (backend + engine)"
 
+# ─── 7. Install independent watchdog ───
+step "Installing independent watchdog..."
+bash "$SCRIPT_DIR/install-watchdog-service.sh"
+ok "watchdog service running"
+
 # ─── Done ───
 echo ""
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -86,4 +91,5 @@ echo ""
 echo -e "  ${CYAN}Restart:${NC}"
 echo -e "    pm2 restart all         — restart everything"
 echo -e "    pm2 restart pms-engine  — restart engine only"
+echo -e "    systemctl status pms-watchdog — watchdog status"
 echo ""
